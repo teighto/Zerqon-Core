@@ -25,6 +25,8 @@ server/
 
 `--directory PATH` selects the server directory. Relative `data_directory` paths resolve from it. Game data is prepared automatically inside `.cache/vanilla/26.3`. Keep the Java plugin libraries from the distribution in that server directory's `libraries/` folder.
 
+Managed Java normally lives in `.cache/java/`. An existing working local runtime is reused, including when downloads are disabled. For a new download on Windows, a non-ASCII server path selects `%LOCALAPPDATA%\Zerqon\cache\java` instead: Java 25's launcher cannot reliably start from paths outside the system code page. This cache is shared by Zerqon servers in the same Windows account. Both locations reject links and reparse points. If the user-cache path also contains non-ASCII characters, set `java_executable` to an installed Java 25 in an ASCII path. An explicit executable is never replaced; the system Java installation and PATH are unchanged.
+
 ## server.properties
 
 | Key | Default | Meaning |
@@ -97,6 +99,8 @@ Use `help`, `version`, `tps`, `plugins` and `stop` in the console. `op NAME` gra
 `cargo run --release -- --init` создаёт конфиги и завершает работу, `cargo run --release -- --check-config` проверяет значения без запуска сети. Настройки применяются после перезапуска. `server.properties` содержит адрес, порт, MOTD, онлайн-проверку аккаунтов и параметры Minecraft. `server.settings` — TOML с настройками потоков, кеша, очередей и плагинов. Неизвестные и повторяющиеся ключи отвергаются.
 
 Для папки `run` используйте `--directory run`. Игровые данные подготовятся автоматически в `run/.cache/vanilla/26.3`; Java-библиотеки из дистрибутива должны находиться в `run/libraries/`. Плагины устанавливаются в `plugins/rust-plugins/` и `plugins/java-plugins/` внутри выбранной папки.
+
+Java обычно скачивается в `.cache/java/`. Уже установленная рабочая копия используется повторно, даже при отключённой загрузке. Для новой загрузки на Windows, если путь содержит символы вне ASCII, используется `%LOCALAPPDATA%\Zerqon\cache\java`: запускатор Java 25 не всегда умеет работать с такими путями. Этот кеш общий для серверов Zerqon одного пользователя. Если и путь профиля содержит такие символы, укажите в `java_executable` установленную Java 25 с путём из ASCII-символов. Системная Java и PATH не меняются.
 
 Адрес и порт задаются только в `server.properties`, количество потоков — только в `server.settings`. Переопределений этих настроек через командную строку нет. Для служебных флагов Cargo нужен разделитель `--`: например, `cargo run --release -- --directory run`.
 

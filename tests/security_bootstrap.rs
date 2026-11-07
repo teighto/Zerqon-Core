@@ -10,6 +10,13 @@ pub mod bootstrap_under_review {
 
 pub mod runtime_under_review {
     include!("../src/java_runtime.rs");
+    #[cfg(windows)]
+    pub fn fallback_fixture(
+        cache: &std::path::Path,
+        local_data: &std::path::Path,
+    ) -> Result<std::path::PathBuf, JavaRuntimeError> {
+        windows_cache_location(cache, Some(local_data))
+    }
     pub async fn probe_fixture(
         runtime: &std::path::Path,
     ) -> Result<std::path::PathBuf, JavaRuntimeError> {
@@ -22,6 +29,30 @@ pub mod runtime_under_review {
         )?;
         validated_cached_runtime(runtime, asset).await
     }
+}
+
+#[cfg(windows)]
+#[test]
+fn runtime_fallback_rejects_links_in_requested_and_selected_caches() {
+    let directory = tempfile::tempdir().unwrap();
+    let outside = directory.path().join("outside");
+    let local_data = directory.path().join("profile");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::create_dir(&local_data).unwrap();
+    std::fs::write(outside.join("original"), b"preserved").unwrap();
+    let cache = directory.path().join("中文");
+    directory_link(&outside, &cache);
+    assert!(runtime_under_review::fallback_fixture(&cache, &local_data).is_err());
+    directory_link(&outside, &local_data.join("Zerqon"));
+    assert!(
+        runtime_under_review::fallback_fixture(&directory.path().join("另一个"), &local_data)
+            .is_err()
+    );
+    assert_eq!(
+        std::fs::read(outside.join("original")).unwrap(),
+        b"preserved"
+    );
+    assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 1);
 }
 
 fn directory_link(target: &std::path::Path, link: &std::path::Path) {

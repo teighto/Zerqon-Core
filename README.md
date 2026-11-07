@@ -55,7 +55,7 @@ chmod +x zerqon
 
 On Windows, run `zerqon.exe`.
 
-The first start creates the configuration files. Read the [Minecraft EULA](https://aka.ms/MinecraftEULA), set `eula=true` if you agree, then start again. Zerqon prepares the game data automatically. If Java 25 is needed and not installed, it downloads a copy into `.cache/` without changing the system installation. Python is not needed to run the server.
+The first start creates the configuration files. Read the [Minecraft EULA](https://aka.ms/MinecraftEULA), set `eula=true` if you agree, then start again. Zerqon prepares the game data automatically and downloads Java 25 if needed. Downloads normally stay in `.cache/`. On Windows, Java uses a [separate user cache](docs/CONFIGURATION.md) when the server path contains non-ASCII characters. Python is not needed to run the server.
 
 Set the port in `server.properties` and the thread counts in `server.settings`. Type `stop` in the console to shut down.
 
@@ -139,7 +139,7 @@ chmod +x zerqon
 
 На Windows запустите `zerqon.exe`.
 
-Первый запуск создаёт настройки. Прочитайте [Minecraft EULA](https://aka.ms/MinecraftEULA), при согласии установите `eula=true` и запустите сервер ещё раз. Игровые данные подготовятся автоматически. Если нужна Java 25, а в системе её нет, сервер скачает отдельную копию в `.cache/`. Установленная Java останется без изменений. Python для запуска не нужен.
+Первый запуск создаёт настройки. Прочитайте [Minecraft EULA](https://aka.ms/MinecraftEULA), при согласии установите `eula=true` и запустите сервер ещё раз. Игровые данные и нужная Java 25 загрузятся автоматически. Обычно загрузки хранятся в `.cache/`. Если путь сервера содержит кириллицу или другие символы вне ASCII, на Windows Java скачивается в [отдельный кеш пользователя](docs/CONFIGURATION.md). Python для запуска не нужен.
 
 Порт задаётся в `server.properties`, потоки в `server.settings`. Для остановки введите `stop` в консоли.
 

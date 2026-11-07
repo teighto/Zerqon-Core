@@ -47,6 +47,8 @@ const LINUX: Asset = Asset {
 pub enum JavaRuntimeError {
     #[error("Java runtime: {0}")]
     Invalid(String),
+    #[error("Java runtime probe exited with {0}")]
+    ProbeExit(std::process::ExitStatus),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -107,6 +109,21 @@ pub async fn resolve_java(
         Err(_) => {}
     }
     let asset = current_asset()?;
+    let requested_cache = std::path::absolute(cache)?;
+    let requested_runtime = requested_cache
+        .join("25")
+        .join(asset.platform.cache_name())
+        .join(ARCHIVE_ROOT);
+    reject_runtime_links(&requested_runtime)?;
+    if requested_runtime.try_exists()? {
+        match validated_cached_runtime(&requested_runtime, asset).await {
+            Ok(java) => return Ok(java),
+            Err(JavaRuntimeError::ProbeExit(_))
+                if cfg!(windows) && !requested_cache.as_os_str().as_encoded_bytes().is_ascii() => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let cache = managed_cache_location(&requested_cache)?;
     let directory = cache.join("25").join(asset.platform.cache_name());
     let runtime = directory.join(ARCHIVE_ROOT);
     if runtime.try_exists()? {
@@ -117,7 +134,44 @@ pub async fn resolve_java(
             "Java 25 was not found and automatic runtime downloads are disabled; configure java_executable",
         ));
     }
-    install_managed(cache, asset).await
+    install_managed(&cache, asset).await
+}
+
+fn managed_cache_location(cache: &Path) -> Result<PathBuf, JavaRuntimeError> {
+    #[cfg(windows)]
+    {
+        let local_data = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+        windows_cache_location(cache, local_data.as_deref())
+    }
+    #[cfg(not(windows))]
+    {
+        reject_runtime_links(cache)?;
+        Ok(std::path::absolute(cache)?)
+    }
+}
+
+#[cfg(windows)]
+fn windows_cache_location(
+    cache: &Path,
+    local_data: Option<&Path>,
+) -> Result<PathBuf, JavaRuntimeError> {
+    reject_runtime_links(cache)?;
+    let absolute = std::path::absolute(cache)?;
+    if absolute.as_os_str().as_encoded_bytes().is_ascii() {
+        return Ok(absolute);
+    }
+    let local_data = local_data
+        .filter(|path| path.is_absolute() && path.as_os_str().as_encoded_bytes().is_ascii())
+        .ok_or_else(|| invalid(
+            "Windows Java 25 cannot reliably launch from this runtime cache path; set java_executable to Java 25 installed in an ASCII path",
+        ))?;
+    let fallback = local_data.join("Zerqon/cache/java");
+    reject_runtime_links(&fallback)?;
+    tracing::info!(
+        "Using the per-user Java cache at {} for Windows launcher path compatibility",
+        fallback.display()
+    );
+    Ok(fallback)
 }
 
 fn is_default_java(path: &Path) -> bool {
@@ -780,8 +834,9 @@ async fn probe_java(executable: &Path) -> Result<PathBuf, JavaRuntimeError> {
         if bytes.len() > 65536 {
             return Err(invalid("Java probe output exceeds64KiB"));
         }
-        if !child.wait().await?.success() {
-            return Err(invalid("Java probe exited unsuccessfully"));
+        let status = child.wait().await?;
+        if !status.success() {
+            return Err(JavaRuntimeError::ProbeExit(status));
         }
         let text =
             std::str::from_utf8(&bytes).map_err(|_| invalid("Java probe text is not UTF-8"))?;

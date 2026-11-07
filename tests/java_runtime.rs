@@ -4,6 +4,231 @@ include!("../src/java_runtime.rs");
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::OnceLock;
+
+    fn cached_probe_fixture(cache: &Path, mode: &str) -> PathBuf {
+        static FIXTURE: OnceLock<tempfile::TempDir> = OnceLock::new();
+        let fixture = FIXTURE.get_or_init(|| {
+            let directory = tempfile::tempdir().unwrap();
+            let source = directory.path().join("probe.rs");
+            fs::write(&source, r#"fn main() {
+                let executable = std::env::current_exe().unwrap();
+                let home = executable.parent().unwrap().parent().unwrap();
+                std::fs::write(home.join("executed"), b"yes").unwrap();
+                let mode = std::fs::read_to_string(home.join("probe-mode")).unwrap();
+                if mode == "exit" { std::process::exit(2); }
+                eprintln!("java.home = {}", home.display());
+                eprintln!("java.specification.version = {}", if mode == "old" { "21" } else { "25" });
+            }"#).unwrap();
+            let compiled = std::process::Command::new("rustc")
+                .arg("--edition=2024")
+                .arg(&source)
+                .arg("-o")
+                .arg(directory.path().join(current_asset().unwrap().platform.executable()))
+                .output()
+                .unwrap();
+            assert!(compiled.status.success(), "{}", String::from_utf8_lossy(&compiled.stderr));
+            directory
+        });
+        let asset = current_asset().unwrap();
+        let runtime = cache
+            .join("25")
+            .join(asset.platform.cache_name())
+            .join(ARCHIVE_ROOT);
+        fs::create_dir_all(runtime.join("bin")).unwrap();
+        fs::copy(
+            fixture.path().join(asset.platform.executable()),
+            runtime.join("bin").join(asset.platform.executable()),
+        )
+        .unwrap();
+        fs::write(runtime.join("probe-mode"), mode).unwrap();
+        fs::write(
+            runtime.join("zerqon-runtime.json"),
+            serde_json::to_vec(&json!({
+                "release": RELEASE, "sha256": asset.sha256, "size": asset.size,
+                "platform": asset.platform.cache_name()
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        runtime
+    }
+
+    fn resolver_child_root() -> Option<PathBuf> {
+        std::env::var_os("ZERQON_RUNTIME_TEST_ROOT").map(PathBuf::from)
+    }
+
+    fn run_resolver_child(test: &str, root: &Path) {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--include-ignored", "--nocapture"])
+            .env("ZERQON_RUNTIME_TEST_ROOT", root)
+            .env("LOCALAPPDATA", root.join("profile"))
+            .env("PATH", "")
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[tokio::test]
+    async fn offline_resolver_preserves_working_unicode_cache() {
+        if let Some(root) = resolver_child_root() {
+            assert!(probe_java(Path::new("java")).await.is_err());
+            let cache = root.join("среда-中文");
+            let resolved = resolve_java(Path::new("java"), &cache, false)
+                .await
+                .unwrap();
+            assert!(
+                resolved
+                    .canonicalize()
+                    .unwrap()
+                    .starts_with(cache.canonicalize().unwrap())
+            );
+            assert!(!root.join("profile").exists());
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        cached_probe_fixture(&directory.path().join("среда-中文"), "valid");
+        run_resolver_child(
+            "tests::offline_resolver_preserves_working_unicode_cache",
+            directory.path(),
+        );
+    }
+
+    #[tokio::test]
+    async fn resolver_rejects_corrupt_local_identity_before_using_fallback() {
+        if let Some(root) = resolver_child_root() {
+            assert!(probe_java(Path::new("java")).await.is_err());
+            let error = resolve_java(Path::new("java"), &root.join("среда-中文"), true)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                JavaRuntimeError::Invalid(_) | JavaRuntimeError::Json(_)
+            ));
+            return;
+        }
+        for contents in [b"{broken".as_slice(), br#"{"release":"unknown"}"#] {
+            let directory = tempfile::tempdir().unwrap();
+            let local = cached_probe_fixture(&directory.path().join("среда-中文"), "valid");
+            let fallback =
+                cached_probe_fixture(&directory.path().join("profile/Zerqon/cache/java"), "valid");
+            fs::write(local.join("zerqon-runtime.json"), contents).unwrap();
+            run_resolver_child(
+                "tests::resolver_rejects_corrupt_local_identity_before_using_fallback",
+                directory.path(),
+            );
+            assert_eq!(
+                fs::read(local.join("zerqon-runtime.json")).unwrap(),
+                contents
+            );
+            assert!(!local.join("executed").exists());
+            assert!(!fallback.join("executed").exists());
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn unicode_launcher_exit_uses_existing_fallback_without_download() {
+        if let Some(root) = resolver_child_root() {
+            assert!(probe_java(Path::new("java")).await.is_err());
+            let resolved = resolve_java(Path::new("java"), &root.join("среда-中文"), false)
+                .await
+                .unwrap();
+            assert!(
+                resolved
+                    .canonicalize()
+                    .unwrap()
+                    .starts_with(root.join("profile").canonicalize().unwrap())
+            );
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let local = cached_probe_fixture(&directory.path().join("среда-中文"), "exit");
+        let fallback =
+            cached_probe_fixture(&directory.path().join("profile/Zerqon/cache/java"), "valid");
+        let identity = fs::read(local.join("zerqon-runtime.json")).unwrap();
+        run_resolver_child(
+            "tests::unicode_launcher_exit_uses_existing_fallback_without_download",
+            directory.path(),
+        );
+        assert!(local.join("executed").exists());
+        assert!(fallback.join("executed").exists());
+        assert_eq!(
+            fs::read(local.join("zerqon-runtime.json")).unwrap(),
+            identity
+        );
+    }
+
+    #[tokio::test]
+    async fn unexpected_java_version_is_not_hidden_by_fallback() {
+        if let Some(root) = resolver_child_root() {
+            assert!(probe_java(Path::new("java")).await.is_err());
+            let error = resolve_java(Path::new("java"), &root.join("среда-中文"), false)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, JavaRuntimeError::Invalid(_)));
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let local = cached_probe_fixture(&directory.path().join("среда-中文"), "old");
+        let fallback =
+            cached_probe_fixture(&directory.path().join("profile/Zerqon/cache/java"), "valid");
+        run_resolver_child(
+            "tests::unexpected_java_version_is_not_hidden_by_fallback",
+            directory.path(),
+        );
+        assert!(local.join("executed").exists());
+        assert!(!fallback.join("executed").exists());
+    }
+
+    #[tokio::test]
+    async fn ascii_launcher_exit_remains_an_error() {
+        if let Some(root) = resolver_child_root() {
+            assert!(probe_java(Path::new("java")).await.is_err());
+            let error = resolve_java(Path::new("java"), &root.join("ascii"), false)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, JavaRuntimeError::ProbeExit(_)));
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let local = cached_probe_fixture(&directory.path().join("ascii"), "exit");
+        let fallback =
+            cached_probe_fixture(&directory.path().join("profile/Zerqon/cache/java"), "valid");
+        run_resolver_child(
+            "tests::ascii_launcher_exit_remains_an_error",
+            directory.path(),
+        );
+        assert!(local.join("executed").exists());
+        assert!(!fallback.join("executed").exists());
+    }
+
+    #[tokio::test]
+    async fn disabled_downloads_create_neither_requested_nor_fallback_cache() {
+        if let Some(root) = resolver_child_root() {
+            assert!(probe_java(Path::new("java")).await.is_err());
+            assert!(
+                resolve_java(Path::new("java"), &root.join("среда-中文"), false)
+                    .await
+                    .is_err()
+            );
+            assert!(!root.join("среда-中文").exists());
+            assert!(!root.join("profile").exists());
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        run_resolver_child(
+            "tests::disabled_downloads_create_neither_requested_nor_fallback_cache",
+            directory.path(),
+        );
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
     fn metadata() -> Value {
         json!({"release_name":"jdk-25.0.5+8","version_data":{"major":25,"security":5,"build":8},"binaries":[{"architecture":"x64","os":"windows","image_type":"jre","jvm_impl":"hotspot","package":{"name":"OpenJDK25U-jre_x64_windows_hotspot_25.0.5_8.zip","size":58589419u64,"checksum":"da78d54a2fcdbba1e92d5e3f07dd30236f96297891c4a21a781c3f38f5c0beae","link":"https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.5%2B8/OpenJDK25U-jre_x64_windows_hotspot_25.0.5_8.zip"}}]})
     }
@@ -217,8 +442,29 @@ mod tests {
     #[tokio::test]
     #[ignore = "Downloads and verifies the pinned official JRE for the current Windows/Linux x64 platform"]
     async fn official_managed_runtime_download_install_probe_and_reuse() {
+        if let Some(root) = resolver_child_root() {
+            assert!(probe_java(Path::new("java")).await.is_err());
+            let java = resolve_java(Path::new("java"), &root.join("среда-中文-Java"), false)
+                .await
+                .unwrap();
+            assert_eq!(probe_java(&java).await.unwrap(), java);
+            assert!(
+                java.canonicalize()
+                    .unwrap()
+                    .starts_with(root.canonicalize().unwrap())
+            );
+            return;
+        }
         let directory = tempfile::tempdir().unwrap();
-        let cache = directory.path().join("среда-Java");
+        let cache = directory.path().join("среда-中文-Java");
+        #[cfg(windows)]
+        let cache = {
+            let resolved =
+                windows_cache_location(&cache, Some(&directory.path().join("profile"))).unwrap();
+            assert!(!cache.exists());
+            assert!(resolved.starts_with(directory.path()));
+            resolved
+        };
         let asset = current_asset().unwrap();
         let java = install_managed(&cache, asset).await.unwrap();
         assert!(
@@ -228,6 +474,30 @@ mod tests {
         );
         assert_eq!(probe_java(&java).await.unwrap(), java);
         assert_eq!(install_managed(&cache, asset).await.unwrap(), java);
+        run_resolver_child(
+            "tests::official_managed_runtime_download_install_probe_and_reuse",
+            directory.path(),
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn non_ascii_runtime_cache_uses_private_fallback_without_writing_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = directory.path().join("中文/cache");
+        let fallback = directory.path().join("profile");
+        let resolved = windows_cache_location(&cache, Some(&fallback)).unwrap();
+        assert_eq!(resolved, fallback.join("Zerqon/cache/java"));
+        assert!(!cache.exists());
+        assert!(!fallback.exists());
+        assert_eq!(
+            windows_cache_location(&directory.path().join("ascii"), None).unwrap(),
+            directory.path().join("ascii")
+        );
+        for invalid_fallback in [None, Some(Path::new("relative")), Some(cache.as_path())] {
+            assert!(windows_cache_location(&cache, invalid_fallback).is_err());
+        }
+        assert!(!cache.exists());
     }
 
     #[test]
