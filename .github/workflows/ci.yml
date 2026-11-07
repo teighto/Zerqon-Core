@@ -116,6 +116,19 @@ jobs:
         run: python scripts/test-inventory-codec.py --fixtures .cache/native-inventory-fixtures.json
       - name: Build native release
         run: cargo build -p zerqon --release --locked
+      - name: Verify standalone Windows runtime
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $zerqonVswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $zerqonInstallation = & $zerqonVswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if ($LASTEXITCODE -ne 0 -or -not $zerqonInstallation) { throw 'MSVC installation was not found' }
+          $zerqonVersion = Get-ChildItem -LiteralPath (Join-Path $zerqonInstallation 'VC\Tools\MSVC') -Directory | Sort-Object { [version]$_.Name } -Descending | Select-Object -First 1
+          $zerqonDumpbin = Join-Path $zerqonVersion.FullName 'bin\Hostx64\x64\dumpbin.exe'
+          $zerqonDependencies = & $zerqonDumpbin /DEPENDENTS target/release/zerqon.exe
+          if ($LASTEXITCODE -ne 0) { throw 'Could not inspect executable imports' }
+          $zerqonDependencies
+          if ($zerqonDependencies -match '(?i)\b(?:vcruntime|msvcp|msvcr)\d\S*\.dll\b') { throw 'Executable requires a separate Visual C++ runtime' }
       - name: Package allowlisted release files
         run: python scripts/package-release.py --skip-build
       - name: Upload development distribution
