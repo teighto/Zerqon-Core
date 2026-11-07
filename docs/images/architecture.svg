@@ -1,7 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1020" viewBox="0 0 1600 1020"><defs><linearGradient id="bg" x2="1" y2="1"><stop stop-color="#0b1020"/><stop offset="1" stop-color="#111d2d"/></linearGradient><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10Z" fill="#7c9ec9"/></marker></defs><rect width="1600" height="1020" rx="24" fill="url(#bg)"/><style>text{font-family:Segoe UI,Arial,sans-serif} .title{fill:#eef5ff;font-size:29px;font-weight:600}.body{fill:#afbed2;font-size:22px}.small{fill:#91a4bd;font-size:20px}.label{fill:#77d8ca;font-size:19px;font-weight:600;letter-spacing:2px}.line{fill:none;stroke:#7c9ec9;stroke-width:3;marker-end:url(#arrow)}</style>
 <text x="52" y="73" class="title">Zerqon</text>
-<text x="52" y="112" class="body">Minecraft 26.3 · Rust server architecture</text>
-<text x="1330" y="75" class="small">by teighto</text>
+
+
 <rect x="350" y="167" width="740" height="575" rx="23" fill="#102b32" stroke="#459d94" stroke-width="2"/>
 <text x="379" y="205" class="label">RUST CORE</text>
 <rect x="390" y="230" width="660" height="110" rx="16" fill="#172539" stroke="#243950" stroke-width="2"/>
