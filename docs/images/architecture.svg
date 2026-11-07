@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1020" viewBox="0 0 1600 1020"><defs><linearGradient id="bg" x2="1" y2="1"><stop stop-color="#0b1020"/><stop offset="1" stop-color="#111d2d"/></linearGradient><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10Z" fill="#7c9ec9"/></marker></defs><rect width="1600" height="1020" rx="24" fill="url(#bg)"/><style>text{font-family:Segoe UI,Arial,sans-serif} .title{fill:#eef5ff;font-size:29px;font-weight:600}.body{fill:#afbed2;font-size:22px}.small{fill:#91a4bd;font-size:20px}.label{fill:#77d8ca;font-size:19px;font-weight:600;letter-spacing:2px}.line{fill:none;stroke:#7c9ec9;stroke-width:3;marker-end:url(#arrow)}</style>
+<text x="52" y="73" class="title">Zerqon</text>
+<text x="52" y="112" class="body">Minecraft 26.3 · Rust server architecture</text>
+<text x="1330" y="75" class="small">by teighto</text>
+<rect x="350" y="167" width="740" height="575" rx="23" fill="#102b32" stroke="#459d94" stroke-width="2"/>
+<text x="379" y="205" class="label">RUST CORE</text>
+<rect x="390" y="230" width="660" height="110" rx="16" fill="#172539" stroke="#243950" stroke-width="2"/>
+<text x="414" y="271" class="title">Network workers</text>
+<text x="414" y="308" class="body">Connections, packet decoding and compression</text>
+<rect x="390" y="390" width="660" height="110" rx="16" fill="#172539" stroke="#243950" stroke-width="2"/>
+<text x="414" y="431" class="title">Server coordinator</text>
+<text x="414" y="468" class="body">Ticks, commands and plugin events</text>
+<rect x="390" y="550" width="390" height="150" rx="16" fill="#172539" stroke="#243950" stroke-width="2"/>
+<text x="414" y="591" class="title">Chunk workers</text>
+<text x="414" y="628" class="body">Generation and encoding</text>
+<text x="414" y="657" class="body">Disk jobs on worker threads</text>
+<rect x="810" y="550" width="240" height="150" rx="16" fill="#172539" stroke="#243950" stroke-width="2"/>
+<text x="834" y="591" class="title">Chunk cache</text>
+<text x="834" y="628" class="body">Compact palettes</text>
+<text x="834" y="657" class="body">Limited capacity</text>
+<rect x="45" y="310" width="250" height="180" rx="16" fill="#172539" stroke="#243950" stroke-width="2"/>
+<text x="69" y="351" class="title">Clients</text>
+<text x="69" y="388" class="body">Java Edition 26.3</text>
+<text x="69" y="417" class="body">Horizon target</text>
+<rect x="1150" y="270" width="405" height="145" rx="16" fill="#172539" stroke="#6979c9" stroke-width="2"/>
+<text x="1174" y="311" class="title">Rust plugins</text>
+<text x="1174" y="348" class="body">WASM runtime</text>
+<text x="1174" y="377" class="body">plugins/rust-plugins/</text>
+<rect x="1150" y="475" width="405" height="160" rx="16" fill="#172539" stroke="#6979c9" stroke-width="2"/>
+<text x="1174" y="516" class="title">Java plugins</text>
+<text x="1174" y="553" class="body">Optional JVM process</text>
+<text x="1174" y="582" class="body">plugins/java-plugins/</text>
+<rect x="390" y="805" width="660" height="105" rx="16" fill="#172539" stroke="#243950" stroke-width="2"/>
+<text x="414" y="846" class="title">World storage</text>
+<text x="414" y="883" class="body">Checksums and atomic chunk writes</text>
+<rect x="45" y="590" width="250" height="250" rx="16" fill="#172539" stroke="#243950" stroke-width="2"/>
+<text x="69" y="631" class="title">Resource limits</text>
+<text x="69" y="668" class="body">Connections</text>
+<text x="69" y="697" class="body">Packet sizes</text>
+<text x="69" y="726" class="body">Work queues</text>
+<text x="69" y="755" class="body">Plugin memory</text>
+<rect x="1150" y="720" width="405" height="190" rx="16" fill="#162031" stroke="#778499" stroke-width="2" stroke-dasharray="7 6"/>
+<text x="1174" y="759" class="title">In development</text>
+<text x="1174" y="800" class="body">Full gameplay and mobs</text>
+<text x="1174" y="829" class="body">Paper API and spark</text>
+<text x="1174" y="858" class="body">Complete world import</text>
+<path d="M295 370H325V285H390" class="line"/>
+<path d="M720 340V390" class="line"/>
+<path d="M580 500V550" class="line"/>
+<path d="M780 625H810" class="line"/>
+<path d="M580 700V805" class="line"/>
+<path d="M1050 425H1120V342H1150" class="line"/>
+<path d="M1050 465H1120V555H1150" class="line"/>
+<text x="1150" y="244" class="label">SERVER PLUGINS</text>
+<text x="390" y="785" class="small">SAVE / LOAD</text>
+<rect x="45" y="945" width="1510" height="46" rx="10" fill="#1b2d43"/>
+<text x="70" y="975" class="body">server.properties   ·   server.settings   ·   logs/   ·   .cache/   ·   libraries/</text>
+</svg>

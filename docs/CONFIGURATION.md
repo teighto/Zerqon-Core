@@ -1,17 +1,18 @@
 # Configuration / Настройки
 
-Run `zerqon --init` in an empty server directory to create defaults. Existing files are preserved. `zerqon --check-config` validates the properties and settings without opening the listener. Changes require a restart; there is no live reload in 0.0.1.
+The normal source-checkout command is `cargo run --release`. For a packaged build, run `./zerqon` on Linux or `.\zerqon.exe` on Windows. The first run creates missing configuration files and asks you to accept the Minecraft EULA before the server starts. Existing files are preserved.
+
+`cargo run --release -- --init` creates configuration and exits. `cargo run --release -- --check-config` validates it without opening the listener. Port, bind address and thread counts are configured only in the files below. Changes require a restart.
 
 ## Runtime directory
 
 ```text
 server/
 ├── zerqon                 # zerqon.exe on Windows
-├── zerqon.jar             # optional native-process launcher
 ├── server.properties      # Minecraft-facing settings
 ├── server.settings        # Zerqon settings in TOML
 ├── eula.txt
-├── ops.json               # operator names, managed from the console
+├── ops.json               # operator records, managed from the console
 ├── plugins/
 │   ├── rust-plugins/
 │   └── java-plugins/
@@ -37,7 +38,7 @@ server/
 | `network-compression-threshold` | `256` | Compression threshold in bytes; `-1` disables it |
 | `level-name` | `world` | World subdirectory name; path separators are rejected |
 
-The alpha parser accepts `key=value` lines and `#`/`!` comments. Duplicate keys are rejected. It is not a complete Java `.properties` escape/continuation parser. Other Paper/Bukkit settings are not automatically implemented by placing them here.
+The parser accepts `key=value` lines and `#`/`!` comments. Unknown and duplicate keys are rejected. It does not support Java `.properties` escapes or continued lines. Configuration files are limited to 1 MiB.
 
 ## server.settings
 
@@ -47,7 +48,7 @@ This file uses TOML. Missing keys use defaults; unknown keys are errors.
 |---|---|---|
 | `network_threads` | CPU count clamped to 2–4 | 1–128 Tokio workers |
 | `world_threads` | CPU count minus 2, clamped to 1–8 | 1–128 chunk workers |
-| `max_connections` | `128` | 1–65,536 accepted network connections |
+| `max_connections` | `128` | 1–65,536 accepted network connections; must be at least `max-players` |
 | `max_packet_bytes` | `2097151` | 1,024–2,097,151 frame/decompression bound |
 | `connection_timeout_seconds` | `30` | 1–300 seconds |
 | `chunk_cache_capacity` | `256` | 1–65,536 cached chunks; the cache also has a 256 MiB byte bound |
@@ -58,7 +59,7 @@ This file uses TOML. Missing keys use defaults; unknown keys are errors.
 | `java_plugins` | `true` | Enable the optional host when Java JAR plugins are present |
 | `java_executable` | `java` | Java 25 executable path |
 
-Thread counts, cache capacity and plugin limits trade resource use for concurrency; increasing every value does not guarantee better performance. WASM memory limits cover linear memory, and the chunk byte bound covers the cache; neither is a process-wide RAM cap. The optional Java host has a separate 128 MiB heap limit.
+Set the bind address and port in `server.properties`, and thread counts in `server.settings`. These values have no command-line overrides. WASM memory limits cover linear memory, and the chunk byte bound covers the cache; neither is a process-wide RAM cap. The optional Java plugin host has a separate 128 MiB heap limit.
 
 ## Command line
 
@@ -68,30 +69,27 @@ Thread counts, cache capacity and plugin limits trade resource use for concurren
 | `--init` | Create missing configuration and exit |
 | `--check-config` | Validate configuration and exit |
 | `--status-only` | Start server-list/status mode without loading game data or a world |
-| `--bind ADDRESS` | Override `server-ip` |
-| `--port PORT` | Override `server-port` |
-| `--threads COUNT` | Override network workers |
-| `--world-threads COUNT` | Override chunk workers |
 | `--data PATH` | Override prepared-data path |
 | `--no-console` | Disable stdin command reading |
 | `--no-color` | Disable ANSI log colors |
-| `--nogui` | Accepted for Java-server-style launch scripts; Zerqon has no GUI |
 | `--help`, `--version` | Print CLI help or version |
 
-Flags override files for that run without rewriting the files. The JAR launcher also accepts `--native PATH` as its first option to select a different native executable. Arguments after it are forwarded to Zerqon. JVM options such as `-Xmx` belong before `-jar` and affect the launcher only.
+When running through Cargo, place operational flags after `--`, for example `cargo run --release -- --directory run`. The native executable accepts them directly. No flags are required for the normal startup command.
 
 ## Administration
 
-Use `help`, `version`, `tps`, `plugins` and `stop` in the console. `op NAME` and `deop NAME` manage the operator-name list. In-game `/tpsbar` toggles a boss bar; `/setblock X Y Z STATE-ID` changes and persists a block for operators. The alpha permission model grants non-null plugin permission requirements to operators; there is no full permission-provider API yet.
+Use `help`, `version`, `tps`, `plugins` and `stop` in the console. `op NAME` and `deop NAME` manage operators. In-game `/tpsbar` toggles a boss bar; `/setblock X Y Z STATE-ID` changes and persists a block for operators. The current permission model grants non-null plugin permission requirements to operators; there is no full permission-provider API yet.
 
-`/tps` reports the recent coordinator tick rate and average measured tick work. Worker CPU, JVM and WASM costs require separate profiling. Integrated spark is not available in this release. The append-only `logs/latest.log` is not automatically rotated; archive it between runs when needed. `RUST_LOG` selects log verbosity, for example `info` or `zerqon=debug`.
+`/tps` reports the recent coordinator tick rate and average measured tick work. Worker CPU, JVM and WASM costs require separate profiling. Integrated spark is not available yet. The append-only `logs/latest.log` is not automatically rotated; archive it between runs when needed. `RUST_LOG` selects log verbosity, for example `info` or `zerqon=debug`.
 
 ## Русский
 
-`--init` создаёт недостающие файлы, `--check-config` проверяет значения без запуска сети. Настройки применяются после перезапуска. `server.properties` содержит адрес, порт, MOTD, онлайн-проверку аккаунтов и параметры Minecraft. `server.settings` — TOML с настройками потоков, кеша, очередей и плагинов. Неизвестные TOML-ключи отвергаются.
+Обычный запуск из исходников — `cargo run --release`, без флагов. Нативная сборка запускается через `./zerqon` или `.\zerqon.exe`. Первый запуск создаёт недостающие конфиги; перед запуском сервера нужно принять Minecraft EULA.
+
+`cargo run --release -- --init` создаёт конфиги и завершает работу, `cargo run --release -- --check-config` проверяет значения без запуска сети. Настройки применяются после перезапуска. `server.properties` содержит адрес, порт, MOTD, онлайн-проверку аккаунтов и параметры Minecraft. `server.settings` — TOML с настройками потоков, кеша, очередей и плагинов. Неизвестные и повторяющиеся ключи отвергаются.
 
 Для папки `run` используйте `--directory run`; подготовьте данные в `run/.cache/vanilla/26.3`, Java-библиотеки поместите в `run/libraries/`. Плагины устанавливаются в `plugins/rust-plugins/` и `plugins/java-plugins/` внутри выбранной папки.
 
-Параметры командной строки переопределяют настройки на один запуск, не меняя файлы. `--threads` задаёт сетевые потоки, `--world-threads` — обработку чанков. `-Xmx` запускатора не ограничивает память Rust-процесса. Увеличение всех лимитов не гарантирует ускорение.
+Адрес и порт задаются только в `server.properties`, количество потоков — только в `server.settings`. Переопределений этих настроек через командную строку нет. Для служебных флагов Cargo нужен разделитель `--`: например, `cargo run --release -- --directory run`.
 
 Команды консоли: `help`, `version`, `tps`, `plugins`, `op NAME`, `deop NAME`, `setblock X Y Z STATE-ID`, `stop`. Права плагинов сейчас проверяются через статус оператора. `/tpsbar` отображается в игре. Полного permission API и встроенного spark пока нет. Журнал `logs/latest.log` дописывается и автоматически не ротируется.
