@@ -1,8 +1,20 @@
 # Native profiling
 
+On Linux, an operator with level 4 can run:
+
+```text
+/spark profiler start --timeout 30
+/spark profiler status
+/spark profiler stop
+```
+
+The server saves the report in `profiles/`. Open the file in the spark viewer. No report is uploaded automatically.
+
 `zerqon-profiler` samples the Rust process on Linux with kernel `perf_event_open` CPU-clock events. Each thread present at capture start has a fixed 64 KiB ring buffer. Kernel callchains are resolved to native symbols and exported as spark `SamplerData` protobuf. Worker CPU time is measured independently of the coordinator's `/tps` timing.
 
 The first backend is Linux only. Windows returns `Unsupported`; it does not substitute Java stacks or tick timings. Linux kernels may deny perf access. The sampler reports that error and does not change kernel settings, capabilities or permissions. It does not sample a separate Java-plugin JVM or threads created after capture start.
+
+The Linux CI test grants `CAP_PERFMON` to its test executable for that one check and removes it afterwards. This follows the kernel's per-executable capability model; it does not change system-wide perf settings. [Kernel documentation](https://www.kernel.org/doc/html/latest/admin-guide/perf-security.html).
 
 Build Linux binaries with frame pointers and symbols. The repository release profile retains symbols and `.cargo/config.toml` enables Linux frame pointers. Libraries built without frame pointers can produce shorter callchains. Unresolved addresses remain visible as hexadecimal addresses. Inlined function attribution is represented by the enclosing native symbol.
 

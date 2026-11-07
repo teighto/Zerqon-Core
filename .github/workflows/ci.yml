@@ -78,7 +78,28 @@ jobs:
       - name: Generate isolated vanilla world fixture
         run: python scripts/generate-test-world.py --server-jar .cache/vanilla/26.3/server.jar --directory .local/vanilla-world-filled --accept-eula
       - name: Data and plugin integration tests
-        run: cargo test --workspace --locked -- --ignored --skip measure_one_thousand_entities_on_flat_ground
+        run: cargo test --workspace --locked -- --ignored --skip measure_one_thousand_entities_on_flat_ground --skip profiling::tests::real_cpu_capture_survives_cancelled_request_autosaves_stops_and_shuts_down
+      - name: Native CPU sampler integration
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          cargo test -p zerqon --bin zerqon --no-run --locked --message-format=json > target/profiler-test-build.jsonl
+          test_binary=$(python3 - <<'PY'
+          import json
+          from pathlib import Path
+          paths = []
+          for line in Path("target/profiler-test-build.jsonl").read_text().splitlines():
+              entry = json.loads(line)
+              if entry.get("reason") == "compiler-artifact" and entry.get("target", {}).get("name") == "zerqon" and entry.get("profile", {}).get("test") and entry.get("executable"):
+                  paths.append(entry["executable"])
+          if len(paths) != 1:
+              raise SystemExit("Expected one native profiler test executable")
+          print(paths[0])
+          PY
+          )
+          sudo setcap cap_perfmon=ep "$test_binary"
+          trap 'sudo setcap -r "$test_binary"' EXIT
+          "$test_binary" --exact profiling::tests::real_cpu_capture_survives_cancelled_request_autosaves_stops_and_shuts_down --ignored --nocapture
       - name: Official packet codec checks
         run: python scripts/test-vanilla-codec.py
       - name: Build native release
