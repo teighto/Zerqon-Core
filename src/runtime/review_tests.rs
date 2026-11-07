@@ -372,6 +372,41 @@ async fn cancelled_accepted_placement_keeps_its_inventory_snapshot_until_commit(
 
 #[tokio::test]
 #[ignore = "requires prepared official Minecraft 26.3 data"]
+async fn normal_stop_cancels_world_reads_without_marking_storage_unavailable() {
+    let (_directory, state) = state().await;
+    let world = state.world.as_ref().unwrap();
+    world.chunk(0, 0).await.unwrap();
+    state.lifecycle.stop();
+    let error = world
+        .cached_chunks()
+        .expect_err("stopped world accepted a read");
+    world.store.check_available().unwrap();
+    world.check_health().unwrap();
+    assert!(
+        crate::managed_tasks::is_cancelled(error.as_ref()),
+        "ordinary stop was reported as a world failure: {error}"
+    );
+}
+
+fn assert_failed_world_read(world: &World) {
+    let health = world
+        .check_health()
+        .expect_err("world failure disappeared from the shutdown health check");
+    assert!(
+        !crate::managed_tasks::is_cancelled(health.as_ref()),
+        "world health failure was reported as ordinary cancellation: {health}"
+    );
+    let error = world
+        .cached_chunks()
+        .expect_err("failed world accepted a read");
+    assert!(
+        !crate::managed_tasks::is_cancelled(error.as_ref()),
+        "world failure was reported as ordinary cancellation: {error}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires prepared official Minecraft 26.3 data"]
 async fn cache_publication_failure_after_commit_stops_world_without_claiming_rollback() {
     let (_directory, state) = state().await;
     let world = state.world.as_ref().unwrap();
@@ -405,7 +440,7 @@ async fn cache_publication_failure_after_commit_stops_world_without_claiming_rol
         world.store.load(0, 0).unwrap().unwrap().get_block(2, 64, 0),
         Some(stone)
     );
-    assert!(world.cached_chunks().is_err());
+    assert_failed_world_read(world);
     assert!(outbound.try_recv().is_err());
 }
 
@@ -440,7 +475,7 @@ async fn corrupt_saved_block_state_is_not_echoed_as_a_rejection_correction() {
         );
     }
     assert!(*shutdown.borrow_and_update());
-    assert!(world.cached_chunks().is_err());
+    assert_failed_world_read(world);
     assert_eq!(
         world.store.load(0, 0).unwrap().unwrap().get_block(2, 63, 0),
         Some(u32::MAX)

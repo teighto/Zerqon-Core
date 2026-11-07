@@ -1,7 +1,7 @@
 use std::{
     collections::VecDeque,
     fs,
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     time::Duration,
@@ -13,7 +13,7 @@ use zerqon_protocol::codec::{
     get_string, get_varint, put_string, put_varint, read_frame, take, write_frame,
 };
 
-struct Server(Child);
+struct Server(Child, PathBuf);
 
 fn server_executable() -> PathBuf {
     std::env::var_os("ZERQON_TEST_SERVER_EXE").map_or_else(
@@ -41,6 +41,7 @@ impl Server {
                 .stderr(Stdio::inherit())
                 .spawn()
                 .unwrap(),
+            directory.join("logs/latest.log"),
         );
         let output = server.0.stdout.take().unwrap();
         let (sender, receiver) = std::sync::mpsc::channel();
@@ -69,7 +70,26 @@ impl Server {
         })
         .await
         .expect("test server did not shut down");
-        assert!(status.success(), "server shutdown failed");
+        assert!(
+            status.success(),
+            "server shutdown failed ({status}):\n{}",
+            self.log_tail()
+        );
+    }
+
+    fn log_tail(&self) -> String {
+        let read = || -> std::io::Result<Vec<u8>> {
+            let mut file = fs::File::open(&self.1)?;
+            let length = file.metadata()?.len().min(65_536);
+            file.seek(SeekFrom::End(-(length as i64)))?;
+            let mut bytes = Vec::with_capacity(length as usize);
+            file.take(length).read_to_end(&mut bytes)?;
+            Ok(bytes)
+        };
+        match read() {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+            Err(error) => format!("server log unavailable: {error}"),
+        }
     }
 }
 

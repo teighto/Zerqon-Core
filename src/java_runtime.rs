@@ -1,3 +1,4 @@
+use crate::cache_lock::TrackedCacheLock;
 use crate::lifecycle::{Lifecycle, StopToken, Stopped};
 use crate::managed_tasks::{self as tasks, OperationError, TaskError};
 use aws_lc_rs::digest::{Context, SHA256};
@@ -412,13 +413,15 @@ async fn install_managed_tracked(
     let directory = version_dir.join(asset.platform.cache_name());
     create_managed_directory(&directory)?;
     reject_runtime_links(&directory.join("install.lock"))?;
-    let lock = fs::OpenOptions::new()
+    let file = fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
         .open(directory.join("install.lock"))?;
-    acquire_install_lock_tracked(&lock, Duration::from_secs(600), stop).await?;
+    let mut lock = TrackedCacheLock::new(file, lifecycle, "Java runtime cache lock")
+        .map_err(TaskError::from)?;
+    acquire_install_lock_tracked(|| lock.try_lock(), Duration::from_secs(600), stop).await?;
     let runtime = directory.join(ARCHIVE_ROOT);
     if runtime.try_exists()? {
         let (java, _lock) =
@@ -471,7 +474,7 @@ struct Installation {
     archive: tempfile::NamedTempFile,
     stage: tempfile::TempDir,
     runtime: PathBuf,
-    _lock: File,
+    _lock: TrackedCacheLock,
 }
 
 async fn finish_installation_tracked(
@@ -803,14 +806,14 @@ fn validate_runtime_contents(
 }
 
 async fn acquire_install_lock_tracked(
-    lock: &File,
+    mut try_lock: impl FnMut() -> Result<(), std::fs::TryLockError>,
     timeout: Duration,
     stop: &StopToken,
 ) -> Result<(), JavaRuntimeError> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         stop.check()?;
-        match lock.try_lock() {
+        match try_lock() {
             Ok(()) => return Ok(()),
             Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
             Err(std::fs::TryLockError::WouldBlock) => {

@@ -1,5 +1,5 @@
 use crate::{
-    WorldError, WorldMetadata,
+    ExclusiveFileLock, WorldError, WorldMetadata,
     metadata::{self, RetainedSource},
 };
 use serde::Serialize;
@@ -27,7 +27,7 @@ pub(crate) struct SourceSnapshot {
     files: Vec<SourceFile>,
     directories: Vec<PathBuf>,
     bytes: u64,
-    _lock: Option<File>,
+    _lock: Option<ExclusiveFileLock>,
 }
 
 #[derive(Serialize)]
@@ -74,6 +74,7 @@ impl SourceSnapshot {
                         ));
                     }
                 }
+                let mut lock = ExclusiveFileLock::new(lock);
                 match lock.try_lock() {
                     Ok(()) => {
                         #[cfg(unix)]

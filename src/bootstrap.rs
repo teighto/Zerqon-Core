@@ -1,3 +1,4 @@
+use crate::cache_lock::TrackedCacheLock;
 use crate::lifecycle::{Lifecycle, StopToken, Stopped};
 use crate::managed_tasks::{self as tasks, OperationError, TaskError};
 use aws_lc_rs::digest::{Context, SHA1_FOR_LEGACY_USE_ONLY};
@@ -131,15 +132,16 @@ impl Bootstrap {
         stop.check()?;
         let directory = checked_cache_directory(directory)?;
         reject_cache_links(&directory.join("prepare.lock"))?;
-        let lock = std::sync::Arc::new(
-            fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(directory.join("prepare.lock"))?,
-        );
-        acquire_prepare_lock_tracked(&lock, Duration::from_secs(600), stop).await?;
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(directory.join("prepare.lock"))?;
+        let mut lock = TrackedCacheLock::new(file, lifecycle, "Minecraft cache lock")
+            .map_err(TaskError::from)?;
+        acquire_prepare_lock_tracked(|| lock.try_lock(), Duration::from_secs(600), stop).await?;
+        let lock = std::sync::Arc::new(lock);
         let jar = directory.join("server.jar");
         let verify_path = jar.clone();
         let verify_lock = std::sync::Arc::clone(&lock);
@@ -237,12 +239,12 @@ impl Bootstrap {
 
 struct PreparationResources {
     stage: std::sync::Arc<tempfile::TempDir>,
-    _lock: std::sync::Arc<File>,
+    _lock: std::sync::Arc<TrackedCacheLock>,
 }
 
 async fn preparation_task_tracked<T: Send + 'static>(
     stage: std::sync::Arc<tempfile::TempDir>,
-    lock: std::sync::Arc<File>,
+    lock: std::sync::Arc<TrackedCacheLock>,
     work: impl FnOnce(&Path) -> Result<T, BootstrapError> + Send + 'static,
     lifecycle: &Lifecycle,
     stop: &StopToken,
@@ -258,14 +260,14 @@ async fn preparation_task_tracked<T: Send + 'static>(
 }
 
 async fn acquire_prepare_lock_tracked(
-    lock: &File,
+    mut try_lock: impl FnMut() -> Result<(), std::fs::TryLockError>,
     timeout: Duration,
     stop: &StopToken,
 ) -> Result<(), BootstrapError> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         stop.check()?;
-        match lock.try_lock() {
+        match try_lock() {
             Ok(()) => return Ok(()),
             Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
             Err(std::fs::TryLockError::WouldBlock) => {

@@ -176,6 +176,9 @@ async fn managed_java_rejects_library_junction_before_executing_the_launcher() {
     assert!(runtime_under_review::probe_fixture(&runtime).await.is_err());
     assert!(!runtime.join("bin/executed").exists());
 }
+#[path = "../src/cache_lock.rs"]
+#[allow(dead_code)]
+mod cache_lock;
 #[path = "../src/lifecycle.rs"]
 #[allow(dead_code)]
 mod lifecycle;

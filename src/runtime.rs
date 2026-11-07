@@ -16,7 +16,7 @@ use std::{
     path::Path,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -154,10 +154,8 @@ impl State {
             Aabb, Bounds, BuildError, Direction, Interaction, Placement, Position, StateId,
         };
         use zerqon_world::{ChunkKey, ChunkWrite, CommitError};
-        if *self.shutdown.borrow() {
-            return Err("server is stopping".into());
-        }
         let world = self.world.as_ref().ok_or("world unavailable")?;
+        world.check_available()?;
         let rules = Arc::clone(self.blocks.as_ref().ok_or("block rules unavailable")?);
         let gameplay = Arc::clone(&self.gameplay).write_owned().await;
         let observers = self.players.snapshots()?;
@@ -202,16 +200,21 @@ impl State {
         let cache = Arc::clone(&world.cache);
         let data = Arc::clone(&world.data);
         let stripes = Arc::clone(&world.stripes);
+        let failed = Arc::clone(&world.failed);
         let players = Arc::clone(&self.players);
         let shutdown = self.shutdown.clone();
         let permit = Arc::clone(&world.inflight).acquire_owned().await?;
         let ticket = world.workers.try_submit(move || {
             Ok((|| -> Result<()> {
                 let _gameplay = gameplay;
-                if *shutdown.borrow() {
-                    return Err("server is stopping".into());
-                }
+                let stopping = *shutdown.borrow();
                 store.check_available()?;
+                if failed.load(Ordering::Acquire) {
+                    return Err(zerqon_world::WorldError::StorageUnavailable.into());
+                }
+                if stopping {
+                    return Err(crate::lifecycle::Stopped.into());
+                }
                 let center = ChunkKey::new(clicked.x.div_euclid(16), clicked.z.div_euclid(16));
                 let keys: Vec<_> = (-1..=1)
                     .flat_map(|x| (-1..=1).map(move |z| ChunkKey::new(center.x + x, center.z + z)))
@@ -238,7 +241,7 @@ impl State {
                     .collect();
                 for chunk in chunks.values() {
                     if let Err(error) = validate_chunk(chunk, &data) {
-                        let _ = shutdown.send(true);
+                        fail_world(&failed, &shutdown);
                         return Err(error.into());
                     }
                 }
@@ -391,7 +394,7 @@ impl State {
                 match store.commit(Uuid::new_v4(), &reads, &writes) {
                     Ok(_) => {}
                     Err(error @ CommitError::Indeterminate { .. }) => {
-                        let _ = shutdown.send(true);
+                        fail_world(&failed, &shutdown);
                         return Err(error.into());
                     }
                     Err(error) => return Err(error.into()),
@@ -403,13 +406,13 @@ impl State {
                         }
                     }
                     Err(_) => {
-                        let _ = shutdown.send(true);
+                        fail_world(&failed, &shutdown);
                         return Err("world edit committed but cache publication failed".into());
                     }
                 }
                 for packet in updates {
                     if let Err(error) = players.broadcast(packet) {
-                        let _ = shutdown.send(true);
+                        fail_world(&failed, &shutdown);
                         return Err(error.into());
                     }
                 }
@@ -1352,6 +1355,7 @@ pub fn block_update(x: i32, y: i32, z: i32, state: u32) -> Vec<u8> {
 pub struct World {
     players: Arc<Players>,
     shutdown: watch::Sender<bool>,
+    failed: Arc<AtomicBool>,
     gameplay: Arc<RwLock<()>>,
     store: Arc<WorldStore>,
     cache: Arc<Mutex<ChunkCache>>,
@@ -1386,10 +1390,18 @@ impl World {
         Ok(descriptor)
     }
     pub fn check_available(&self) -> Result<()> {
-        if *self.shutdown.borrow() {
+        let stopping = *self.shutdown.borrow();
+        self.check_health()?;
+        if stopping {
+            return Err(crate::lifecycle::Stopped.into());
+        }
+        Ok(())
+    }
+    pub fn check_health(&self) -> Result<()> {
+        self.store.check_available()?;
+        if self.failed.load(Ordering::Acquire) {
             return Err(zerqon_world::WorldError::StorageUnavailable.into());
         }
-        self.store.check_available()?;
         Ok(())
     }
     pub fn spawn(&self) -> SpawnPoint {
@@ -1480,6 +1492,7 @@ impl World {
         Ok(Self {
             players,
             shutdown,
+            failed: Arc::new(AtomicBool::new(false)),
             gameplay,
             store: Arc::new(store),
             cache: Arc::new(Mutex::new(ChunkCache::with_limits(
@@ -1534,6 +1547,7 @@ impl World {
         Ok(result)
     }
     pub async fn set_block(&self, x: i32, y: i32, z: i32, block: u32) -> Result<()> {
+        self.check_available()?;
         let gameplay = Arc::clone(&self.gameplay).write_owned().await;
         if x.unsigned_abs() > 30_000_000
             || z.unsigned_abs() > 30_000_000
@@ -1543,6 +1557,7 @@ impl World {
         }
         let players = Arc::clone(&self.players);
         let shutdown = self.shutdown.clone();
+        let failed = Arc::clone(&self.failed);
         let permit = Arc::clone(&self.inflight).acquire_owned().await?;
         let store = Arc::clone(&self.store);
         let cache = Arc::clone(&self.cache);
@@ -1550,8 +1565,13 @@ impl World {
         let stripes = Arc::clone(&self.stripes);
         let ticket = self.workers.try_submit(move || {
             let _gameplay = gameplay;
-            if *shutdown.borrow() {
+            let stopping = *shutdown.borrow();
+            store.check_available()?;
+            if failed.load(Ordering::Acquire) {
                 return Err(zerqon_world::WorldError::StorageUnavailable);
+            }
+            if stopping {
+                return Err(zerqon_world::WorldError::Cancelled);
             }
             let cx = x.div_euclid(16);
             let cz = z.div_euclid(16);
@@ -1573,7 +1593,7 @@ impl World {
             chunk.set_block(x.rem_euclid(16) as u8, y, z.rem_euclid(16) as u8, block)?;
             if let Err(error) = store.save(&chunk) {
                 if store.check_available().is_err() {
-                    let _ = shutdown.send(true);
+                    fail_world(&failed, &shutdown);
                 }
                 return Err(error);
             }
@@ -1582,7 +1602,7 @@ impl World {
                     cache.insert(Arc::new(chunk));
                 }
                 Err(_) => {
-                    let _ = shutdown.send(true);
+                    fail_world(&failed, &shutdown);
                     return Err(zerqon_world::WorldError::StorageUnavailable);
                 }
             }
@@ -1590,18 +1610,27 @@ impl World {
                 .broadcast(block_update(x, y, z, block).into())
                 .is_err()
             {
-                let _ = shutdown.send(true);
+                fail_world(&failed, &shutdown);
                 return Err(zerqon_world::WorldError::StorageUnavailable);
             }
             Ok(())
         })?;
-        tokio::task::spawn_blocking(move || {
+        let result = tokio::task::spawn_blocking(move || {
             let _permit = permit;
             ticket.wait()
         })
-        .await??;
-        Ok(())
+        .await?;
+        match result {
+            Ok(()) => Ok(()),
+            Err(zerqon_world::WorldError::Cancelled) => Err(crate::lifecycle::Stopped.into()),
+            Err(error) => Err(error.into()),
+        }
     }
+}
+
+fn fail_world(failed: &AtomicBool, shutdown: &watch::Sender<bool>) {
+    failed.store(true, Ordering::Release);
+    shutdown.send_replace(true);
 }
 fn validate_chunk(
     chunk: &Chunk,

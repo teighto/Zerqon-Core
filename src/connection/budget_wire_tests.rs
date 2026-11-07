@@ -385,9 +385,10 @@ async fn cancelling_a_blocked_tcp_handler_reclaims_queued_packet_leases() {
         wait_used(&fixture.state, held + 4 * FRAME_BYTES).await;
         drop(connection);
         wait_used(&fixture.state, 0).await;
-        assert_eq!(fixture.state.players.count(), 0);
         client.expect_closed().await;
         drop(blocker);
+        fixture.state.sessions.drain().await;
+        assert_eq!(fixture.state.players.count(), 0);
     })
     .await
     .expect("TCP handler cancellation exceeded its five-second window");

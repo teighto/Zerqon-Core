@@ -284,6 +284,7 @@ async fn run_tick(state: Arc<State>, tick: u64) -> Result<()> {
     }
     let started = Instant::now();
     let mut failures = Vec::new();
+    let mut cancellation = None;
     if let Err(error) = state.players.tracking_tick() {
         failures.push(format!("player tracking: {error}"));
     }
@@ -291,7 +292,9 @@ async fn run_tick(state: Arc<State>, tick: u64) -> Result<()> {
         && let Some(mobs) = &state.mobs
         && let Err(error) = mobs.tick(tick).await
     {
-        if error
+        if *state.shutdown.borrow() && crate::managed_tasks::is_cancelled(error.as_ref()) {
+            cancellation = Some(error);
+        } else if error
             .downcast_ref::<crate::mob_store::StoreError>()
             .is_some()
         {
@@ -308,10 +311,12 @@ async fn run_tick(state: Arc<State>, tick: u64) -> Result<()> {
     if let Ok(mut stats) = state.stats.lock() {
         stats.record(started, started.elapsed());
     }
-    if failures.is_empty() {
-        Ok(())
-    } else {
+    if !failures.is_empty() {
         Err(failures.join("; ").into())
+    } else if let Some(error) = cancellation {
+        Err(error)
+    } else {
+        Ok(())
     }
 }
 
@@ -480,6 +485,12 @@ fn record_failure(failures: &mut Vec<String>, omitted: &mut u64, error: String) 
 async fn shutdown_components(state: &State) -> Result<()> {
     state.sessions.drain().await;
     let mut failures = Vec::new();
+    if let Some(world) = &state.world
+        && let Err(error) = world.check_health()
+    {
+        tracing::error!(%error, "World remained unavailable during shutdown");
+        failures.push(format!("world: {error}"));
+    }
     if let Some(mobs) = &state.mobs
         && let Err(error) = mobs.flush().await
     {
@@ -628,5 +639,210 @@ mod tests {
                 .await,
             Err(ProfilerServiceError::ShuttingDown)
         ));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires prepared official Minecraft 26.3 data"]
+    async fn normal_stop_while_mob_tick_waits_for_gameplay_does_not_fail_shutdown() {
+        use crate::{config, players::Identity};
+        use std::future::Future;
+        let directory = tempfile::tempdir().unwrap();
+        config::initialize(directory.path()).unwrap();
+        let settings = Settings {
+            data_directory: std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(".cache/vanilla/26.3")
+                .to_string_lossy()
+                .into_owned(),
+            java_plugins: false,
+            update_check: false,
+            spawn_mobs: false,
+            ..Settings::default()
+        };
+        let (shutdown, _) = watch::channel(false);
+        let state = State::new(
+            directory.path(),
+            Properties::parse("online-mode=false\nview-distance=1\n").unwrap(),
+            settings,
+            false,
+            shutdown,
+            None,
+        )
+        .await
+        .unwrap();
+        let (outbound, _receiver) = mpsc::channel(32);
+        let (disconnect, _closed) = watch::channel(false);
+        let player = state
+            .players
+            .reserve(
+                Identity {
+                    uuid: uuid::Uuid::from_u128(2),
+                    name: "StopTester".into(),
+                    properties: vec![],
+                },
+                outbound,
+                disconnect,
+            )
+            .unwrap();
+        player.activate().unwrap();
+        state
+            .mobs
+            .as_ref()
+            .unwrap()
+            .summon(zerqon_entities::MobKind::Pig, [2.5, 64.0, 0.5])
+            .await
+            .unwrap();
+        let blocker = state.gameplay.write().await;
+        let mut tick = Box::pin(run_tick(Arc::clone(&state), 1));
+        std::future::poll_fn(|context| {
+            assert!(tick.as_mut().poll(context).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        state.lifecycle.stop();
+        drop(blocker);
+        let tick = tokio::time::timeout(Duration::from_secs(5), tick).await;
+        drop(player);
+        let cleanup = shutdown_components(&state).await;
+        let drain = state
+            .lifecycle
+            .drain(tokio::time::Instant::now() + Duration::from_secs(5))
+            .await;
+        assert!(
+            matches!(&tick, Ok(Ok(())))
+                || matches!(&tick, Ok(Err(error)) if crate::managed_tasks::is_cancelled(error.as_ref())),
+            "normal stop was reported as a failed mob tick: {tick:?}"
+        );
+        assert!(cleanup.is_ok(), "shutdown cleanup failed: {cleanup:?}");
+        assert!(drain.is_ok(), "lifecycle cleanup failed: {drain:?}");
+        assert!(state.lifecycle.pending().is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires prepared official Minecraft 26.3 data"]
+    async fn failed_world_shutdown_reports_failure_and_still_disables_plugins_and_profiler() {
+        use crate::{
+            config, game_data::GameData, players::Identity, profiling::ProfilerServiceError,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        config::initialize(directory.path()).unwrap();
+        let data_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".cache/vanilla/26.3");
+        let data = GameData::load(&data_path).unwrap();
+        let store = zerqon_world::WorldStore::open(directory.path().join("world")).unwrap();
+        let mut chunk = zerqon_world::Chunk::flat(0, 0, data.flat);
+        chunk.set_block(2, 63, 0, u32::MAX).unwrap();
+        store.save(&chunk).unwrap();
+        drop(store);
+        drop(data);
+        let settings = Settings {
+            data_directory: data_path.to_string_lossy().into_owned(),
+            java_plugins: false,
+            update_check: false,
+            spawn_mobs: false,
+            ..Settings::default()
+        };
+        let (shutdown, _) = watch::channel(false);
+        let state = State::new(
+            directory.path(),
+            Properties::parse("online-mode=false\nview-distance=1\n").unwrap(),
+            settings,
+            false,
+            shutdown,
+            None,
+        )
+        .await
+        .unwrap();
+        let observer = wat::parse_str(
+            "(module (memory (export \"memory\") 1)
+                (func (export \"zerqon_abi_version\") (result i32) i32.const 1)
+                (func (export \"zerqon_on_event\") (result i32) i32.const 0))",
+        )
+        .unwrap();
+        drop(
+            state
+                .plugins
+                .load(
+                    "shutdown-witness",
+                    &observer,
+                    &state.lifecycle.token(),
+                    tokio::time::Instant::now() + Duration::from_secs(5),
+                )
+                .await
+                .unwrap(),
+        );
+        let (outbound, _receiver) = mpsc::channel(32);
+        let (disconnect, _closed) = watch::channel(false);
+        let uuid = uuid::Uuid::from_u128(3);
+        let player = state
+            .players
+            .reserve(
+                Identity {
+                    uuid,
+                    name: "FailedWorld".into(),
+                    properties: Vec::new(),
+                },
+                outbound,
+                disconnect,
+            )
+            .unwrap();
+        let inventory = state
+            .inventories
+            .as_ref()
+            .unwrap()
+            .open(uuid, player.id())
+            .await
+            .unwrap();
+        player.activate().unwrap();
+        state
+            .inventories
+            .as_ref()
+            .unwrap()
+            .give(uuid, player.id(), "stone", 1)
+            .await
+            .unwrap();
+        let edit = state
+            .edit_block(
+                uuid,
+                player.id(),
+                &inventory,
+                crate::runtime::BlockInteraction::Place(zerqon_inventory::UseOnRequest {
+                    hand: zerqon_inventory::Hand::Main,
+                    block: zerqon_inventory::BlockPosition { x: 2, y: 63, z: 0 },
+                    face: zerqon_inventory::Face::Up,
+                    hit: [0.5, 1.0, 0.5],
+                    inside: false,
+                    world_border_hit: false,
+                    sequence: 1,
+                }),
+            )
+            .await;
+        let stopped_by_world = *state.shutdown.borrow();
+        let health = state.world.as_ref().unwrap().check_health();
+        drop(inventory);
+        drop(player);
+        state.lifecycle.stop();
+        let cleanup = shutdown_components(&state).await;
+        let disabled = state.plugins.list().is_empty();
+        let profiler = state
+            .profiler
+            .execute(&["profiler".into(), "start".into()], true)
+            .await;
+        let drain = state
+            .lifecycle
+            .drain(tokio::time::Instant::now() + Duration::from_secs(5))
+            .await;
+        assert!(edit.is_err(), "corrupt stored block was accepted");
+        assert!(stopped_by_world, "corruption did not stop the world");
+        assert!(
+            matches!(health, Err(error) if !crate::managed_tasks::is_cancelled(error.as_ref()))
+        );
+        assert!(
+            matches!(cleanup, Err(error) if !crate::managed_tasks::is_cancelled(error.as_ref())),
+            "world failure was hidden by shutdown"
+        );
+        assert!(disabled, "world failure skipped plugin Disable");
+        assert!(matches!(profiler, Err(ProfilerServiceError::ShuttingDown)));
+        assert!(drain.is_ok(), "lifecycle cleanup failed: {drain:?}");
+        assert!(state.lifecycle.pending().is_empty());
     }
 }

@@ -1,5 +1,6 @@
 use crate::{
-    Chunk, GenerationPolicy, SECTION_COUNT, SECTION_VOLUME, Section, WorldError, WorldMetadata,
+    Chunk, ExclusiveFileLock, GenerationPolicy, SECTION_COUNT, SECTION_VOLUME, Section, WorldError,
+    WorldMetadata,
 };
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{Read, Write};
@@ -16,7 +17,7 @@ pub struct WorldStore {
     stripes: [RwLock<()>; 64],
     metadata: Option<WorldMetadata>,
     transactions: Option<crate::transaction::Transactions>,
-    _lock: File,
+    _lock: ExclusiveFileLock,
 }
 
 impl WorldStore {
@@ -71,6 +72,7 @@ impl WorldStore {
             .create(true)
             .truncate(false)
             .open(root.join("world.lock"))?;
+        let mut lock = ExclusiveFileLock::new(lock);
         lock.try_lock().map_err(|error| match error {
             TryLockError::WouldBlock => WorldError::Locked,
             TryLockError::Error(error) => WorldError::Io(error),
@@ -365,5 +367,29 @@ impl Reader<'_> {
         result.copy_from_slice(source);
         self.position = end;
         Ok(result)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::fd::AsFd;
+
+    #[test]
+    fn closing_world_releases_its_lock_while_an_inherited_descriptor_remains_open() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = WorldStore::open(directory.path()).unwrap();
+        let uuid = store.uuid().unwrap();
+        let inherited = store._lock.as_fd().try_clone_to_owned().unwrap();
+        assert!(matches!(
+            WorldStore::open(directory.path()),
+            Err(WorldError::Locked)
+        ));
+        drop(store);
+        let reopened = WorldStore::open(directory.path())
+            .expect("a closed world must release its lock before inherited descriptors close");
+        assert_eq!(reopened.uuid().unwrap(), uuid);
+        drop(reopened);
+        drop(inherited);
     }
 }

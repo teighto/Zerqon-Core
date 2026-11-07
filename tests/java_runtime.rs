@@ -1,3 +1,6 @@
+#[path = "../src/cache_lock.rs"]
+#[allow(dead_code)]
+mod cache_lock;
 #[path = "../src/lifecycle.rs"]
 #[allow(dead_code)]
 mod lifecycle;
@@ -66,7 +69,7 @@ mod tests {
         .await?
     }
     async fn acquire_install_lock(lock: &File, timeout: Duration) -> Result<(), JavaRuntimeError> {
-        acquire_install_lock_tracked(lock, timeout, &Lifecycle::new().token()).await
+        acquire_install_lock_tracked(|| lock.try_lock(), timeout, &Lifecycle::new().token()).await
     }
     async fn download_archive(
         client: &reqwest::Client,
@@ -1249,13 +1252,23 @@ mod tests {
     }
 
     fn installation_fixture(directory: &Path, archive_bytes: &[u8]) -> Installation {
-        let lock = fs::OpenOptions::new()
+        let file = fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
             .open(directory.join("install.lock"))
             .unwrap();
+        installation_fixture_with_file(directory, archive_bytes, file, &Lifecycle::new())
+    }
+
+    fn installation_fixture_with_file(
+        directory: &Path,
+        archive_bytes: &[u8],
+        file: File,
+        lifecycle: &Lifecycle,
+    ) -> Installation {
+        let mut lock = TrackedCacheLock::new(file, lifecycle, "test Java cache lock").unwrap();
         lock.try_lock().unwrap();
         let mut archive = tempfile::NamedTempFile::new_in(directory).unwrap();
         archive.write_all(archive_bytes).unwrap();
@@ -1339,7 +1352,20 @@ mod tests {
         running.recv_timeout(Duration::from_secs(5)).unwrap();
         runtime.block_on(async {
             let directory = tempfile::tempdir().unwrap();
-            let installation = installation_fixture(directory.path(), b"invalid archive");
+            let file = fs::OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .write(true)
+                .open(directory.path().join("install.lock"))
+                .unwrap();
+            let inherited = file.try_clone().unwrap();
+            let lifecycle = Lifecycle::new();
+            let installation = installation_fixture_with_file(
+                directory.path(),
+                b"invalid archive",
+                file,
+                &lifecycle,
+            );
             let archive = installation.archive.path().to_owned();
             let stage = installation.stage.path().to_owned();
             let waiter = fs::OpenOptions::new()
@@ -1347,7 +1373,6 @@ mod tests {
                 .write(true)
                 .open(directory.path().join("install.lock"))
                 .unwrap();
-            let lifecycle = Lifecycle::new();
             let stop = lifecycle.token();
             let mut task = Box::pin(finish_installation_tracked(
                 installation,
@@ -1366,17 +1391,17 @@ mod tests {
             let inputs_retained = archive.is_file() && stage.is_dir();
             release.send(()).unwrap();
             blocker.await.unwrap();
-            acquire_install_lock(&waiter, Duration::from_secs(5))
-                .await
-                .unwrap();
-            assert!(lock_held, "queued installation lost its cache lock");
-            assert!(inputs_retained, "queued installation lost its input guards");
-            assert!(!archive.exists() && !stage.exists());
-            assert!(!directory.path().join(ARCHIVE_ROOT).exists());
             lifecycle
                 .drain(tokio::time::Instant::now() + Duration::from_secs(5))
                 .await
                 .unwrap();
+            waiter.try_lock().unwrap();
+            assert!(inherited.metadata().unwrap().is_file());
+            assert!(lock_held, "queued installation lost its cache lock");
+            assert!(inputs_retained, "queued installation lost its input guards");
+            assert!(!archive.exists() && !stage.exists());
+            assert!(!directory.path().join(ARCHIVE_ROOT).exists());
+            waiter.unlock().unwrap();
         });
     }
 

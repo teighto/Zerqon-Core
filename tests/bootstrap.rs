@@ -1,3 +1,6 @@
+#[path = "../src/cache_lock.rs"]
+#[allow(dead_code)]
+mod cache_lock;
 #[path = "../src/lifecycle.rs"]
 #[allow(dead_code)]
 mod lifecycle;
@@ -22,7 +25,7 @@ mod tests {
     }
 
     async fn acquire_prepare_lock(lock: &File, timeout: Duration) -> Result<(), BootstrapError> {
-        acquire_prepare_lock_tracked(lock, timeout, &Lifecycle::new().token()).await
+        acquire_prepare_lock_tracked(|| lock.try_lock(), timeout, &Lifecycle::new().token()).await
     }
 
     async fn download(
@@ -560,15 +563,18 @@ mod tests {
     async fn cancelled_preparation_keeps_stage_and_exclusive_lock_until_blocking_work_finishes() {
         let directory = tempfile::tempdir().unwrap();
         let lock_path = directory.path().join("prepare.lock");
-        let lock = std::sync::Arc::new(
-            fs::OpenOptions::new()
-                .create_new(true)
-                .read(true)
-                .write(true)
-                .open(&lock_path)
-                .unwrap(),
-        );
+        let file = fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        let inherited = file.try_clone().unwrap();
+        let lifecycle = Lifecycle::new();
+        let mut lock =
+            TrackedCacheLock::new(file, &lifecycle, "test Minecraft cache lock").unwrap();
         lock.try_lock().unwrap();
+        let lock = std::sync::Arc::new(lock);
         let second = fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -579,7 +585,6 @@ mod tests {
         let (started, running) = tokio::sync::oneshot::channel();
         let (release, released) = std::sync::mpsc::channel();
         let (completed, completion) = tokio::sync::oneshot::channel();
-        let lifecycle = Lifecycle::new();
         let context = lifecycle.clone();
         let task = tokio::spawn(async move {
             preparation_task_tracked(
@@ -620,6 +625,7 @@ mod tests {
         ));
         assert!(!stage_path.exists());
         second.try_lock().unwrap();
+        assert!(inherited.metadata().unwrap().is_file());
     }
 
     async fn generator_fixture(main_class: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {

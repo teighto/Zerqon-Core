@@ -6,6 +6,7 @@ use std::{
     path::{Path, PathBuf},
 };
 use uuid::Uuid;
+use zerqon_world::ExclusiveFileLock;
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -37,6 +38,8 @@ pub enum OperatorStoreError {
     TooLarge,
     #[error("another process is updating operators")]
     Busy,
+    #[error("operator change was saved, but releasing its file lock failed: {0}")]
+    CommittedCleanup(#[source] std::io::Error),
     #[error("operator storage paths must be regular files and directories")]
     InvalidPath,
     #[error(transparent)]
@@ -153,6 +156,7 @@ impl OperatorStore {
             .read(true)
             .write(true)
             .open(lock_path)?;
+        let mut lock = ExclusiveFileLock::new(lock);
         match lock.try_lock() {
             Ok(()) => {}
             Err(fs::TryLockError::WouldBlock) => return Err(OperatorStoreError::Busy),
@@ -179,6 +183,8 @@ impl OperatorStore {
         self.snapshot = Some(bytes);
         #[cfg(unix)]
         directory.sync_all()?;
+        lock.release()
+            .map_err(OperatorStoreError::CommittedCleanup)?;
         Ok(true)
     }
 }

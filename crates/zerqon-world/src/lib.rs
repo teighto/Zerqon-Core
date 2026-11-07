@@ -1,6 +1,7 @@
 pub mod anvil;
 mod cache;
 mod chunk;
+mod file_lock;
 pub mod metadata;
 mod section;
 mod source_data;
@@ -10,6 +11,7 @@ mod workers;
 
 pub use cache::ChunkCache;
 pub use chunk::{Chunk, FlatPalette, MIN_Y, SECTION_COUNT, WORLD_HEIGHT};
+pub use file_lock::ExclusiveFileLock;
 pub use metadata::{GenerationPolicy, SpawnPoint, WorldMetadata};
 pub use section::{SECTION_VOLUME, Section};
 pub use storage::WorldStore;
@@ -24,7 +26,7 @@ pub enum WorldError {
     Cancelled,
     #[error("world storage: {0}")]
     Storage(String),
-    #[error("world storage requires reopening after an uncertain commit")]
+    #[error("world storage is unavailable; reopen the world before continuing")]
     StorageUnavailable,
     #[error("world commit {operation} has an uncertain outcome: {cause}")]
     CommitIndeterminate {

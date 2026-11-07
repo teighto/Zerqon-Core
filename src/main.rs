@@ -1,5 +1,6 @@
 mod auth;
 mod bootstrap;
+mod cache_lock;
 mod client_policy;
 mod config;
 mod connection;

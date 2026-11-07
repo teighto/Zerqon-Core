@@ -2821,6 +2821,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror",
+ "tracing",
  "uuid",
  "winapi-util",
 ]
