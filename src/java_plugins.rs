@@ -1,7 +1,14 @@
 use crate::java_launch::{JavaLaunchError, JavaLaunchPath};
+use crate::plugin_services::{
+    MAX_NATIVE_CALL_BYTES, MAX_NATIVE_CALLS, MAX_NATIVE_RESULT_BYTES, MAX_NATIVE_TOTAL_BYTES,
+    NativeCallContext, NativeErrorCode, NativeQuery, NativeQueryError, NativeQueryService,
+    ServerSnapshot,
+};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -70,6 +77,10 @@ pub struct JavaPlugins {
 #[derive(Serialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 enum Operation {
+    Hello {
+        min_protocol: u32,
+        max_protocol: u32,
+    },
     Load {
         directory: String,
         server_version: String,
@@ -93,9 +104,31 @@ struct Envelope {
 struct Request {
     id: u64,
     bytes: Vec<u8>,
-    shutdown: bool,
+    kind: RequestKind,
     deadline: Instant,
     reply: oneshot::Sender<Result<Vec<JavaPluginResult>, JavaPluginError>>,
+}
+
+enum RequestKind {
+    Hello,
+    Load,
+    Event { plugin: Option<String> },
+    List,
+    Shutdown,
+}
+
+impl RequestKind {
+    fn of(operation: &Operation) -> Self {
+        match operation {
+            Operation::Hello { .. } => Self::Hello,
+            Operation::Load { .. } => Self::Load,
+            Operation::Event { plugin, .. } => Self::Event {
+                plugin: plugin.clone(),
+            },
+            Operation::List => Self::List,
+            Operation::Shutdown => Self::Shutdown,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -109,8 +142,87 @@ struct Response {
     error: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HelloResponse {
+    id: u64,
+    ok: bool,
+    results: Vec<JavaPluginResult>,
+    protocol: u32,
+    capabilities: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum HostFrame {
+    Response(Response),
+    NativeCall(NativeCall),
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum NativeCallKind {
+    NativeCall,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeCall {
+    kind: NativeCallKind,
+    parent_id: u64,
+    call_id: u64,
+    plugin: String,
+    operation: NativeQuery,
+}
+
+#[derive(Serialize)]
+struct NativeResult {
+    kind: &'static str,
+    parent_id: u64,
+    call_id: u64,
+    result: NativeResultValue,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum NativeResultValue {
+    Success { ok: bool, value: ServerSnapshot },
+    Error { ok: bool, error: NativeQueryError },
+}
+
+struct NativeHost {
+    service: Arc<dyn NativeQueryService>,
+    available: HashSet<String>,
+    known: HashSet<String>,
+    active: HashSet<String>,
+    negotiated: bool,
+}
+
+impl NativeHost {
+    fn permits(&self, kind: &RequestKind, plugin: &str) -> bool {
+        self.negotiated
+            && valid_plugin_name(plugin)
+            && match kind {
+                RequestKind::Load => self.available.contains(plugin),
+                RequestKind::Event { .. } => self.active.contains(plugin),
+                RequestKind::Shutdown => self.active.contains(plugin),
+                RequestKind::Hello | RequestKind::List => false,
+            }
+    }
+}
+
 impl JavaPlugins {
-    pub async fn spawn(config: JavaPluginConfig) -> Result<Self, JavaPluginError> {
+    pub async fn spawn_with_services(
+        config: JavaPluginConfig,
+        services: Arc<dyn NativeQueryService>,
+    ) -> Result<Self, JavaPluginError> {
+        Self::spawn_internal(config, Some(services)).await
+    }
+
+    async fn spawn_internal(
+        config: JavaPluginConfig,
+        services: Option<Arc<dyn NativeQueryService>>,
+    ) -> Result<Self, JavaPluginError> {
         if !(1..=1024).contains(&config.queue_capacity)
             || config.request_timeout.is_zero()
             || config.startup_timeout.is_zero()
@@ -125,6 +237,18 @@ impl JavaPlugins {
             ));
         }
         std::fs::create_dir_all(&config.directory)?;
+        let negotiate = services.is_some();
+        let native = services
+            .map(|service| {
+                Ok::<_, JavaPluginError>(NativeHost {
+                    service,
+                    available: plugin_candidates(&config.directory)?,
+                    known: HashSet::new(),
+                    active: HashSet::new(),
+                    negotiated: false,
+                })
+            })
+            .transpose()?;
         let directory = std::fs::canonicalize(&config.directory)?
             .to_str()
             .ok_or(JavaPluginError::Configuration(
@@ -167,7 +291,7 @@ impl JavaPlugins {
             let _classpath = classpath;
             let stderr_task = StderrTask(tokio::spawn(drain_stderr(stderr)));
             tokio::select! {
-                () = run_host(&mut child, stdin, stdout, receiver) => {}
+                () = run_host(&mut child, stdin, stdout, receiver, native) => {}
                 _ = cancelled => terminate(&mut child).await,
             }
             drop(stderr_task);
@@ -179,6 +303,17 @@ impl JavaPlugins {
             request_timeout: config.request_timeout,
             startup_results: Vec::new(),
         };
+        if negotiate {
+            plugins
+                .request(
+                    Operation::Hello {
+                        min_protocol: 2,
+                        max_protocol: 2,
+                    },
+                    config.startup_timeout,
+                )
+                .await?;
+        }
         plugins.startup_results = plugins
             .request(
                 Operation::Load {
@@ -218,10 +353,12 @@ impl JavaPlugins {
         operation: Operation,
         duration: Duration,
     ) -> Result<Vec<JavaPluginResult>, JavaPluginError> {
-        let shutdown = matches!(operation, Operation::Shutdown);
+        let kind = RequestKind::of(&operation);
         let id = self
             .sequence
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
+                (id < i64::MAX as u64).then_some(id + 1)
+            })
             .map_err(|_| JavaPluginError::Stopped)?;
         let mut writer = LimitedWriter {
             bytes: Vec::new(),
@@ -236,7 +373,7 @@ impl JavaPlugins {
             .try_send(Request {
                 id,
                 bytes: writer.bytes,
-                shutdown,
+                kind,
                 deadline,
                 reply,
             })
@@ -284,6 +421,35 @@ fn java_classpath(config: &JavaPluginConfig) -> Result<JavaLaunchPath, JavaPlugi
     Ok(crate::java_launch::classpath(&paths)?)
 }
 
+fn plugin_candidates(directory: &std::path::Path) -> Result<HashSet<String>, JavaPluginError> {
+    let mut candidates = HashSet::new();
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file()
+            || entry
+                .path()
+                .extension()
+                .is_none_or(|extension| extension != "jar")
+        {
+            continue;
+        }
+        let name = entry
+            .path()
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .filter(|name| valid_plugin_name(name))
+            .ok_or(JavaPluginError::Configuration(
+                "invalid Java plugin file name",
+            ))?
+            .to_owned();
+        candidates.insert(name);
+        if candidates.len() > 64 {
+            return Err(JavaPluginError::Configuration("Java plugin limit is 64"));
+        }
+    }
+    Ok(candidates)
+}
+
 impl Drop for JavaPlugins {
     fn drop(&mut self) {
         if let Some(cancel) = self.cancel.take() {
@@ -304,9 +470,10 @@ async fn run_host(
     mut stdin: ChildStdin,
     stdout: ChildStdout,
     mut receiver: mpsc::Receiver<Request>,
+    mut native: Option<NativeHost>,
 ) {
     let mut stdout = BufReader::with_capacity(8192, stdout);
-    while let Some(request) = receiver.recv().await {
+    while let Some(mut request) = receiver.recv().await {
         if request.reply.is_closed() {
             continue;
         }
@@ -314,23 +481,153 @@ async fn run_host(
             let _ = request.reply.send(Err(JavaPluginError::Timeout));
             continue;
         }
-        let result = timeout_at(request.deadline, async {
+        let exchange = async {
             stdin.write_all(&request.bytes).await?;
             stdin.flush().await?;
-            let line = read_line_limited(&mut stdout, MAX_RESPONSE_BYTES).await?;
-            let response: Response = serde_json::from_slice(&line)
-                .map_err(|_| JavaPluginError::Protocol("invalid JSON envelope"))?;
-            validate_response(response, request.id)
-        })
-        .await
-        .unwrap_or(Err(JavaPluginError::Timeout));
+            if matches!(request.kind, RequestKind::Hello) {
+                let line = read_line_limited(&mut stdout, MAX_REQUEST_BYTES).await?;
+                let hello: HelloResponse = serde_json::from_slice(&line)
+                    .map_err(|_| JavaPluginError::Protocol("invalid protocol negotiation"))?;
+                let native = native.as_mut().ok_or(JavaPluginError::Protocol(
+                    "native query services are unavailable",
+                ))?;
+                if hello.id != request.id
+                    || !hello.ok
+                    || !hello.results.is_empty()
+                    || hello.protocol != 2
+                    || hello.capabilities != ["native_queries"]
+                    || native.negotiated
+                {
+                    return Err(JavaPluginError::Protocol(
+                        "unsupported protocol negotiation",
+                    ));
+                }
+                native.negotiated = true;
+                return Ok(Vec::new());
+            }
+            let mut calls = 0;
+            let mut response_bytes = 0;
+            loop {
+                let line = read_line_limited(&mut stdout, MAX_RESPONSE_BYTES).await?;
+                let frame: HostFrame = serde_json::from_slice(&line)
+                    .map_err(|_| JavaPluginError::Protocol("invalid JSON envelope"))?;
+                match frame {
+                    HostFrame::Response(response) => {
+                        let results = validate_response(response, request.id)?;
+                        if let Some(native) = &mut native {
+                            for result in &results {
+                                let allowed = if matches!(request.kind, RequestKind::Load) {
+                                    &native.available
+                                } else {
+                                    &native.known
+                                };
+                                if !allowed.contains(&result.name) {
+                                    return Err(JavaPluginError::Protocol("unknown plugin result"));
+                                }
+                                if let RequestKind::Event {
+                                    plugin: Some(target),
+                                } = &request.kind
+                                    && result.name != *target
+                                {
+                                    return Err(JavaPluginError::Protocol("wrong plugin result"));
+                                }
+                            }
+                            for result in &results {
+                                native.known.insert(result.name.clone());
+                                if result.enabled {
+                                    native.active.insert(result.name.clone());
+                                } else {
+                                    native.active.remove(&result.name);
+                                }
+                            }
+                        }
+                        return Ok(results);
+                    }
+                    HostFrame::NativeCall(call) => {
+                        let _ = call.kind;
+                        let native = native.as_ref().ok_or(JavaPluginError::Protocol(
+                            "native query before protocol negotiation",
+                        ))?;
+                        if line.len() > MAX_NATIVE_CALL_BYTES
+                            || calls >= MAX_NATIVE_CALLS
+                            || call.parent_id != request.id
+                            || call.call_id != calls + 1
+                            || !native.permits(&request.kind, &call.plugin)
+                        {
+                            return Err(JavaPluginError::Protocol("invalid native query frame"));
+                        }
+                        calls += 1;
+                        let deadline = request
+                            .deadline
+                            .min(Instant::now() + Duration::from_millis(250));
+                        let context = NativeCallContext {
+                            plugin: call.plugin,
+                            parent_id: request.id,
+                            call_id: call.call_id,
+                            deadline,
+                        };
+                        let queried =
+                            timeout_at(deadline, native.service.query(context, call.operation))
+                                .await
+                                .unwrap_or_else(|_| {
+                                    Err(NativeQueryError::new(
+                                        NativeErrorCode::DeadlineExceeded,
+                                        "Native query deadline exceeded",
+                                    ))
+                                });
+                        let result = match queried {
+                            Ok(value) if value.valid() => {
+                                NativeResultValue::Success { ok: true, value }
+                            }
+                            Err(error) if error.valid() => {
+                                NativeResultValue::Error { ok: false, error }
+                            }
+                            _ => NativeResultValue::Error {
+                                ok: false,
+                                error: NativeQueryError::new(
+                                    NativeErrorCode::Internal,
+                                    "Native query service returned an invalid result",
+                                ),
+                            },
+                        };
+                        let mut writer = LimitedWriter {
+                            bytes: Vec::new(),
+                            limit: MAX_NATIVE_RESULT_BYTES,
+                        };
+                        serde_json::to_writer(
+                            &mut writer,
+                            &NativeResult {
+                                kind: "native_result",
+                                parent_id: request.id,
+                                call_id: call.call_id,
+                                result,
+                            },
+                        )
+                        .map_err(|_| {
+                            JavaPluginError::Protocol("native query result exceeds limit")
+                        })?;
+                        response_bytes += writer.bytes.len();
+                        if response_bytes > MAX_NATIVE_TOTAL_BYTES {
+                            return Err(JavaPluginError::Protocol("native query budget exceeded"));
+                        }
+                        writer.bytes.push(b'\n');
+                        stdin.write_all(&writer.bytes).await?;
+                        stdin.flush().await?;
+                    }
+                }
+            }
+        };
+        let result = tokio::select! {
+            result = timeout_at(request.deadline, exchange) => result.unwrap_or(Err(JavaPluginError::Timeout)),
+            _ = request.reply.closed() => Err(JavaPluginError::Stopped),
+        };
         let fatal = matches!(result, Err(ref error) if !matches!(error, JavaPluginError::Rejected));
         if fatal {
             terminate(child).await;
             let _ = request.reply.send(result);
             return;
         }
-        if request.shutdown {
+        if matches!(request.kind, RequestKind::Shutdown) {
             drop(stdin);
             let result = match timeout_at(request.deadline, child.wait()).await {
                 Ok(Ok(status)) if status.success() => result,

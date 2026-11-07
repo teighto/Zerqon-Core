@@ -24,6 +24,7 @@ pub struct MobConfig {
 }
 pub struct Mobs {
     config: MobConfig,
+    gameplay: Arc<tokio::sync::RwLock<()>>,
     world: Arc<World>,
     players: Arc<Players>,
     data: Arc<GameData>,
@@ -42,12 +43,42 @@ struct LiveMobs {
 }
 
 impl Mobs {
+    pub fn blockers_near(&self, position: [f64; 3]) -> Result<Vec<zerqon_blocks::Aabb>> {
+        let live = self.live.lock().map_err(|_| "mob state lock poisoned")?;
+        let mut blockers = Vec::new();
+        for mob in live.engine.entities().filter(|mob| mob.health > 0.0) {
+            let [width, height] = mob.kind.dimensions();
+            let half = width / 2.0;
+            let bounds = zerqon_blocks::Aabb {
+                min: [
+                    mob.position[0] - half,
+                    mob.position[1],
+                    mob.position[2] - half,
+                ],
+                max: [
+                    mob.position[0] + half,
+                    mob.position[1] + height,
+                    mob.position[2] + half,
+                ],
+            };
+            if (0..3).all(|axis| {
+                bounds.max[axis] >= position[axis] - 3.0 && bounds.min[axis] <= position[axis] + 4.0
+            }) {
+                if blockers.len() == 1024 {
+                    return Err("too many nearby entities for block interaction".into());
+                }
+                blockers.push(bounds);
+            }
+        }
+        Ok(blockers)
+    }
     pub async fn open(
         config: MobConfig,
         world: Arc<World>,
         players: Arc<Players>,
         data: Arc<GameData>,
         ids: Arc<EntityIds>,
+        gameplay: Arc<tokio::sync::RwLock<()>>,
     ) -> Result<Arc<Self>> {
         for kind in [MobKind::Pig, MobKind::Cow, MobKind::Zombie] {
             data.entity_type(kind.identifier())
@@ -65,6 +96,7 @@ impl Mobs {
         }
         Ok(Arc::new(Self {
             config,
+            gameplay,
             world,
             players,
             data,
@@ -82,6 +114,7 @@ impl Mobs {
 
     pub async fn tick(&self, tick: u64) -> Result<()> {
         let _serial = self.serial.lock().await;
+        let gameplay = Arc::clone(&self.gameplay).read_owned().await;
         let observers = self.players.snapshots()?;
         if observers.is_empty() {
             {
@@ -109,6 +142,7 @@ impl Mobs {
         let (batches, save_error) = self
             .world
             .execute(move || {
+                let _gameplay = gameplay;
                 let view = ChunkView::new(world.cached_chunks()?, Arc::clone(&data));
                 let targets: Vec<_> = observers
                     .iter()
@@ -186,6 +220,7 @@ impl Mobs {
             return Err("invalid summon coordinates".into());
         }
         let _serial = self.serial.lock().await;
+        let gameplay = Arc::clone(&self.gameplay).read_owned().await;
         let cx = (position[0].floor() as i32).div_euclid(16);
         let cz = (position[2].floor() as i32).div_euclid(16);
         let mut chunks = self.world.cached_chunks()?;
@@ -204,6 +239,7 @@ impl Mobs {
         let batches = self
             .world
             .execute(move || {
+                let _gameplay = gameplay;
                 let view = ChunkView::new(chunks, Arc::clone(&data));
                 let mut live = live.lock().map_err(|_| "mob state lock poisoned")?;
                 let before = live.engine.snapshot();
@@ -220,6 +256,7 @@ impl Mobs {
 
     pub async fn attack(&self, uuid: Uuid, player_id: i32, target: i32) -> Result<()> {
         let _serial = self.serial.lock().await;
+        let gameplay = Arc::clone(&self.gameplay).read_owned().await;
         let observers = self.players.snapshots()?;
         let attacker = observers
             .iter()
@@ -236,6 +273,7 @@ impl Mobs {
         let batches = self
             .world
             .execute(move || {
+                let _gameplay = gameplay;
                 let view = ChunkView::new(world.cached_chunks()?, Arc::clone(&data));
                 let mut live = live.lock().map_err(|_| "mob state lock poisoned")?;
                 let observer = (uuid, player_id);

@@ -190,6 +190,25 @@ pub struct BlockPosition {
     pub y: i32,
     pub z: i32,
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlayerAction {
+    StartDestroyBlock,
+    ChangeDestroyDirection,
+    AbortDestroyBlock,
+    StopDestroyBlock,
+    DropAllItems,
+    DropItem,
+    ReleaseUseItem,
+    SwapItemWithOffhand,
+    Stab,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlayerActionRequest {
+    pub action: PlayerAction,
+    pub block: BlockPosition,
+    pub face: Face,
+    pub sequence: u32,
+}
 #[derive(Debug, Clone, PartialEq)]
 pub struct UseOnRequest {
     pub hand: Hand,

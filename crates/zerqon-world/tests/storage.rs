@@ -37,21 +37,34 @@ fn rewriting_existing_chunk_replaces_it_and_leaves_no_temporary_files() {
         store.load(0, 0).unwrap().unwrap().get_block(3, 64, 8),
         Some(98)
     );
-    assert_eq!(fs::read_dir(root.path()).unwrap().count(), 2);
+    let names: std::collections::BTreeSet<_> = fs::read_dir(root.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "world.lock",
+            "chunks.redb",
+            "storage-format.json",
+            "IMPORT_INCOMPLETE"
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+    );
 }
 
 #[test]
 fn checksum_failure_is_an_error_and_does_not_change_existing_data() {
     let root = tempfile::tempdir().unwrap();
-    let store = WorldStore::open(root.path()).unwrap();
     let chunk = Chunk::flat(1, 2, PALETTE);
-    store.save(&chunk).unwrap();
     let path = root.path().join("c.1.2.zqc");
-    let mut data = fs::read(&path).unwrap();
+    let mut data = chunk.to_bytes();
     *data.last_mut().unwrap() ^= 1;
     fs::write(&path, &data).unwrap();
-    assert!(store.load(1, 2).is_err());
-    assert!(store.save(&chunk).is_err());
+    assert!(WorldStore::open(root.path()).is_err());
+    assert!(!root.path().join("chunks.redb").exists());
     assert_eq!(fs::read(path).unwrap(), data);
 }
 
@@ -84,15 +97,18 @@ fn absent_chunk_is_distinct_from_oversized_or_wrong_coordinate_chunk() {
     let root = tempfile::tempdir().unwrap();
     let store = WorldStore::open(root.path()).unwrap();
     assert!(store.load(10, 10).unwrap().is_none());
-    let file = fs::File::create(root.path().join("c.10.10.zqc")).unwrap();
+    drop(store);
+    let oversized = tempfile::tempdir().unwrap();
+    let file = fs::File::create(oversized.path().join("c.10.10.zqc")).unwrap();
     file.set_len(2 * 1024 * 1024).unwrap();
-    assert!(store.load(10, 10).is_err());
+    assert!(WorldStore::open(oversized.path()).is_err());
+    let mismatched = tempfile::tempdir().unwrap();
     fs::write(
-        root.path().join("c.10.10.zqc"),
+        mismatched.path().join("c.10.10.zqc"),
         Chunk::flat(9, 9, PALETTE).to_bytes(),
     )
     .unwrap();
-    assert!(store.load(10, 10).is_err());
+    assert!(WorldStore::open(mismatched.path()).is_err());
 }
 
 #[test]

@@ -210,6 +210,38 @@ fn block_import_preserves_original_and_reports_unimported_world_data() {
         Err(WorldError::MissingImportedChunk { x: 0, z: 0 })
     ));
     assert!(!destination.join("c.0.0.zqc").exists());
+    let keys = [
+        zerqon_world::ChunkKey::new(-1, -33),
+        zerqon_world::ChunkKey::new(0, 0),
+    ];
+    let snapshots = store.snapshot(&keys).unwrap();
+    assert!(snapshots[1].chunk().is_none());
+    let original_import = snapshots[0].chunk().unwrap().to_bytes();
+    let mut changed = (**snapshots[0].chunk().unwrap()).clone();
+    changed.set_block(0, -64, 0, 77).unwrap();
+    assert!(matches!(
+        store.commit(
+            uuid::Uuid::new_v4(),
+            &snapshots,
+            &[
+                zerqon_world::ChunkWrite {
+                    key: keys[0],
+                    replacement: std::sync::Arc::new(changed)
+                },
+                zerqon_world::ChunkWrite {
+                    key: keys[1],
+                    replacement: std::sync::Arc::new(flat)
+                },
+            ]
+        ),
+        Err(zerqon_world::CommitError::Rejected(
+            WorldError::MissingImportedChunk { x: 0, z: 0 }
+        ))
+    ));
+    assert_eq!(
+        store.load(-1, -33).unwrap().unwrap().to_bytes(),
+        original_import
+    );
     assert_eq!(
         store.load(-1, -33).unwrap().unwrap().get_block(15, -64, 0),
         Some(101)

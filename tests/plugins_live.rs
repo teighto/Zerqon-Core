@@ -152,6 +152,8 @@ impl Client {
                         let teleport = get_varint(&mut body).unwrap();
                         let mut ack = vec![0];
                         put_varint(teleport, &mut ack);
+                        ack.extend_from_slice(&body[..24]);
+                        ack.extend_from_slice(&body[48..56]);
                         client.send(&ack).await;
                         teleported = true;
                     }
@@ -338,10 +340,17 @@ fn paletted_value(bytes: &mut &[u8], entries: usize, index: usize, local_limit: 
 }
 
 fn saved_block(chunks: &[Vec<u8>]) -> u32 {
+    saved_block_at(chunks, 0, 64, 0)
+}
+
+fn saved_block_at(chunks: &[Vec<u8>], x: i32, y: i32, z: i32) -> u32 {
     let packet = chunks
         .iter()
-        .find(|packet| packet[1..9] == [0; 8])
-        .expect("center chunk");
+        .find(|packet| {
+            i32::from_be_bytes(packet[1..5].try_into().unwrap()) == x.div_euclid(16)
+                && i32::from_be_bytes(packet[5..9].try_into().unwrap()) == z.div_euclid(16)
+        })
+        .expect("expected chunk");
     let mut body = &packet[9..];
     for _ in 0..get_varint(&mut body).unwrap() {
         get_varint(&mut body).unwrap();
@@ -352,13 +361,337 @@ fn saved_block(chunks: &[Vec<u8>]) -> u32 {
     let mut sections = take(&mut body, length).unwrap();
     for index in 0..24 {
         take(&mut sections, 4).unwrap();
-        let state = paletted_value(&mut sections, 4096, 0, 8);
+        let block_index = y.rem_euclid(16) as usize * 256
+            + z.rem_euclid(16) as usize * 16
+            + x.rem_euclid(16) as usize;
+        let state = paletted_value(&mut sections, 4096, block_index, 8);
         paletted_value(&mut sections, 64, 0, 3);
-        if index == 8 {
+        if index == (y + 64) as usize / 16 {
             return state;
         }
     }
-    panic!("missing y=64 section")
+    panic!("missing requested section")
+}
+
+#[tokio::test]
+#[ignore = "requires prepared 26.3 data, Java 25 host/example JARs and the Rust WASM example"]
+async fn truncated_signed_commands_cannot_modify_the_world() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let directory = tempfile::tempdir().unwrap();
+    setup(directory.path(), &root);
+    let data = root.join(".cache/vanilla/26.3");
+    let (mut server, address) = Server::start(directory.path(), &data);
+    let (mut client, _) = Client::join(&address, "LiveOp").await;
+    let mut packet = vec![8];
+    put_string("setblock 0 64 0 1", &mut packet);
+    client.send(&packet).await;
+    timeout(Duration::from_secs(3), async {
+        loop {
+            match read_frame(&mut client.socket, 2_097_151, Some(client.threshold)).await {
+                Err(_) => break,
+                Ok(packet) if packet[0] == 32 => break,
+                Ok(packet) => assert_ne!(packet[0], 8, "malformed signed command changed a block"),
+            }
+        }
+    })
+    .await
+    .expect("malformed command connection stayed open");
+    let (mut guest, _) = Client::join(&address, "AfterBadCommand").await;
+    guest.reply("tps", "TPS").await;
+    drop(client);
+    drop(guest);
+    server.stop().await;
+    let store = zerqon_world::WorldStore::open(directory.path().join("world")).unwrap();
+    assert_eq!(
+        store
+            .load(0, 0)
+            .unwrap()
+            .map_or(0, |chunk| chunk.get_block(0, 64, 0).unwrap()),
+        0
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires prepared 26.3 data, Java 25 host/example JARs and the Rust WASM example"]
+async fn creative_building_preserves_orientation_offhand_and_cross_chunk_stair_updates() {
+    fn position([x, y, z]: [i32; 3]) -> [u8; 8] {
+        (((i64::from(x) & 0x3ffffff) << 38)
+            | ((i64::from(z) & 0x3ffffff) << 12)
+            | (i64::from(y) & 0xfff))
+            .to_be_bytes()
+    }
+    async fn item(client: &mut Client, slot: i16, id: Option<i32>) {
+        let mut packet = vec![57];
+        packet.extend_from_slice(&slot.to_be_bytes());
+        if let Some(id) = id {
+            packet.push(1);
+            put_varint(id, &mut packet);
+            packet.extend_from_slice(&[0, 0]);
+        } else {
+            packet.push(0);
+        }
+        client.send(&packet).await;
+    }
+    async fn use_on(
+        client: &mut Client,
+        hand: u8,
+        clicked: [i32; 3],
+        face: u8,
+        hit: [f32; 3],
+        sequence: i32,
+    ) {
+        let mut packet = vec![66, hand];
+        packet.extend_from_slice(&position(clicked));
+        packet.push(face);
+        for value in hit {
+            packet.extend_from_slice(&value.to_be_bytes());
+        }
+        packet.extend_from_slice(&[0, 0]);
+        put_varint(sequence, &mut packet);
+        client.send(&packet).await;
+    }
+    async fn dig(client: &mut Client, at: [i32; 3], sequence: i32) {
+        let mut packet = vec![41, 0];
+        packet.extend_from_slice(&position(at));
+        packet.push(1);
+        put_varint(sequence, &mut packet);
+        client.send(&packet).await;
+    }
+    async fn changes(
+        client: &mut Client,
+        sequence: i32,
+        expected: &[([i32; 3], i32)],
+        rejection: Option<&str>,
+    ) {
+        let mut wanted: std::collections::BTreeMap<_, _> =
+            expected.iter().map(|(p, s)| (position(*p), *s)).collect();
+        let mut notice = None;
+        loop {
+            let packet = client.read().await;
+            match packet[0] {
+                8 => {
+                    let key: [u8; 8] = packet[1..9].try_into().unwrap();
+                    if let Some(state) = wanted.remove(&key) {
+                        assert_eq!(
+                            get_varint(&mut &packet[9..]).unwrap(),
+                            state,
+                            "block {key:?}, sequence {sequence}"
+                        );
+                    }
+                }
+                124 => {
+                    let size = u16::from_be_bytes(packet[2..4].try_into().unwrap()) as usize;
+                    notice = Some(String::from_utf8(packet[4..4 + size].to_vec()).unwrap());
+                }
+                45 => {
+                    let mut response = packet;
+                    response[0] = 28;
+                    client.send(&response).await;
+                }
+                4 => {
+                    assert_eq!(get_varint(&mut &packet[1..]).unwrap(), sequence);
+                    break;
+                }
+                32 => panic!("server disconnected during building"),
+                _ => {}
+            }
+        }
+        assert!(
+            wanted.is_empty(),
+            "acknowledgement preceded expected block updates: {wanted:?}, notice={notice:?}"
+        );
+        if let Some(expected) = rejection {
+            assert!(
+                notice
+                    .as_deref()
+                    .is_some_and(|value| value.contains(expected)),
+                "{notice:?}"
+            );
+        } else {
+            assert!(notice.is_none(), "unexpected rejection: {notice:?}");
+        }
+    }
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let directory = tempfile::tempdir().unwrap();
+    setup(directory.path(), &root);
+    let data = root.join(".cache/vanilla/26.3");
+    let (mut server, address) = Server::start(directory.path(), &data);
+    let (mut client, _) = Client::join(&address, "LiveOp").await;
+    item(&mut client, 36, Some(1)).await;
+    use_on(&mut client, 0, [2, 63, 0], 1, [0.5, 1.0, 0.5], 100).await;
+    changes(&mut client, 100, &[([2, 64, 0], 1)], None).await;
+    item(&mut client, 36, Some(163)).await;
+    use_on(&mut client, 0, [2, 64, 0], 5, [1.0, 0.5, 0.5], 101).await;
+    changes(&mut client, 101, &[([3, 64, 0], 139)], None).await;
+    item(&mut client, 36, Some(341)).await;
+    use_on(&mut client, 0, [4, 63, 0], 1, [0.5, 1.0, 0.5], 102).await;
+    changes(&mut client, 102, &[([4, 64, 0], 15180)], None).await;
+    use_on(&mut client, 0, [4, 64, 0], 1, [0.5, 0.5, 0.5], 103).await;
+    changes(&mut client, 103, &[([4, 64, 0], 15182)], None).await;
+    item(&mut client, 36, Some(1)).await;
+    use_on(&mut client, 0, [0, 63, 0], 1, [0.5, 1.0, 0.5], 104).await;
+    changes(
+        &mut client,
+        104,
+        &[([0, 64, 0], 0)],
+        Some("intersects an entity"),
+    )
+    .await;
+    use_on(&mut client, 0, [30, 63, 0], 1, [0.5, 1.0, 0.5], 105).await;
+    changes(
+        &mut client,
+        105,
+        &[([30, 64, 0], 0)],
+        Some("outside interaction range"),
+    )
+    .await;
+    item(&mut client, 45, Some(1)).await;
+    item(&mut client, 36, None).await;
+    use_on(&mut client, 1, [2, 63, 1], 1, [0.5, 1.0, 0.5], 106).await;
+    changes(&mut client, 106, &[([2, 64, 1], 1)], None).await;
+    client.move_to([14.5, 64.0, 0.5], 270.0, 0.0).await;
+    item(&mut client, 36, Some(515)).await;
+    use_on(&mut client, 0, [15, 63, 2], 1, [0.5, 1.0, 0.5], 107).await;
+    changes(&mut client, 107, &[([15, 64, 2], 5534)], None).await;
+    client.move_to([14.5, 64.0, 0.5], 0.0, 0.0).await;
+    use_on(&mut client, 0, [16, 63, 2], 1, [0.5, 1.0, 0.5], 108).await;
+    changes(
+        &mut client,
+        108,
+        &[([15, 64, 2], 5542), ([16, 64, 2], 5494)],
+        None,
+    )
+    .await;
+    item(&mut client, 36, Some(1050)).await;
+    dig(&mut client, [16, 64, 2], 109).await;
+    changes(
+        &mut client,
+        109,
+        &[([16, 64, 2], 5494)],
+        Some("cannot destroy blocks"),
+    )
+    .await;
+    item(&mut client, 36, Some(1)).await;
+    dig(&mut client, [16, 64, 2], 110).await;
+    changes(
+        &mut client,
+        110,
+        &[([15, 64, 2], 5534), ([16, 64, 2], 0)],
+        None,
+    )
+    .await;
+    drop(client);
+    server.stop().await;
+    let (mut restarted, address) = Server::start(directory.path(), &data);
+    let (client, chunks) = Client::join(&address, "LiveOp").await;
+    for ([x, y, z], state) in [
+        ([2, 64, 0], 1),
+        ([3, 64, 0], 139),
+        ([4, 64, 0], 15182),
+        ([2, 64, 1], 1),
+        ([15, 64, 2], 5534),
+        ([16, 64, 2], 0),
+    ] {
+        assert_eq!(
+            saved_block_at(&chunks, x, y, z),
+            state,
+            "persisted block at {x},{y},{z}"
+        );
+    }
+    drop(client);
+    restarted.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "requires prepared 26.3 data, Java 25 host/example JARs and the Rust WASM example"]
+async fn creative_block_placement_uses_the_held_item_and_reaches_the_client() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let directory = tempfile::tempdir().unwrap();
+    setup(directory.path(), &root);
+    let (mut server, address) = Server::start(directory.path(), &root.join(".cache/vanilla/26.3"));
+    let (mut client, _) = Client::join(&address, "LiveOp").await;
+    client.reply("give LiveOp stone 8", "Gave 8 stone").await;
+    let mut packet = vec![66, 0];
+    let clicked = (2_i64 << 38) | 63;
+    packet.extend_from_slice(&clicked.to_be_bytes());
+    packet.push(1);
+    for coordinate in [0.5_f32, 1.0, 0.5] {
+        packet.extend_from_slice(&coordinate.to_be_bytes());
+    }
+    packet.extend_from_slice(&[0, 0]);
+    put_varint(100, &mut packet);
+    client.send(&packet).await;
+    let target = ((2_i64 << 38) | 64).to_be_bytes();
+    let update = client
+        .until(|packet| packet[0] == 8 && packet[1..9] == target)
+        .await;
+    let actual = get_varint(&mut &update[9..]).unwrap();
+    if actual != 1 {
+        let reply = client.until(|packet| packet[0] == 124).await;
+        panic!(
+            "expected stone, received state {actual}: {}",
+            String::from_utf8_lossy(&reply[4..])
+        );
+    }
+    let ack = client.until(|packet| packet[0] == 4).await;
+    assert_eq!(get_varint(&mut &ack[1..]).unwrap(), 100);
+    client.reply("tps", "TPS").await;
+    drop(client);
+    server.stop().await;
+    let store = zerqon_world::WorldStore::open(directory.path().join("world")).unwrap();
+    assert_eq!(
+        store
+            .load(0, 0)
+            .unwrap()
+            .unwrap()
+            .get_block(2, 64, 0)
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires prepared 26.3 data, Java 25 host/example JARs and the Rust WASM example"]
+async fn java_native_queries_observe_live_players_and_the_rust_tick_clock() {
+    async fn snapshot(client: &mut Client) -> (u32, u64) {
+        client.command("jserver").await;
+        let packet = client.until(|packet| packet[0] == 124).await;
+        let mut body = &packet[1..];
+        assert_eq!(take(&mut body, 1).unwrap(), &[8]);
+        let size = u16::from_be_bytes(take(&mut body, 2).unwrap().try_into().unwrap()) as usize;
+        let text = std::str::from_utf8(take(&mut body, size).unwrap()).unwrap();
+        let prefix = format!(
+            "Zerqon {} | Minecraft 26.3 | Players ",
+            env!("CARGO_PKG_VERSION")
+        );
+        let values = text
+            .strip_prefix(&prefix)
+            .unwrap_or_else(|| panic!("unexpected native query response: {text}"));
+        let (online, tick) = values.split_once("/20 | Tick ").unwrap();
+        (online.parse().unwrap(), tick.parse().unwrap())
+    }
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let directory = tempfile::tempdir().unwrap();
+    setup(directory.path(), &root);
+    let (mut server, address) = Server::start(directory.path(), &root.join(".cache/vanilla/26.3"));
+    let (mut first, _) = Client::join(&address, "LiveOp").await;
+    let (second, _) = Client::join(&address, "SnapshotGuest").await;
+    let (online, tick) = snapshot(&mut first).await;
+    assert_eq!(online, 2);
+    drop(second);
+    timeout(Duration::from_secs(3), async {
+        loop {
+            let (online, next_tick) = snapshot(&mut first).await;
+            if online == 1 && next_tick > tick {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("snapshot did not follow disconnect and server ticks");
+    drop(first);
+    server.stop().await;
 }
 
 #[tokio::test]

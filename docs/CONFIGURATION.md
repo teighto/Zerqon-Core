@@ -93,6 +93,8 @@ Use `help`, `version`, `tps`, `plugins` and `stop` in the console. `op NAME` gra
 
 `/give PLAYER minecraft:ITEM [COUNT]` gives items to a connected player and requires operator level 2. The default count is 1; the limit is 4,096. If the full amount does not fit, nothing is added. Inventories are saved under the world's `playerdata/` directory and restored by UUID. Item dropping, crafting and special container behavior are still being developed.
 
+Players currently use Creative mode. Ordinary blocks, logs, dry slabs and stairs can be placed and broken, including stair connections across chunk boundaries. Placement uses the item in the selected hand and checks range and entity collisions. Unsupported interactions are rejected with a chat message. Survival, fluids, random block ticks and interactive containers still need work. Current chunks are saved in `chunks.redb`; see [world storage](WORLD_STORAGE.md) before restoring a backup or moving to an older build.
+
 `/tps` reports the recent coordinator tick rate and average measured tick work. The built-in Rust CPU profiler uses `/spark profiler start` and `/spark profiler stop` on Linux. It saves reports in `profiles/`; see [Profiling](PROFILING.md). The append-only `logs/latest.log` is not automatically rotated. `RUST_LOG` selects log verbosity, for example `info` or `zerqon=debug`.
 
 ## Русский
@@ -100,6 +102,8 @@ Use `help`, `version`, `tps`, `plugins` and `stop` in the console. `op NAME` gra
 Обычный запуск из исходников — `cargo run --release`, без флагов. Нативная сборка запускается через `./zerqon` или `.\zerqon.exe`. Первый запуск создаёт недостающие конфиги; перед запуском сервера нужно принять Minecraft EULA.
 
 Команда `/give ИГРОК minecraft:ПРЕДМЕТ [КОЛИЧЕСТВО]` выдаёт предметы подключённому игроку; нужен второй уровень оператора. По умолчанию выдаётся один предмет, максимум — 4 096. Если места не хватает на всё количество, команда ничего не добавляет. Инвентарь сохраняется по UUID в `world/playerdata/`. Выбрасывание предметов, крафт и работа специальных контейнеров ещё дорабатываются.
+
+Сейчас используется творческий режим. Можно ставить и ломать обычные блоки, брёвна, сухие плиты и лестницы. Соединения лестниц обновляются и на границе чанков. Сервер проверяет предмет в руке, расстояние и пересечение с игроками и мобами. Неподдержанная операция возвращает сообщение в чат. Выживание, жидкости, случайные тики блоков и контейнеры ещё дорабатываются. Чанки сохраняются в `chunks.redb`; правила переноса и восстановления описаны в [документации хранилища](WORLD_STORAGE.md).
 
 `cargo run --release -- --init` создаёт конфиги и завершает работу, `cargo run --release -- --check-config` проверяет значения без запуска сети. Настройки применяются после перезапуска. `server.properties` содержит адрес, порт, MOTD, онлайн-проверку аккаунтов и параметры Minecraft. `server.settings` — TOML с настройками потоков, кеша, очередей и плагинов. Неизвестные и повторяющиеся ключи отвергаются.
 

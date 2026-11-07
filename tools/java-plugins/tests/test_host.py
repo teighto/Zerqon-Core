@@ -24,6 +24,7 @@ class Host:
         paths.append(libraries / "gson-2.13.2.jar")
         cp = os.pathsep.join(map(str, paths))
         self.process = subprocess.Popen([JAVA, "-Xms16M", "-Xmx128M", *java_args, "-cp", cp, "io.github.teighto.zerqon.host.PluginHost"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8")
+        self.process.stdin.reconfigure(newline="\n")
         self.lines = queue.Queue()
         self.errors = []
         self.reader = threading.Thread(target=self.read_output, daemon=True)
@@ -40,13 +41,21 @@ class Host:
         for line in self.process.stderr:
             self.errors.append(line)
 
-    def request(self, **request):
+    def request(self, native=None, **request):
         self.process.stdin.write(json.dumps(request) + "\n")
         self.process.stdin.flush()
-        line = self.lines.get(timeout=10)
-        if line is None:
-            raise AssertionError("host exited: " + "".join(self.errors))
-        response = json.loads(line)
+        while True:
+            line = self.lines.get(timeout=10)
+            if line is None:
+                raise AssertionError("host exited: " + "".join(self.errors))
+            response = json.loads(line)
+            if response.get("kind") != "native_call":
+                break
+            if native is None:
+                raise AssertionError("unexpected native query: " + line)
+            result = native(response)
+            self.process.stdin.write((result if isinstance(result, str) else json.dumps(result)) + "\n")
+            self.process.stdin.flush()
         if response["id"] != request["id"]:
             raise AssertionError("mismatched request id")
         return response
@@ -73,11 +82,215 @@ class HostTests(unittest.TestCase):
     def load(self):
         return self.host.request(id=1, op="load", directory=str(self.plugins), server_version="0.0.1")
 
+    def test_protocol_v2_negotiates_without_changing_legacy_plugin_results(self):
+        hello = self.host.request(id=1, op="hello", min_protocol=2, max_protocol=2)
+        self.assertEqual(hello, {"id": 1, "ok": True, "results": [], "protocol": 2, "capabilities": ["native_queries"]})
+        loaded = self.host.request(id=2, op="load", directory=str(self.plugins), server_version="0.0.1")
+        self.assertTrue(loaded["ok"])
+        response = self.host.request(id=3, op="event", plugin="hello", event={"event": "command", "sender": "teighto", "sender_kind": "player", "command": "jhello", "args": []})
+        self.assertEqual(response["results"][0]["actions"], [{"action": "reply", "message": "Hello, teighto! This plugin uses the Zerqon Java API."}])
+
+    def test_protocol_negotiation_rejects_late_duplicate_and_unsupported_requests(self):
+        for request in [{"id": 1, "op": "hello", "min_protocol": 3, "max_protocol": 4}, {"id": 2, "op": "hello", "min_protocol": 2, "max_protocol": 1}]:
+            self.assertFalse(self.host.request(**request)["ok"])
+        self.assertTrue(self.host.request(id=3, op="hello", min_protocol=2, max_protocol=2)["ok"])
+        self.assertFalse(self.host.request(id=4, op="hello", min_protocol=2, max_protocol=2)["ok"])
+        self.host.close()
+        self.host = Host()
+        self.addCleanup(self.host.close)
+        self.load()
+        self.assertFalse(self.host.request(id=2, op="hello", min_protocol=2, max_protocol=2)["ok"])
+
+    def test_hello_example_exposes_native_snapshot_with_legacy_fallback(self):
+        self.load()
+        command = {"event": "command", "sender": "teighto", "sender_kind": "player", "command": "jserver", "args": []}
+        legacy = self.host.request(id=2, op="event", plugin="hello", event=command)
+        self.assertEqual(legacy["results"][0]["actions"], [{"action": "reply", "message": "Native server queries are unavailable (protocol 2 required)"}])
+        self.host.close()
+        self.host = Host()
+        self.addCleanup(self.host.close)
+        self.assertTrue(self.host.request(id=1, op="hello", min_protocol=2, max_protocol=2)["ok"])
+        loaded = self.host.request(id=2, op="load", directory=str(self.plugins), server_version="0.0.1")
+        self.assertIn({"action": "register_command", "name": "jserver", "description": "Show the native server snapshot", "permission": None}, loaded["results"][0]["actions"])
+        native = self.host.request(native=self.native_result, id=3, op="event", plugin="hello", event=command)
+        self.assertEqual(native["results"][0]["actions"], [{"action": "reply", "message": "Zerqon 0.0.1 | Minecraft 26.3 | Players 3/100 | Tick 42"}])
+
     def add_fixture(self, name, class_name="FaultyPlugin", api="1"):
         with zipfile.ZipFile(self.plugins / f"{name}.jar", "w") as jar:
             jar.writestr("META-INF/MANIFEST.MF", f"Manifest-Version: 1.0\nZerqon-Plugin: io.github.teighto.zerqon.fixtures.{class_name}\nZerqon-API: {api}\n\n")
             for file in FIXTURES.rglob("*.class"):
                 jar.write(file, file.relative_to(FIXTURES).as_posix())
+
+    def native_ready(self):
+        self.add_fixture("native", "NativeQueryPlugin")
+        self.assertTrue(self.host.request(id=1, op="hello", min_protocol=2, max_protocol=2)["ok"])
+        self.assertTrue(self.host.request(id=2, op="load", directory=str(self.plugins), server_version="0.0.1")["ok"])
+
+    def add_paper_native(self, filename, metadata):
+        with zipfile.ZipFile(self.plugins / f"{filename}.jar", "w") as jar:
+            for file in (ROOT / "target/paper-bridge/fixtures").rglob("NativePaperProbe*.class"):
+                jar.write(file, file.relative_to(ROOT / "target/paper-bridge/fixtures").as_posix())
+            jar.writestr("plugin.yml", f"name: {metadata}\nversion: 1\nmain: io.github.teighto.zerqon.fixtures.NativePaperProbe\napi-version: '26.3'\ncommands:\n  nativepaper: {{}}\n")
+
+    @staticmethod
+    def native_result(call, value=None, error=None):
+        if value is None:
+            value = {"server_version": "0.0.1", "minecraft_version": "26.3", "protocol": 777, "max_players": 100, "online_players": 3, "tick": 42}
+        result = {"ok": True, "value": value} if error is None else {"ok": False, "error": error}
+        return {"kind": "native_result", "parent_id": call["parent_id"], "call_id": call["call_id"], "result": result}
+
+    def native_command(self, responder, command="native", request_id=3):
+        return self.host.request(native=responder, id=request_id, op="event", plugin="native", event={"event": "command", "sender": "teighto", "sender_kind": "player", "command": command, "args": []})
+
+    def test_native_query_roundtrip_and_non_inherited_thread_context(self):
+        self.native_ready()
+        calls = []
+        def respond(call):
+            calls.append(call)
+            return self.native_result(call)
+        result = self.native_command(respond)
+        self.assertEqual(calls, [{"kind": "native_call", "parent_id": 3, "call_id": 1, "plugin": "native", "operation": {"query": "server_snapshot"}}])
+        self.assertEqual(result["results"][0]["actions"], [{"action": "reply", "message": "0.0.1:26.3:777:100:3:42"}])
+        thread = self.native_command(None, "thread", 4)
+        self.assertEqual(thread["results"][0]["actions"], [{"action": "reply", "message": "thread rejected"}])
+
+    def test_native_query_is_explicitly_unavailable_to_legacy_transport(self):
+        self.add_fixture("native", "NativeQueryPlugin")
+        self.load()
+        result = self.native_command(None)
+        self.assertEqual(result["results"][0]["actions"], [{"action": "reply", "message": "UNSUPPORTED"}])
+
+    def test_native_service_errors_are_typed_and_do_not_poison_next_query(self):
+        self.native_ready()
+        calls = []
+        def respond(call):
+            calls.append(call["call_id"])
+            return self.native_result(call, error={"code": "unavailable", "message": "service offline"}) if len(calls) == 1 else self.native_result(call)
+        result = self.native_command(respond, "twice")
+        self.assertEqual(calls, [1, 2])
+        self.assertTrue(result["results"][0]["enabled"])
+        self.assertEqual(result["results"][0]["actions"][0]["message"], "0.0.1:26.3:777:100:3:42")
+
+    def test_native_calls_keep_one_sequence_across_lifecycle_plugins(self):
+        for name in ["one", "two"]:
+            self.add_fixture(name, "NativeLifecyclePlugin")
+        self.assertTrue(self.host.request(id=1, op="hello", min_protocol=2, max_protocol=2)["ok"])
+        for request in [{"id": 2, "op": "load", "directory": str(self.plugins), "server_version": "0.0.1"}, {"id": 3, "op": "event", "event": {"event": "tick", "tick": 1}}, {"id": 4, "op": "shutdown"}]:
+            calls = []
+            def respond(call):
+                calls.append((call["parent_id"], call["call_id"], call["plugin"]))
+                return self.native_result(call)
+            self.assertTrue(self.host.request(native=respond, **request)["ok"])
+            self.assertEqual(calls, [(request["id"], 1, "one"), (request["id"], 2, "two")])
+
+    def test_native_query_count_is_bounded_even_when_plugin_catches_service_errors(self):
+        self.native_ready()
+        calls = []
+        def respond(call):
+            calls.append(call["call_id"])
+            return self.native_result(call, error={"code": "capacity", "message": "budget"})
+        with self.assertRaises(AssertionError):
+            self.native_command(respond, "limit")
+        self.assertEqual(calls, list(range(1, 129)))
+        self.assertNotEqual(self.host.process.wait(timeout=10), 0)
+
+    def test_mismatched_native_reply_poisons_host_even_if_plugin_catches_exception(self):
+        self.native_ready()
+        def respond(call):
+            result = self.native_result(call)
+            result["parent_id"] += 1
+            return result
+        with self.assertRaises(AssertionError):
+            self.native_command(respond, "catch_protocol")
+        self.assertNotEqual(self.host.process.wait(timeout=10), 0)
+
+    def test_malformed_native_results_are_fatal_instead_of_fabricating_snapshot(self):
+        variants = [
+            ("extra", lambda response: response.update(extra=True)),
+            ("call", lambda response: response.update(call_id=2)),
+            ("kind", lambda response: response.update(kind="response")),
+            ("missing", lambda response: response["result"].pop("value")),
+            ("ok", lambda response: response["result"].update(ok="true")),
+            ("online", lambda response: response["result"]["value"].update(online_players=101)),
+            ("capacity", lambda response: response["result"]["value"].update(max_players=0)),
+            ("tick", lambda response: response["result"]["value"].update(tick=9223372036854775808)),
+            ("control", lambda response: response["result"]["value"].update(server_version="bad\nversion")),
+            ("surrogate", lambda response: response["result"]["value"].update(server_version="\ud800")),
+            ("version", lambda response: response["result"]["value"].update(server_version="")),
+            ("error_code", lambda response: response.update(result={"ok": False, "error": {"code": "UNKNOWN", "message": "bad"}})),
+            ("uppercase_code", lambda response: response.update(result={"ok": False, "error": {"code": "UNAVAILABLE", "message": "bad"}})),
+            ("empty_error", lambda response: response.update(result={"ok": False, "error": {"code": "unavailable", "message": ""}})),
+            ("control_error", lambda response: response.update(result={"ok": False, "error": {"code": "unavailable", "message": "bad\nmessage"}})),
+        ]
+        for name, mutate in variants:
+            with self.subTest(name=name):
+                self.host.close()
+                self.host = Host()
+                self.addCleanup(self.host.close)
+                self.native_ready()
+                def respond(call):
+                    result = self.native_result(call)
+                    mutate(result)
+                    return result
+                with self.assertRaises(AssertionError):
+                    self.native_command(respond, "catch_protocol")
+                self.assertNotEqual(self.host.process.wait(timeout=10), 0)
+
+    def test_native_result_frame_and_parent_aggregate_are_bounded(self):
+        for size, command, expected in [(262_145, "native", 1), (262_144, "aggregate", 5)]:
+            self.host.close()
+            self.host = Host()
+            self.addCleanup(self.host.close)
+            self.native_ready()
+            calls = []
+            def respond(call):
+                calls.append(call["call_id"])
+                result = json.dumps(self.native_result(call))
+                return result + " " * (size - len(result))
+            with self.assertRaises((AssertionError, BrokenPipeError, OSError)):
+                self.native_command(respond, command)
+            self.assertEqual(len(calls), expected)
+            self.assertNotEqual(self.host.process.wait(timeout=10), 0)
+
+    def test_paper_callbacks_use_file_identity_for_native_transport(self):
+        self.host.close()
+        self.host = Host(paper=True)
+        self.addCleanup(self.host.close)
+        self.add_paper_native("transport", "DifferentMetadataName")
+        self.assertTrue(self.host.request(id=1, op="hello", min_protocol=2, max_protocol=2)["ok"])
+        requests = [
+            ({"id": 2, "op": "load", "directory": str(self.plugins), "server_version": "0.0.1"}, 2),
+            ({"id": 3, "op": "event", "event": {"event": "tick", "tick": 1}}, 1),
+            ({"id": 4, "op": "event", "plugin": "transport", "event": {"event": "command", "sender": "player", "sender_kind": "player", "command": "nativepaper", "args": []}}, 2),
+            ({"id": 5, "op": "shutdown"}, 1),
+        ]
+        for request, expected in requests:
+            calls = []
+            def respond(call):
+                calls.append(call)
+                return self.native_result(call)
+            response = self.host.request(native=respond, **request)
+            self.assertTrue(response["ok"], response)
+            self.assertEqual(len(calls), expected, response)
+            self.assertTrue(all(call["plugin"] == "transport" for call in calls))
+            self.assertEqual([call["call_id"] for call in calls], list(range(1, expected + 1)))
+
+    def test_nested_paper_commands_switch_native_identity_and_restore_parent_scope(self):
+        self.host.close()
+        self.host = Host(paper=True)
+        self.addCleanup(self.host.close)
+        self.add_paper_native("file-a", "NativeA")
+        self.add_paper_native("file-b", "NativeB")
+        self.assertTrue(self.host.request(id=1, op="hello", min_protocol=2, max_protocol=2)["ok"])
+        loaded = self.host.request(native=self.native_result, id=2, op="load", directory=str(self.plugins), server_version="0.0.1")
+        self.assertTrue(all(result["enabled"] for result in loaded["results"]), loaded)
+        calls = []
+        def respond(call):
+            calls.append((call["call_id"], call["plugin"]))
+            return self.native_result(call)
+        response = self.host.request(native=respond, id=3, op="event", plugin="file-a", event={"event": "command", "sender": "player", "sender_kind": "player", "command": "nativepaper", "args": ["nested", "nativeb:nativepaper"]})
+        self.assertTrue(response["results"][0]["enabled"], response)
+        self.assertEqual(calls, [(1, "file-b"), (2, "file-b"), (3, "file-a")])
 
     def test_real_plugin_command_and_clean_shutdown(self):
         loaded = self.load()

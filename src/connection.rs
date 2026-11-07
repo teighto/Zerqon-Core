@@ -4,7 +4,7 @@ use crate::{
     packets,
     player_inventory::InventoryHandle,
     players::{Identity, PacketBatch, PlayerHandle, Position},
-    runtime::{CommandSource, State, World, block_update},
+    runtime::{BlockInteraction, CommandSource, State, World},
     world_view,
 };
 use md5::{Digest, Md5};
@@ -400,8 +400,11 @@ async fn play(
     for packet in inventory.full_sync().await? {
         writer.send(&packet).await?;
     }
-    registration.move_to(initial)?;
-    registration.activate()?;
+    {
+        let _gameplay = state.gameplay.read().await;
+        registration.move_to(initial)?;
+        registration.activate()?;
+    }
     if let Some(mobs) = &state.mobs {
         mobs.synchronize().await?;
     }
@@ -511,23 +514,33 @@ async fn play(
                         let policy=zerqon_inventory::InventoryPolicy {creative:true,can_interact:teleport_confirmed,allow_drops:false};
                         inventory_response(inventory.apply_packet(id,view,policy).await,inventory,&mut writer).await?;
                     },
+                    66=>{
+                        let request=zerqon_inventory::decode_use_on(view)?;
+                        let sequence=request.sequence;
+                        inventory_count+=1;
+                        let result=if inventory_count>64 {Err("Block interactions are rate limited".into())}
+                            else if !teleport_confirmed {Err("Wait for teleport confirmation".into())}
+                            else if !loaded.contains(&(request.block.x.div_euclid(16),request.block.z.div_euclid(16))) {Err("Block is outside the loaded terrain".into())}
+                            else {state.edit_block(profile.uuid,registration.id(),inventory,BlockInteraction::Place(request)).await};
+                        block_response(&state,profile.uuid,registration.id(),sequence,result)?;
+                    },
                     1=>{
                         let target=get_varint(&mut view)?;
                         if target<=0||!view.is_empty(){return Err("invalid attack packet".into());}
                         if teleport_confirmed&&let Some(mobs)=&state.mobs{mobs.attack(profile.uuid,registration.id(),target).await?;}
                     },
                     0=>{
-                        let id=get_varint(&mut view)?;
-                        if id<=0||id>teleport_id||!view.is_empty(){return Err("invalid teleport acknowledgement".into());}
-                        if id==teleport_id{teleport_confirmed=true;}
+                        let acknowledgement=zerqon_protocol::decode_teleport_ack(view)?;
+                        if acknowledgement.id>teleport_id{return Err("invalid teleport acknowledgement".into());}
+                        if acknowledgement.id==teleport_id{teleport_confirmed=true;}
                     },
                     28=>{
-                        let received=i64::from_be_bytes(take(&mut view,8)?.try_into()?);
+                        let received=zerqon_protocol::decode_keepalive(view)?;
                         if !outstanding.is_some_and(|(expected,_)|expected==received){return Err("invalid keepalive response".into());}
                         if let Some((_,sent))=outstanding{registration.latency(sent.elapsed().as_millis().min(i32::MAX as u128) as i32)?;}
                         outstanding=None;
                     },
-                    7|8=>{let command=get_string(&mut view,256)?;if command.trim()=="tpsbar"{show_bar = !show_bar;if show_bar{let (title,progress)=tpsbar_metrics(&state);writer.send(&packets::bossbar_add(bar,&title,progress)).await?;}else{writer.send(&packets::bossbar_remove(bar)).await?;}}else{match state.command(CommandSource::Player{uuid:profile.uuid,name:&profile.name},command).await{Ok(replies)=>for reply in replies{writer.send(&packets::system_chat(&reply)).await?;},Err(error)=>writer.send(&packets::system_chat(&format!("Command failed: {error}"))).await?,}}},
+                    7|8=>{let command=zerqon_protocol::decode_command(view,id==8)?;if command.trim()=="tpsbar"{show_bar = !show_bar;if show_bar{let (title,progress)=tpsbar_metrics(&state);writer.send(&packets::bossbar_add(bar,&title,progress)).await?;}else{writer.send(&packets::bossbar_remove(bar)).await?;}}else{match state.command(CommandSource::Player{uuid:profile.uuid,name:&profile.name},command).await{Ok(replies)=>for reply in replies{writer.send(&packets::system_chat(&reply)).await?;},Err(error)=>writer.send(&packets::system_chat(&format!("Command failed: {error}"))).await?,}}},
                     30|31=>{
                         let x=f64::from_be_bytes(take(&mut view,8)?.try_into()?);
                         let y=f64::from_be_bytes(take(&mut view,8)?.try_into()?);
@@ -542,7 +555,7 @@ async fn play(
                                 teleport_confirmed=false;
                                 writer.send(&packets::position_rotated(teleport_id,[position.0,position.1,position.2],[rotation.0,rotation.1])).await?;
                                 if !boundary_notice{writer.send(&packets::system_chat("This area is outside the available imported terrain.")).await?;boundary_notice=true;}
-                            }else{registration.move_to(next)?;position=(x,y,z);rotation=next_rotation;}
+                            }else{let _gameplay=state.gameplay.read().await;registration.move_to(next)?;position=(x,y,z);rotation=next_rotation;}
                         }
                     },
                     32|33=>{
@@ -550,35 +563,58 @@ async fn play(
                         let flags=take(&mut view,1)?[0];
                         let next=Position{xyz:[position.0,position.1,position.2],yaw:next_rotation.0,pitch:next_rotation.1,on_ground:flags&1!=0};
                         if !view.is_empty()||!world_view::valid_position(next){return Err("invalid movement packet".into());}
-                        if teleport_confirmed{registration.move_to(next)?;rotation=next_rotation;}
+                        if teleport_confirmed{let _gameplay=state.gameplay.read().await;registration.move_to(next)?;rotation=next_rotation;}
                     },
                     41=>{
-                        let action=get_varint(&mut view)?;let packed=i64::from_be_bytes(take(&mut view,8)?.try_into()?);take(&mut view,1)?;let sequence=get_varint(&mut view)?;
-                        if !(0..=8).contains(&action)||sequence<0||!view.is_empty(){return Err("invalid player action".into());}
-                        if matches!(action,4|5|7){
+                        use zerqon_inventory::PlayerAction;
+                        let request=zerqon_inventory::decode_player_action(view)?;
+                        let action=request.action;
+                        if matches!(action,PlayerAction::DropAllItems|PlayerAction::DropItem|PlayerAction::SwapItemWithOffhand){
                             inventory_count+=1;
                             if inventory_count<=64{
-                                let result=if action==7{inventory.swap_offhand(zerqon_inventory::InventoryPolicy{creative:true,can_interact:teleport_confirmed,allow_drops:false}).await}else{Err(zerqon_inventory::InventoryError::DroppingUnavailable.into())};
+                                let result=if action==PlayerAction::SwapItemWithOffhand{inventory.swap_offhand(zerqon_inventory::InventoryPolicy{creative:true,can_interact:teleport_confirmed,allow_drops:false}).await}else{Err(zerqon_inventory::InventoryError::DroppingUnavailable.into())};
                                 inventory_response(result,inventory,&mut writer).await?;
                             }else if inventory_count==65{inventory_response(Err(crate::player_inventory::InventoryServiceError::RateLimited),inventory,&mut writer).await?;}
-                        }else{
-                            let x=(packed>>38) as i32;let y=(packed<<52>>52) as i32;let z=(packed<<26>>38) as i32;
-                            if action==0&&teleport_confirmed&&(f64::from(x)+0.5-position.0).powi(2)+(f64::from(y)+0.5-position.1).powi(2)+(f64::from(z)+0.5-position.2).powi(2)<=64.0{
-                                let air=data.flat.air;
-                                match world.set_block(x,y,z,air).await{
-                                    Ok(())=>state.broadcast(block_update(x,y,z,air)),
-                                    Err(error) if World::missing_imported_chunk(error.as_ref())=>{},
-                                    Err(error)=>return Err(error),
-                                }
-                            }
+                        }else if matches!(action,PlayerAction::StartDestroyBlock|PlayerAction::ChangeDestroyDirection|PlayerAction::AbortDestroyBlock|PlayerAction::StopDestroyBlock){
+                            let sequence=request.sequence;
+                            inventory_count+=1;
+                            let result=if inventory_count>64 {Err("Block interactions are rate limited".into())}
+                                else if !teleport_confirmed {Err("Wait for teleport confirmation".into())}
+                                else if !loaded.contains(&(request.block.x.div_euclid(16),request.block.z.div_euclid(16))) {Err("Block is outside the loaded terrain".into())}
+                                else if action==PlayerAction::StartDestroyBlock {state.edit_block(profile.uuid,registration.id(),inventory,BlockInteraction::Break(request)).await}
+                                else {Ok(())};
+                            block_response(&state,profile.uuid,registration.id(),sequence,result)?;
                         }
-                        let mut ack=vec![4];put_varint(sequence,&mut ack);writer.send(&ack).await?;
                     },
                     _=>{},
                 }
             }
         }
     }
+}
+
+fn block_response(
+    state: &State,
+    uuid: Uuid,
+    id: i32,
+    sequence: u32,
+    result: Result<()>,
+) -> Result<()> {
+    if *state.shutdown.borrow() {
+        return Err("server is stopping; block operation outcome is not being acknowledged".into());
+    }
+    if let Some(world) = &state.world {
+        world.check_available()?;
+    }
+    let mut batch: Vec<bytes::Bytes> = Vec::new();
+    if let Err(error) = result {
+        batch.push(packets::system_chat(&format!("Block interaction rejected: {error}")).into());
+    }
+    let mut acknowledgement = vec![4];
+    put_varint(sequence as i32, &mut acknowledgement);
+    batch.push(acknowledgement.into());
+    state.players.dispatch_batches(vec![(uuid, id, batch)])?;
+    Ok(())
 }
 
 fn tpsbar_metrics(state: &State) -> (String, f32) {
@@ -684,6 +720,7 @@ fn stream_chunks(
 #[cfg(test)]
 mod shutdown_tests {
     use super::*;
+    use crate::runtime::block_update;
 
     #[tokio::test]
     async fn reader_created_after_shutdown_does_not_wait_for_network_timeout() {

@@ -50,6 +50,7 @@ public final class PaperBridge implements AutoCloseable {
     private static PaperBridge instance;
     private final Thread owner = Thread.currentThread();
     private final Path directory;
+    private final CallbackContext callbackContext;
     private final Logger logger = Logger.getLogger("Zerqon-Paper");
     private final Map<String, BridgeClassLoader> plugins = new LinkedHashMap<>();
     private final Map<String, PluginCommand> commands = new LinkedHashMap<>();
@@ -61,11 +62,21 @@ public final class PaperBridge implements AutoCloseable {
     private boolean closed;
 
     public PaperBridge(Path directory) {
+        this(directory, plugin -> () -> {});
+    }
+
+    public PaperBridge(Path directory, CallbackContext callbackContext) {
         if (instance != null || Bukkit.getServer() != null) { throw new IllegalStateException("Only one Paper bridge may be installed in a JVM"); }
         this.directory = directory.toAbsolutePath().normalize();
+        this.callbackContext = java.util.Objects.requireNonNull(callbackContext, "callbackContext");
         instance = this;
         Bukkit.setServer(server);
     }
+
+    @FunctionalInterface
+    public interface CallbackContext { CallbackScope enter(Plugin plugin); }
+    @FunctionalInterface
+    public interface CallbackScope extends AutoCloseable { @Override void close(); }
 
     static PaperBridge current() {
         if (instance == null) { throw new IllegalStateException("Paper bridge is not installed"); }
@@ -84,8 +95,9 @@ public final class PaperBridge implements AutoCloseable {
     static <T> T context(Plugin plugin, java.util.function.Supplier<T> action) {
         Thread thread = Thread.currentThread();
         ClassLoader previous = thread.getContextClassLoader();
+        CallbackScope scope = current().callbackContext.enter(plugin);
         try { thread.setContextClassLoader(plugin.getClass().getClassLoader()); return action.get(); }
-        finally { thread.setContextClassLoader(previous); }
+        finally { scope.close(); thread.setContextClassLoader(previous); }
     }
 
     static <T> T proxy(Class<T> type, InvocationHandler implementation) {
@@ -141,7 +153,7 @@ public final class PaperBridge implements AutoCloseable {
         try {
             thread.setContextClassLoader(loader);
             JavaPlugin plugin = loader.create();
-            plugin.onLoad();
+            context(plugin, () -> { plugin.onLoad(); return null; });
             return plugin;
         } catch (Exception | Error failure) {
             plugins.remove(key);
@@ -282,9 +294,10 @@ public final class PaperBridge implements AutoCloseable {
             if (!listener.getPlugin().isEnabled()) { continue; }
             Thread thread = Thread.currentThread();
             ClassLoader previous = thread.getContextClassLoader();
+            CallbackScope scope = callbackContext.enter(listener.getPlugin());
             try { thread.setContextClassLoader(listener.getPlugin().getClass().getClassLoader()); listener.callEvent(event); }
             catch (org.bukkit.event.EventException failure) { logger.log(Level.SEVERE, "Plugin event handler failed: " + listener.getPlugin().getName(), failure.getCause()); }
-            finally { thread.setContextClassLoader(previous); }
+            finally { scope.close(); thread.setContextClassLoader(previous); }
         }
     }
 

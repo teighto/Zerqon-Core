@@ -22,12 +22,17 @@ final class PaperSupport implements AutoCloseable {
     private final Map<String, String> metadataNames = new LinkedHashMap<>();
     private boolean closed;
 
-    PaperSupport(Path directory) {
+    PaperSupport(Path directory, NativeTransport transport) {
         Path serverDirectory = directory;
         if (directory.getFileName().toString().equals("java-plugins") && directory.getParent() != null && directory.getParent().getFileName().toString().equals("plugins")) {
             serverDirectory = directory.getParent().getParent();
         }
-        bridge = new PaperBridge(serverDirectory);
+        bridge = new PaperBridge(serverDirectory, plugin -> {
+            String identity = metadataNames.get(plugin.getName().toLowerCase(Locale.ROOT));
+            if (identity == null) throw new IllegalStateException("Paper callback has no host identity");
+            var scope = transport.bind(identity);
+            return scope::close;
+        });
     }
 
     JsonArray load(List<Path> paths, String version) {
@@ -52,6 +57,7 @@ final class PaperSupport implements AutoCloseable {
                 pending.remove(candidate.getKey()); progress = true;
                 JavaPlugin plugin = null;
                 try {
+                    metadataNames.put(candidate.getKey(), value.identity);
                     plugin = bridge.load(value.path);
                     bridge.enable(plugin);
                     List<Action> actions = new ArrayList<>();
@@ -65,6 +71,7 @@ final class PaperSupport implements AutoCloseable {
                     results.add(result(value.identity, true, output, null));
                 } catch (Exception | LinkageError | AssertionError failure) {
                     if (plugin != null && plugin.isEnabled()) { try { bridge.disable(plugin); } catch (RuntimeException cleanup) { failure.addSuppressed(cleanup); } }
+                    metadataNames.remove(candidate.getKey());
                     results.add(result(value.identity, false, new JsonArray(), Wire.error(failure)));
                 }
             }
@@ -129,8 +136,8 @@ final class PaperSupport implements AutoCloseable {
             catch (RuntimeException | LinkageError | AssertionError failure) { plugin.error = Wire.error(failure); }
             results.add(result(entry.getKey(), false, new JsonArray(), plugin.error));
         }
-        entries.clear(); metadataNames.clear();
-        bridge.close(); closed = true;
+        entries.clear();
+        try { bridge.close(); } finally { metadataNames.clear(); closed = true; }
         return results;
     }
 

@@ -112,7 +112,7 @@ impl Client {
                 let (id, xyz, rotation) = teleport(&packet);
                 assert_eq!(xyz, [0.5, -60.0, 0.5], "source spawn must be active");
                 assert_eq!(rotation, [137.5, -25.0]);
-                client.ack(id).await;
+                client.ack(id, xyz, rotation).await;
             }
             let finished = packet[0] == 11;
             received.push(packet);
@@ -158,9 +158,15 @@ impl Client {
         .await
         .unwrap()
     }
-    async fn ack(&mut self, id: i32) {
+    async fn ack(&mut self, id: i32, xyz: [f64; 3], rotation: [f32; 2]) {
         let mut ack = vec![0];
         put_varint(id, &mut ack);
+        for value in xyz {
+            ack.extend_from_slice(&value.to_be_bytes());
+        }
+        for value in rotation {
+            ack.extend_from_slice(&value.to_be_bytes());
+        }
         self.send(&ack).await;
     }
     async fn movement(&mut self, xyz: [f64; 3]) {
@@ -425,10 +431,10 @@ async fn imported_spawn_sparse_view_and_boundary_corrections_survive_restart() {
                 assert_eq!(xyz, [32.5, -60.0, 0.5]);
                 assert_eq!(rotation, [137.5, -25.0]);
                 last_id = id;
-                client.ack(id - 1).await;
+                client.ack(id - 1, xyz, rotation).await;
                 client.movement([16.5, -60.0, 0.5]).await;
                 client.tps().await;
-                client.ack(id).await;
+                client.ack(id, xyz, rotation).await;
                 client.tps().await;
             }
             client.movement([47.5, -60.0, 0.5]).await;
@@ -454,14 +460,50 @@ async fn imported_spawn_sparse_view_and_boundary_corrections_survive_restart() {
             (chunk.x, chunk.z) == (0, 0)
         })
         .unwrap();
-    let spawn_path = world.join(spawn_path);
-    let held = spawn_path.with_extension("held");
-    fs::rename(&spawn_path, &held).unwrap();
-    startup_failure(&directory, &data, "imported world has no chunk").await;
-    fs::rename(&held, &spawn_path).unwrap();
-    fs::write(&spawn_path, b"corrupt").unwrap();
-    startup_failure(&directory, &data, "invalid chunk length").await;
-    fs::write(&spawn_path, spawn_bytes).unwrap();
+    for (name, missing) in [("missing-spawn", true), ("corrupt-spawn", false)] {
+        let rejected = temporary.path().join(name);
+        fs::create_dir_all(rejected.join("world")).unwrap();
+        for config in ["server.properties", "server.settings", "eula.txt"] {
+            fs::copy(directory.join(config), rejected.join(config)).unwrap();
+        }
+        for metadata in ["world-metadata.json", "import-report.json"] {
+            fs::copy(world.join(metadata), rejected.join("world").join(metadata)).unwrap();
+        }
+        copy_tree(
+            &world.join("source-data"),
+            &rejected.join("world/source-data"),
+        );
+        for (path, bytes) in &chunks_before {
+            if path == spawn_path {
+                if !missing {
+                    fs::write(rejected.join("world").join(path), b"corrupt").unwrap();
+                }
+            } else {
+                fs::write(rejected.join("world").join(path), bytes).unwrap();
+            }
+        }
+        startup_failure(
+            &rejected,
+            &data,
+            if missing {
+                "imported world has no chunk"
+            } else {
+                "invalid chunk length"
+            },
+        )
+        .await;
+    }
+    let baseline = world.join(spawn_path);
+    fs::write(&baseline, b"unused legacy recovery copy").unwrap();
+    {
+        let store = zerqon_world::WorldStore::open(&world).unwrap();
+        assert_eq!(
+            store.load(0, 0).unwrap().unwrap().to_bytes(),
+            *spawn_bytes,
+            "active database must remain authoritative"
+        );
+    }
+    fs::write(&baseline, spawn_bytes).unwrap();
     let chunks_after: BTreeMap<_, _> = snapshot(&world)
         .into_iter()
         .filter(|(path, _)| path.extension().is_some_and(|ext| ext == "zqc"))

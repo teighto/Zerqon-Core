@@ -33,6 +33,8 @@ The manifest records original relative paths, byte sizes and SHA-256 digests. Na
 
 Failed imports retain `IMPORT_INCOMPLETE`; opening such a destination fails. Metadata and the final report are published atomically, and the marker is removed only after successful completion. Retry into a new directory after correcting the error. Source files are never deleted.
 
+The first server startup migrates imported chunk files into the current [transactional store](WORLD_STORAGE.md). Its versioned downgrade guard also uses the name `IMPORT_INCOMPLETE`; this specific guard is accepted only alongside a valid storage database. It is distinct from a failed-import marker.
+
 ## No substitute terrain
 
 Imported worlds use `GenerationPolicy::ExistingOnly`. Loading an absent chunk returns `WorldError::MissingImportedChunk { x, z }`; saving a new chunk outside the imported set also fails. Missing or skipped source terrain must never silently become Zerqon's flat generator.
@@ -97,3 +99,5 @@ The wire integration test imports a temporary copy of that world with nonzero sp
 Политика `ExistingOnly` запрещает создавать flat-чанки вместо отсутствующего импортированного ландшафта. Игрок появляется в исходной точке с сохранённым направлением взгляда. Отсутствующие чанки пропускаются при отправке; попытка пересечь край доступной территории возвращает игрока в последнюю принятую позицию. Это проверка доступности территории, а не полноценная физика или античит. Чанк spawn проверяется при запуске. Ошибка импорта оставляет `IMPORT_INCOMPLETE`, и такой каталог нельзя открыть. Старые native-миры сохраняют прежний режим; старый импорт без метаданных требуется повторить в новый каталог.
 
 Сохранение сущностей, сундуков, playerdata, правил, времени и режима игры не означает восстановления их поведения. Отчёт разделяет применённые поля, сохранённые оригиналы и неподдержанные возможности. Полный импорт миров и его игровая совместимость остаются последующими этапами.
+
+При первом запуске импортированные чанки переносятся в [базу хранилища](WORLD_STORAGE.md). После этого файл `IMPORT_INCOMPLETE` с другим, строго определённым содержимым защищает мир от старых сборок. Такая защита допускается только при исправной базе; отметка неудачного импорта по-прежнему запрещает запуск.

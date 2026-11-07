@@ -237,6 +237,8 @@ impl Client {
                 let teleport = get_varint(&mut view).unwrap();
                 let mut ack = vec![0];
                 put_varint(teleport, &mut ack);
+                ack.extend_from_slice(&view[..24]);
+                ack.extend_from_slice(&view[48..56]);
                 write_frame(&mut self.socket, &ack, None).await.unwrap();
             }
             18 => {

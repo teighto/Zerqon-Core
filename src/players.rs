@@ -260,9 +260,13 @@ impl Players {
         })
     }
     pub fn count(&self) -> usize {
-        self.inner.lock().map_or(0, |inner| {
-            inner.values().filter(|player| player.active).count()
-        })
+        self.try_count().unwrap_or(0)
+    }
+    pub fn try_count(&self) -> Result<usize, PlayerError> {
+        self.inner
+            .lock()
+            .map(|inner| inner.values().filter(|player| player.active).count())
+            .map_err(|_| PlayerError::Unavailable)
     }
     pub fn names(&self) -> Vec<String> {
         self.inner.lock().map_or_else(
@@ -276,12 +280,12 @@ impl Players {
             },
         )
     }
-    pub fn broadcast(&self, packet: Bytes) {
-        if let Ok(inner) = self.inner.lock() {
-            for player in inner.values().filter(|player| player.active) {
-                enqueue(player, vec![packet.clone()]);
-            }
+    pub fn broadcast(&self, packet: Bytes) -> Result<(), PlayerError> {
+        let inner = self.inner.lock().map_err(|_| PlayerError::Unavailable)?;
+        for player in inner.values().filter(|player| player.active) {
+            enqueue(player, vec![packet.clone()]);
         }
+        Ok(())
     }
     fn visible(&self, left: Position, right: Position) -> bool {
         (left.xyz[0] - right.xyz[0]).abs() <= self.radius

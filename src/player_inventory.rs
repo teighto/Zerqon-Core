@@ -12,7 +12,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tokio::sync::Semaphore;
+use tokio::sync::{RwLock, Semaphore};
 use uuid::Uuid;
 use zerqon_inventory::{
     CreativeSlotRequest, DecodeLimits, InventoryPolicy, ItemCatalog, ItemId, ItemStack,
@@ -43,6 +43,7 @@ pub enum InventoryServiceError {
 }
 
 pub struct InventoryService {
+    pub gameplay: Arc<RwLock<()>>,
     catalog: Arc<ItemCatalog>,
     store: Arc<PlayerStore>,
     players: Arc<Players>,
@@ -86,11 +87,13 @@ impl InventoryService {
         catalog: Arc<ItemCatalog>,
         players: Arc<Players>,
         capacity: usize,
+        gameplay: Arc<RwLock<()>>,
     ) -> Result<Arc<Self>, InventoryServiceError> {
         if !(1..=65_536).contains(&capacity) {
             return Err(InventoryServiceError::Limit("player capacity"));
         }
         Ok(Arc::new(Self {
+            gameplay,
             store: Arc::new(PlayerStore::new(directory, Arc::clone(&catalog))?),
             catalog,
             players,
@@ -213,6 +216,7 @@ impl InventoryService {
             + Send
             + 'static,
     {
+        let gameplay = Arc::clone(&self.gameplay).read_owned().await;
         let permit = Arc::clone(&self.inflight)
             .acquire_owned()
             .await
@@ -222,7 +226,7 @@ impl InventoryService {
         let stripes = Arc::clone(&self.stripes);
         let players = Arc::clone(&self.players);
         tokio::task::spawn_blocking(move||{
-            let _permit=permit;let _stripe=stripes[stripe(session.uuid)].lock().map_err(|_|InventoryServiceError::Unavailable("inventory I/O lock poisoned"))?;
+            let _gameplay=gameplay;let _permit=permit;let _stripe=stripes[stripe(session.uuid)].lock().map_err(|_|InventoryServiceError::Unavailable("inventory I/O lock poisoned"))?;
             ensure_open(&session)?;
             let mut current=session.inventory.lock().map_err(|_|InventoryServiceError::Unavailable("inventory lock poisoned"))?;
             let mut candidate=current.as_ref().ok_or(InventoryServiceError::Unavailable("inventory is loading"))?.clone();
@@ -243,6 +247,24 @@ impl InventoryService {
     }
 }
 impl InventoryHandle {
+    pub fn held_stack(
+        &self,
+        hand: zerqon_inventory::Hand,
+    ) -> Result<zerqon_inventory::Slot, InventoryServiceError> {
+        ensure_open(&self.session)?;
+        let current = self
+            .session
+            .inventory
+            .lock()
+            .map_err(|_| InventoryServiceError::Unavailable("inventory lock poisoned"))?;
+        let current = current
+            .as_ref()
+            .ok_or(InventoryServiceError::Unavailable("inventory is loading"))?;
+        Ok(match hand {
+            zerqon_inventory::Hand::Main => current.selected_stack().clone(),
+            zerqon_inventory::Hand::Off => current.slots()[45].clone(),
+        })
+    }
     pub fn allow_outbound(&self, batch: &PacketBatch) -> bool {
         batch.inventory_revision().is_none_or(|revision| {
             revision.uuid == self.session.uuid
@@ -569,15 +591,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inventory_changes_wait_for_an_exclusive_world_edit_without_blocking_the_executor() {
+        let directory = tempfile::tempdir().unwrap();
+        let catalog = catalog();
+        let uuid = Uuid::from_u128(76);
+        let players = Players::new(20, 64.0, 159, Arc::new(EntityIds::default()));
+        let (player, _receiver) = reserve(&players, uuid);
+        let service = InventoryService::new(
+            directory.path().into(),
+            catalog,
+            players,
+            20,
+            Arc::new(RwLock::new(())),
+        )
+        .unwrap();
+        let _handle = service.open(uuid, player.id()).await.unwrap();
+        let lease = Arc::clone(&service.gameplay).write_owned().await;
+        let pending_service = Arc::clone(&service);
+        let id = player.id();
+        let mut pending =
+            tokio::spawn(async move { pending_service.give(uuid, id, "stone", 1).await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut pending)
+                .await
+                .is_err()
+        );
+        assert!(!directory.path().join(format!("{uuid}.zinv")).exists());
+        drop(lease);
+        tokio::time::timeout(Duration::from_secs(2), pending)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let loaded = service.store.load(uuid).unwrap();
+        assert_eq!(loaded.slots()[36].as_ref().unwrap().count(), 1);
+    }
+
+    #[tokio::test]
     async fn writes_are_persisted_by_uuid_before_success_and_reload_restores_selection() {
         let directory = tempfile::tempdir().unwrap();
         let catalog = catalog();
         let uuid = Uuid::from_u128(7);
         let players = Players::new(20, 64.0, 159, Arc::new(EntityIds::default()));
         let (player, _receiver) = reserve(&players, uuid);
-        let service =
-            InventoryService::new(directory.path().into(), Arc::clone(&catalog), players, 20)
-                .unwrap();
+        let service = InventoryService::new(
+            directory.path().into(),
+            Arc::clone(&catalog),
+            players,
+            20,
+            Arc::new(RwLock::new(())),
+        )
+        .unwrap();
         let handle = service.open(uuid, player.id()).await.unwrap();
         let bytes = encode_creative_slot_body(
             &CreativeSlotRequest {
@@ -608,9 +672,14 @@ mod tests {
         let uuid = Uuid::from_u128(8);
         let players = Players::new(20, 64.0, 159, Arc::new(EntityIds::default()));
         let (player, _receiver) = reserve(&players, uuid);
-        let service =
-            InventoryService::new(directory.path().into(), Arc::clone(&catalog), players, 20)
-                .unwrap();
+        let service = InventoryService::new(
+            directory.path().into(),
+            Arc::clone(&catalog),
+            players,
+            20,
+            Arc::new(RwLock::new(())),
+        )
+        .unwrap();
         let handle = service.open(uuid, player.id()).await.unwrap();
         let text = "\0".repeat(4096);
         let patch = ValidatedPatch::new(
@@ -693,6 +762,7 @@ mod tests {
             Arc::clone(&catalog),
             Arc::clone(&players),
             20,
+            Arc::new(RwLock::new(())),
         )
         .unwrap();
         let handle = service.open(uuid, player.id()).await.unwrap();
@@ -736,9 +806,14 @@ mod tests {
         let uuid = Uuid::from_u128(11);
         let players = Players::new(20, 64.0, 159, Arc::new(EntityIds::default()));
         let (player, _rx) = reserve(&players, uuid);
-        let service =
-            InventoryService::new(directory.path().into(), Arc::clone(&catalog), players, 20)
-                .unwrap();
+        let service = InventoryService::new(
+            directory.path().into(),
+            Arc::clone(&catalog),
+            players,
+            20,
+            Arc::new(RwLock::new(())),
+        )
+        .unwrap();
         let handle = service.open(uuid, player.id()).await.unwrap();
         handle.session.rate.lock().unwrap().count = 32;
         handle
@@ -776,9 +851,14 @@ mod tests {
         let uuid = Uuid::from_u128(12);
         let players = Players::new(20, 64.0, 159, Arc::new(EntityIds::default()));
         let (player, _rx) = reserve(&players, uuid);
-        let service =
-            InventoryService::new(directory.path().into(), Arc::clone(&catalog), players, 20)
-                .unwrap();
+        let service = InventoryService::new(
+            directory.path().into(),
+            Arc::clone(&catalog),
+            players,
+            20,
+            Arc::new(RwLock::new(())),
+        )
+        .unwrap();
         let handle = service.open(uuid, player.id()).await.unwrap();
         service.give(uuid, player.id(), "stone", 1).await.unwrap();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -825,9 +905,14 @@ mod tests {
         let uuid = Uuid::from_u128(13);
         let players = Players::new(20, 64.0, 159, Arc::new(EntityIds::default()));
         let (player, _rx) = reserve(&players, uuid);
-        let service =
-            InventoryService::new(directory.path().into(), Arc::clone(&catalog), players, 20)
-                .unwrap();
+        let service = InventoryService::new(
+            directory.path().into(),
+            Arc::clone(&catalog),
+            players,
+            20,
+            Arc::new(RwLock::new(())),
+        )
+        .unwrap();
         let handle = service.open(uuid, player.id()).await.unwrap();
         let before = handle.full_sync().await.unwrap();
         assert!(matches!(
@@ -847,7 +932,14 @@ mod tests {
         let uuid = Uuid::from_u128(14);
         let players = Players::new(20, 64.0, 159, Arc::new(EntityIds::default()));
         let (player, _rx) = reserve(&players, uuid);
-        let service = InventoryService::new(directory.path().into(), catalog, players, 20).unwrap();
+        let service = InventoryService::new(
+            directory.path().into(),
+            catalog,
+            players,
+            20,
+            Arc::new(RwLock::new(())),
+        )
+        .unwrap();
         let handle = service.open(uuid, player.id()).await.unwrap();
         service.give(uuid, player.id(), "stone", 1).await.unwrap();
         let before = handle.full_sync().await.unwrap();

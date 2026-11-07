@@ -1,0 +1,2068 @@
+{
+  "minecraft": "26.3",
+  "protocol": 777,
+  "cases": [
+    {
+      "name": "teleport_initial",
+      "kind": "accept_teleportation",
+      "packet_id": 0,
+      "body": "013fe000000000000040500000000000003fe00000000000000000000000000000",
+      "fields": {
+        "id": 1,
+        "position": [
+          0.5,
+          64.0,
+          0.5
+        ],
+        "rotation": [
+          0.0,
+          0.0
+        ]
+      },
+      "packet": "00013fe000000000000040500000000000003fe00000000000000000000000000000",
+      "frame": "2200013fe000000000000040500000000000003fe00000000000000000000000000000"
+    },
+    {
+      "name": "teleport_negative",
+      "kind": "accept_teleportation",
+      "packet_id": 0,
+      "body": "8101c031400000000000c04e0000000000004040c0000000000043340000c2360000",
+      "fields": {
+        "id": 129,
+        "position": [
+          -17.25,
+          -60.0,
+          33.5
+        ],
+        "rotation": [
+          180.0,
+          -45.5
+        ]
+      },
+      "packet": "008101c031400000000000c04e0000000000004040c0000000000043340000c2360000",
+      "frame": "23008101c031400000000000c04e0000000000004040c0000000000043340000c2360000"
+    },
+    {
+      "name": "teleport_max_id",
+      "kind": "accept_teleportation",
+      "packet_id": 0,
+      "body": "ffffffff07417c9c3800000000c17312d000000000c17c9c38000000004434100042b30000",
+      "fields": {
+        "id": 2147483647,
+        "position": [
+          3.0E7,
+          -2.0E7,
+          -3.0E7
+        ],
+        "rotation": [
+          720.25,
+          89.5
+        ]
+      },
+      "packet": "00ffffffff07417c9c3800000000c17312d000000000c17c9c38000000004434100042b30000",
+      "frame": "2600ffffffff07417c9c3800000000c17312d000000000c17c9c38000000004434100042b30000"
+    },
+    {
+      "name": "attack_multibyte",
+      "kind": "attack",
+      "packet_id": 1,
+      "body": "ac02",
+      "fields": {
+        "entity_id": 300
+      },
+      "packet": "01ac02",
+      "frame": "0301ac02"
+    },
+    {
+      "name": "keepalive_negative",
+      "kind": "keep_alive",
+      "packet_id": 28,
+      "body": "fefdfcfbfaf9f8f8",
+      "fields": {
+        "nonce": -72623859790382856
+      },
+      "packet": "1cfefdfcfbfaf9f8f8",
+      "frame": "091cfefdfcfbfaf9f8f8"
+    },
+    {
+      "name": "command_unicode",
+      "kind": "chat_command",
+      "packet_id": 7,
+      "body": "1873617920d09fd180d0b8d0b2d0b5d182207465696768746f",
+      "fields": {
+        "command": "say Привет teighto"
+      },
+      "packet": "071873617920d09fd180d0b8d0b2d0b5d182207465696768746f",
+      "frame": "1a071873617920d09fd180d0b8d0b2d0b5d182207465696768746f"
+    },
+    {
+      "name": "command_length_300",
+      "kind": "chat_command",
+      "packet_id": 7,
+      "body": "ac02736179206161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161",
+      "fields": {
+        "command": "say aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "packet": "07ac02736179206161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161",
+      "frame": "af0207ac02736179206161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161"
+    },
+    {
+      "name": "signed_empty",
+      "kind": "chat_command_signed",
+      "packet_id": 8,
+      "body": "0776657273696f6e000001a1b505847b0000000000000000000000000000",
+      "fields": {
+        "command": "version",
+        "timestamp_ms": 1794038400123,
+        "salt": 0,
+        "signatures": [],
+        "last_seen_offset": 0,
+        "last_seen_bits": [],
+        "last_seen_checksum": 0
+      },
+      "packet": "080776657273696f6e000001a1b505847b0000000000000000000000000000",
+      "frame": "1f080776657273696f6e000001a1b505847b0000000000000000000000000000"
+    },
+    {
+      "name": "signed_arguments",
+      "kind": "chat_command_signed",
+      "packet_id": 8,
+      "body": "0b736179207465696768746f000001a1b505847bfffffffffffffff701076d657373616765000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff8201010108db",
+      "fields": {
+        "command": "say teighto",
+        "timestamp_ms": 1794038400123,
+        "salt": -9,
+        "signatures": [
+          {
+            "name": "message",
+            "bytes": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff"
+          }
+        ],
+        "last_seen_offset": 130,
+        "last_seen_bits": [
+          0,
+          8,
+          19
+        ],
+        "last_seen_checksum": -37
+      },
+      "packet": "080b736179207465696768746f000001a1b505847bfffffffffffffff701076d657373616765000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff8201010108db",
+      "frame": "ac02080b736179207465696768746f000001a1b505847bfffffffffffffff701076d657373616765000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff8201010108db"
+    },
+    {
+      "name": "move_pos_flags0",
+      "kind": "move_player_pos",
+      "packet_id": 30,
+      "body": "c031400000000000c04e0000000000004040c0000000000000",
+      "fields": {
+        "has_position": true,
+        "has_rotation": false,
+        "position": [
+          -17.25,
+          -60.0,
+          33.5
+        ],
+        "on_ground": false,
+        "horizontal_collision": false
+      },
+      "packet": "1ec031400000000000c04e0000000000004040c0000000000000",
+      "frame": "1a1ec031400000000000c04e0000000000004040c0000000000000"
+    },
+    {
+      "name": "move_posrot_flags0",
+      "kind": "move_player_pos_rot",
+      "packet_id": 31,
+      "body": "c031400000000000c04e0000000000004040c0000000000043340000c236000000",
+      "fields": {
+        "has_position": true,
+        "has_rotation": true,
+        "position": [
+          -17.25,
+          -60.0,
+          33.5
+        ],
+        "rotation": [
+          180.0,
+          -45.5
+        ],
+        "on_ground": false,
+        "horizontal_collision": false
+      },
+      "packet": "1fc031400000000000c04e0000000000004040c0000000000043340000c236000000",
+      "frame": "221fc031400000000000c04e0000000000004040c0000000000043340000c236000000"
+    },
+    {
+      "name": "move_rot_flags0",
+      "kind": "move_player_rot",
+      "packet_id": 32,
+      "body": "4434100042b3000000",
+      "fields": {
+        "has_position": false,
+        "has_rotation": true,
+        "rotation": [
+          720.25,
+          89.5
+        ],
+        "on_ground": false,
+        "horizontal_collision": false
+      },
+      "packet": "204434100042b3000000",
+      "frame": "0a204434100042b3000000"
+    },
+    {
+      "name": "move_status_flags0",
+      "kind": "move_player_status_only",
+      "packet_id": 33,
+      "body": "00",
+      "fields": {
+        "has_position": false,
+        "has_rotation": false,
+        "on_ground": false,
+        "horizontal_collision": false
+      },
+      "packet": "2100",
+      "frame": "022100"
+    },
+    {
+      "name": "move_pos_flags1",
+      "kind": "move_player_pos",
+      "packet_id": 30,
+      "body": "c031400000000000c04e0000000000004040c0000000000001",
+      "fields": {
+        "has_position": true,
+        "has_rotation": false,
+        "position": [
+          -17.25,
+          -60.0,
+          33.5
+        ],
+        "on_ground": true,
+        "horizontal_collision": false
+      },
+      "packet": "1ec031400000000000c04e0000000000004040c0000000000001",
+      "frame": "1a1ec031400000000000c04e0000000000004040c0000000000001"
+    },
+    {
+      "name": "move_posrot_flags1",
+      "kind": "move_player_pos_rot",
+      "packet_id": 31,
+      "body": "c031400000000000c04e0000000000004040c0000000000043340000c236000001",
+      "fields": {
+        "has_position": true,
+        "has_rotation": true,
+        "position": [
+          -17.25,
+          -60.0,
+          33.5
+        ],
+        "rotation": [
+          180.0,
+          -45.5
+        ],
+        "on_ground": true,
+        "horizontal_collision": false
+      },
+      "packet": "1fc031400000000000c04e0000000000004040c0000000000043340000c236000001",
+      "frame": "221fc031400000000000c04e0000000000004040c0000000000043340000c236000001"
+    },
+    {
+      "name": "move_rot_flags1",
+      "kind": "move_player_rot",
+      "packet_id": 32,
+      "body": "4434100042b3000001",
+      "fields": {
+        "has_position": false,
+        "has_rotation": true,
+        "rotation": [
+          720.25,
+          89.5
+        ],
+        "on_ground": true,
+        "horizontal_collision": false
+      },
+      "packet": "204434100042b3000001",
+      "frame": "0a204434100042b3000001"
+    },
+    {
+      "name": "move_status_flags1",
+      "kind": "move_player_status_only",
+      "packet_id": 33,
+      "body": "01",
+      "fields": {
+        "has_position": false,
+        "has_rotation": false,
+        "on_ground": true,
+        "horizontal_collision": false
+      },
+      "packet": "2101",
+      "frame": "022101"
+    },
+    {
+      "name": "move_pos_flags2",
+      "kind": "move_player_pos",
+      "packet_id": 30,
+      "body": "c031400000000000c04e0000000000004040c0000000000002",
+      "fields": {
+        "has_position": true,
+        "has_rotation": false,
+        "position": [
+          -17.25,
+          -60.0,
+          33.5
+        ],
+        "on_ground": false,
+        "horizontal_collision": true
+      },
+      "packet": "1ec031400000000000c04e0000000000004040c0000000000002",
+      "frame": "1a1ec031400000000000c04e0000000000004040c0000000000002"
+    },
+    {
+      "name": "move_posrot_flags2",
+      "kind": "move_player_pos_rot",
+      "packet_id": 31,
+      "body": "c031400000000000c04e0000000000004040c0000000000043340000c236000002",
+      "fields": {
+        "has_position": true,
+        "has_rotation": true,
+        "position": [
+          -17.25,
+          -60.0,
+          33.5
+        ],
+        "rotation": [
+          180.0,
+          -45.5
+        ],
+        "on_ground": false,
+        "horizontal_collision": true
+      },
+      "packet": "1fc031400000000000c04e0000000000004040c0000000000043340000c236000002",
+      "frame": "221fc031400000000000c04e0000000000004040c0000000000043340000c236000002"
+    },
+    {
+      "name": "move_rot_flags2",
+      "kind": "move_player_rot",
+      "packet_id": 32,
+      "body": "4434100042b3000002",
+      "fields": {
+        "has_position": false,
+        "has_rotation": true,
+        "rotation": [
+          720.25,
+          89.5
+        ],
+        "on_ground": false,
+        "horizontal_collision": true
+      },
+      "packet": "204434100042b3000002",
+      "frame": "0a204434100042b3000002"
+    },
+    {
+      "name": "move_status_flags2",
+      "kind": "move_player_status_only",
+      "packet_id": 33,
+      "body": "02",
+      "fields": {
+        "has_position": false,
+        "has_rotation": false,
+        "on_ground": false,
+        "horizontal_collision": true
+      },
+      "packet": "2102",
+      "frame": "022102"
+    },
+    {
+      "name": "move_pos_flags3",
+      "kind": "move_player_pos",
+      "packet_id": 30,
+      "body": "c031400000000000c04e0000000000004040c0000000000003",
+      "fields": {
+        "has_position": true,
+        "has_rotation": false,
+        "position": [
+          -17.25,
+          -60.0,
+          33.5
+        ],
+        "on_ground": true,
+        "horizontal_collision": true
+      },
+      "packet": "1ec031400000000000c04e0000000000004040c0000000000003",
+      "frame": "1a1ec031400000000000c04e0000000000004040c0000000000003"
+    },
+    {
+      "name": "move_posrot_flags3",
+      "kind": "move_player_pos_rot",
+      "packet_id": 31,
+      "body": "c031400000000000c04e0000000000004040c0000000000043340000c236000003",
+      "fields": {
+        "has_position": true,
+        "has_rotation": true,
+        "position": [
+          -17.25,
+          -60.0,
+          33.5
+        ],
+        "rotation": [
+          180.0,
+          -45.5
+        ],
+        "on_ground": true,
+        "horizontal_collision": true
+      },
+      "packet": "1fc031400000000000c04e0000000000004040c0000000000043340000c236000003",
+      "frame": "221fc031400000000000c04e0000000000004040c0000000000043340000c236000003"
+    },
+    {
+      "name": "move_rot_flags3",
+      "kind": "move_player_rot",
+      "packet_id": 32,
+      "body": "4434100042b3000003",
+      "fields": {
+        "has_position": false,
+        "has_rotation": true,
+        "rotation": [
+          720.25,
+          89.5
+        ],
+        "on_ground": true,
+        "horizontal_collision": true
+      },
+      "packet": "204434100042b3000003",
+      "frame": "0a204434100042b3000003"
+    },
+    {
+      "name": "move_status_flags3",
+      "kind": "move_player_status_only",
+      "packet_id": 33,
+      "body": "03",
+      "fields": {
+        "has_position": false,
+        "has_rotation": false,
+        "on_ground": true,
+        "horizontal_collision": true
+      },
+      "packet": "2103",
+      "frame": "022103"
+    },
+    {
+      "name": "action_0",
+      "kind": "player_action",
+      "packet_id": 41,
+      "body": "00fffffbc000021fc4008201",
+      "fields": {
+        "action": 0,
+        "block": [
+          -17.0,
+          -60.0,
+          33.0
+        ],
+        "face": 0,
+        "sequence": 130
+      },
+      "packet": "2900fffffbc000021fc4008201",
+      "frame": "0d2900fffffbc000021fc4008201"
+    },
+    {
+      "name": "action_1",
+      "kind": "player_action",
+      "packet_id": 41,
+      "body": "01fffffbc000021fc4018201",
+      "fields": {
+        "action": 1,
+        "block": [
+          -17.0,
+          -60.0,
+          33.0
+        ],
+        "face": 1,
+        "sequence": 130
+      },
+      "packet": "2901fffffbc000021fc4018201",
+      "frame": "0d2901fffffbc000021fc4018201"
+    },
+    {
+      "name": "action_2",
+      "kind": "player_action",
+      "packet_id": 41,
+      "body": "02fffffbc000021fc4028201",
+      "fields": {
+        "action": 2,
+        "block": [
+          -17.0,
+          -60.0,
+          33.0
+        ],
+        "face": 2,
+        "sequence": 130
+      },
+      "packet": "2902fffffbc000021fc4028201",
+      "frame": "0d2902fffffbc000021fc4028201"
+    },
+    {
+      "name": "action_3",
+      "kind": "player_action",
+      "packet_id": 41,
+      "body": "03fffffbc000021fc4038201",
+      "fields": {
+        "action": 3,
+        "block": [
+          -17.0,
+          -60.0,
+          33.0
+        ],
+        "face": 3,
+        "sequence": 130
+      },
+      "packet": "2903fffffbc000021fc4038201",
+      "frame": "0d2903fffffbc000021fc4038201"
+    },
+    {
+      "name": "action_4",
+      "kind": "player_action",
+      "packet_id": 41,
+      "body": "04fffffbc000021fc4048201",
+      "fields": {
+        "action": 4,
+        "block": [
+          -17.0,
+          -60.0,
+          33.0
+        ],
+        "face": 4,
+        "sequence": 130
+      },
+      "packet": "2904fffffbc000021fc4048201",
+      "frame": "0d2904fffffbc000021fc4048201"
+    },
+    {
+      "name": "action_5",
+      "kind": "player_action",
+      "packet_id": 41,
+      "body": "05fffffbc000021fc4058201",
+      "fields": {
+        "action": 5,
+        "block": [
+          -17.0,
+          -60.0,
+          33.0
+        ],
+        "face": 5,
+        "sequence": 130
+      },
+      "packet": "2905fffffbc000021fc4058201",
+      "frame": "0d2905fffffbc000021fc4058201"
+    },
+    {
+      "name": "action_6",
+      "kind": "player_action",
+      "packet_id": 41,
+      "body": "06fffffbc000021fc4008201",
+      "fields": {
+        "action": 6,
+        "block": [
+          -17.0,
+          -60.0,
+          33.0
+        ],
+        "face": 0,
+        "sequence": 130
+      },
+      "packet": "2906fffffbc000021fc4008201",
+      "frame": "0d2906fffffbc000021fc4008201"
+    },
+    {
+      "name": "action_7",
+      "kind": "player_action",
+      "packet_id": 41,
+      "body": "07fffffbc000021fc4018201",
+      "fields": {
+        "action": 7,
+        "block": [
+          -17.0,
+          -60.0,
+          33.0
+        ],
+        "face": 1,
+        "sequence": 130
+      },
+      "packet": "2907fffffbc000021fc4018201",
+      "frame": "0d2907fffffbc000021fc4018201"
+    },
+    {
+      "name": "action_8",
+      "kind": "player_action",
+      "packet_id": 41,
+      "body": "08fffffbc000021fc4028201",
+      "fields": {
+        "action": 8,
+        "block": [
+          -17.0,
+          -60.0,
+          33.0
+        ],
+        "face": 2,
+        "sequence": 130
+      },
+      "packet": "2908fffffbc000021fc4028201",
+      "frame": "0d2908fffffbc000021fc4028201"
+    },
+    {
+      "name": "carried_last",
+      "kind": "set_carried_item",
+      "packet_id": 54,
+      "body": "0008",
+      "fields": {
+        "slot": 8
+      },
+      "packet": "360008",
+      "frame": "03360008"
+    },
+    {
+      "name": "creative_empty",
+      "kind": "set_creative_mode_slot",
+      "packet_id": 57,
+      "body": "002400",
+      "fields": {
+        "slot": 36,
+        "stack": null
+      },
+      "packet": "39002400",
+      "frame": "0439002400"
+    },
+    {
+      "name": "creative_stone64",
+      "kind": "set_creative_mode_slot",
+      "packet_id": 57,
+      "body": "002c40010000",
+      "fields": {
+        "slot": 44,
+        "stack": {
+          "item": "minecraft:stone",
+          "count": 64,
+          "added": {},
+          "removed": []
+        }
+      },
+      "packet": "39002c40010000",
+      "frame": "0739002c40010000"
+    },
+    {
+      "name": "click_0",
+      "kind": "container_click",
+      "packet_id": 18,
+      "body": "00ffff0100240000010024010140010112345678010600",
+      "fields": {
+        "container_id": 0,
+        "state_id": 32767,
+        "slot": 36,
+        "button": 0,
+        "mode": 0,
+        "changed_slots": [
+          {
+            "slot": 36,
+            "stack": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "added": {
+                "minecraft:max_stack_size": 305419896
+              },
+              "removed": [
+                "minecraft:custom_name"
+              ]
+            }
+          }
+        ],
+        "carried": null
+      },
+      "packet": "1200ffff0100240000010024010140010112345678010600",
+      "frame": "181200ffff0100240000010024010140010112345678010600"
+    },
+    {
+      "name": "click_1",
+      "kind": "container_click",
+      "packet_id": 18,
+      "body": "00ffff0100240001010024010140010112345678010600",
+      "fields": {
+        "container_id": 0,
+        "state_id": 32767,
+        "slot": 36,
+        "button": 0,
+        "mode": 1,
+        "changed_slots": [
+          {
+            "slot": 36,
+            "stack": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "added": {
+                "minecraft:max_stack_size": 305419896
+              },
+              "removed": [
+                "minecraft:custom_name"
+              ]
+            }
+          }
+        ],
+        "carried": null
+      },
+      "packet": "1200ffff0100240001010024010140010112345678010600",
+      "frame": "181200ffff0100240001010024010140010112345678010600"
+    },
+    {
+      "name": "click_2",
+      "kind": "container_click",
+      "packet_id": 18,
+      "body": "00ffff0100240002010024010140010112345678010600",
+      "fields": {
+        "container_id": 0,
+        "state_id": 32767,
+        "slot": 36,
+        "button": 0,
+        "mode": 2,
+        "changed_slots": [
+          {
+            "slot": 36,
+            "stack": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "added": {
+                "minecraft:max_stack_size": 305419896
+              },
+              "removed": [
+                "minecraft:custom_name"
+              ]
+            }
+          }
+        ],
+        "carried": null
+      },
+      "packet": "1200ffff0100240002010024010140010112345678010600",
+      "frame": "181200ffff0100240002010024010140010112345678010600"
+    },
+    {
+      "name": "click_3",
+      "kind": "container_click",
+      "packet_id": 18,
+      "body": "00ffff0100240003010024010140010112345678010600",
+      "fields": {
+        "container_id": 0,
+        "state_id": 32767,
+        "slot": 36,
+        "button": 0,
+        "mode": 3,
+        "changed_slots": [
+          {
+            "slot": 36,
+            "stack": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "added": {
+                "minecraft:max_stack_size": 305419896
+              },
+              "removed": [
+                "minecraft:custom_name"
+              ]
+            }
+          }
+        ],
+        "carried": null
+      },
+      "packet": "1200ffff0100240003010024010140010112345678010600",
+      "frame": "181200ffff0100240003010024010140010112345678010600"
+    },
+    {
+      "name": "click_4",
+      "kind": "container_click",
+      "packet_id": 18,
+      "body": "00ffff0100240004010024010140010112345678010600",
+      "fields": {
+        "container_id": 0,
+        "state_id": 32767,
+        "slot": 36,
+        "button": 0,
+        "mode": 4,
+        "changed_slots": [
+          {
+            "slot": 36,
+            "stack": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "added": {
+                "minecraft:max_stack_size": 305419896
+              },
+              "removed": [
+                "minecraft:custom_name"
+              ]
+            }
+          }
+        ],
+        "carried": null
+      },
+      "packet": "1200ffff0100240004010024010140010112345678010600",
+      "frame": "181200ffff0100240004010024010140010112345678010600"
+    },
+    {
+      "name": "click_5",
+      "kind": "container_click",
+      "packet_id": 18,
+      "body": "00ffff0100240005010024010140010112345678010600",
+      "fields": {
+        "container_id": 0,
+        "state_id": 32767,
+        "slot": 36,
+        "button": 0,
+        "mode": 5,
+        "changed_slots": [
+          {
+            "slot": 36,
+            "stack": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "added": {
+                "minecraft:max_stack_size": 305419896
+              },
+              "removed": [
+                "minecraft:custom_name"
+              ]
+            }
+          }
+        ],
+        "carried": null
+      },
+      "packet": "1200ffff0100240005010024010140010112345678010600",
+      "frame": "181200ffff0100240005010024010140010112345678010600"
+    },
+    {
+      "name": "click_6",
+      "kind": "container_click",
+      "packet_id": 18,
+      "body": "00ffff0100240006010024010140010112345678010600",
+      "fields": {
+        "container_id": 0,
+        "state_id": 32767,
+        "slot": 36,
+        "button": 0,
+        "mode": 6,
+        "changed_slots": [
+          {
+            "slot": 36,
+            "stack": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "added": {
+                "minecraft:max_stack_size": 305419896
+              },
+              "removed": [
+                "minecraft:custom_name"
+              ]
+            }
+          }
+        ],
+        "carried": null
+      },
+      "packet": "1200ffff0100240006010024010140010112345678010600",
+      "frame": "181200ffff0100240006010024010140010112345678010600"
+    },
+    {
+      "name": "use_MAIN_HAND_down_0",
+      "kind": "use_item_on",
+      "packet_id": 66,
+      "body": "00fffffbc000021fc4003e8000003f0000003f40000000008201",
+      "fields": {
+        "hand": 0,
+        "position": [
+          -17,
+          -60,
+          33
+        ],
+        "face": 0,
+        "hit": [
+          0.25,
+          0.5,
+          0.75
+        ],
+        "inside": false,
+        "world_border_hit": false,
+        "sequence": 130
+      },
+      "packet": "4200fffffbc000021fc4003e8000003f0000003f40000000008201",
+      "frame": "1b4200fffffbc000021fc4003e8000003f0000003f40000000008201"
+    },
+    {
+      "name": "use_MAIN_HAND_down_1",
+      "kind": "use_item_on",
+      "packet_id": 66,
+      "body": "00fffffbc000021fc4003e8000003f0000003f40000001008201",
+      "fields": {
+        "hand": 0,
+        "position": [
+          -17,
+          -60,
+          33
+        ],
+        "face": 0,
+        "hit": [
+          0.25,
+          0.5,
+          0.75
+        ],
+        "inside": true,
+        "world_border_hit": false,
+        "sequence": 130
+      },
+      "packet": "4200fffffbc000021fc4003e8000003f0000003f40000001008201",
+      "frame": "1b4200fffffbc000021fc4003e8000003f0000003f40000001008201"
+    },
+    {
+      "name": "use_MAIN_HAND_down_2",
+      "kind": "use_item_on",
+      "packet_id": 66,
+      "body": "00fffffbc000021fc4003e8000003f0000003f40000000018201",
+      "fields": {
+        "hand": 0,
+        "position": [
+          -17,
+          -60,
+          33
+        ],
+        "face": 0,
+        "hit": [
+          0.25,
+          0.5,
+          0.75
+        ],
+        "inside": false,
+        "world_border_hit": true,
+        "sequence": 130
+      },
+      "packet": "4200fffffbc000021fc4003e8000003f0000003f40000000018201",
+      "frame": "1b4200fffffbc000021fc4003e8000003f0000003f40000000018201"
+    },
+    {
+      "name": "use_MAIN_HAND_down_3",
+      "kind": "use_item_on",
+      "packet_id": 66,
+      "body": "00fffffbc000021fc4003e8000003f0000003f40000001018201",
+      "fields": {
+        "hand": 0,
+        "position": [
+          -17,
+          -60,
+          33
+        ],
+        "face": 0,
+        "hit": [
+          0.25,
+          0.5,
+          0.75
+        ],
+        "inside": true,
+        "world_border_hit": true,
+        "sequence": 130
+      },
+      "packet": "4200fffffbc000021fc4003e8000003f0000003f40000001018201",
+      "frame": "1b4200fffffbc000021fc4003e8000003f0000003f40000001018201"
+    },
+    {
+      "name": "use_MAIN_HAND_up_0",
+      "kind": "use_item_on",
+      "packet_id": 66,
+      "body": "00fffffbc000021fc4013e8000003f0000003f40000000008201",
+      "fields": {
+        "hand": 0,
+        "position": [
+          -17,
+          -60,
+          33
+        ],
+        "face": 1,
+        "hit": [
+          0.25,
+          0.5,
+          0.75
+        ],
+        "inside": false,
+        "world_border_hit": false,
+        "sequence": 130
+      },
+      "packet": "4200fffffbc000021fc4013e8000003f0000003f40000000008201",
+      "frame": "1b4200fffffbc000021fc4013e8000003f0000003f40000000008201"
+    },
+    {
+      "name": "use_MAIN_HAND_up_1",
+      "kind": "use_item_on",
+      "packet_id": 66,
+      "body": "00fffffbc000021fc4013e8000003f0000003f40000001008201",
+      "fields": {
+        "hand": 0,
+        "position": [
+          -17,
+          -60,
+          33
+        ],
+        "face": 1,
+        "hit": [
+          0.25,
+          0.5,
+          0.75
+        ],
+        "inside": true,
+        "world_border_hit": false,
+        "sequence": 130
+      },
+      "packet": "4200fffffbc000021fc4013e8000003f0000003f40000001008201",
+      "frame": "1b4200fffffbc000021fc4013e8000003f0000003f40000001008201"
+    },
+    {
+      "name": "use_MAIN_HAND_up_2",
+      "kind": "use_item_on",
+      "packet_id": 66,
+      "body": "00fffffbc000021fc4013e8000003f0000003f40000000018201",
+      "fields": {
+        "hand": 0,
+        "position": [
+          -17,
+          -60,
+          33
+        ],
+        "face": 1,
+        "hit": [
+          0.25,
+          0.5,
+          0.75
+        ],
+        "inside": false,
+        "world_border_hit": true,
+        "sequence": 130
+      },
+      "packet": "4200fffffbc000021fc4013e8000003f0000003f40000000018201",
+      "frame": "1b4200fffffbc000021fc4013e8000003f0000003f40000000018201"
+    },
+    {
+      "name": "use_MAIN_HAND_up_3",
+      "kind": "use_item_on",
+      "packet_id": 66,
+      "body": "00fffffbc000021fc4013e8000003f0000003f40000001018201",
+      "fields": {
+        "hand": 0,
+        "position": [
+          -17,
+          -60,
+          33
+        ],
+        "face": 1,
+        "hit": [
+          0.25,
+          0.5,
+          0.75
+        ],
+        "inside": true,
+        "world_border_hit": true,
+        "sequence": 130
+      },
+      "packet": "4200fffffbc000021fc4013e8000003f0000003f40000001018201",
+      "frame": "1b4200fffffbc000021fc4013e8000003f0000003f40000001018201"
+    },
+    {
+      "name": "use_MAIN_HAND_north_0",
+      "kind": "use_item_on",
+      "packet_id": 66,
+      "body": "00fffffbc000021fc4023e8000003f0000003f40000000008201",
+      "fields": {
+        "hand": 0,
+        "position": [
+          -17,
+          -60,
+          33
+        ],
+        "face": 2,
+        "hit": [
+          0.25,
+          0.5,
+          0.75
+        ],
+        "inside": false,
+        "world_border_hit": false,
+        "sequence": 130
+      },
+      "packet": "4200fffffbc000021fc4023e8000003f0000003f40000000008201",
+      "frame": "1b4200fffffbc000021fc4023e8000003f0000003f40000000008201"
+    },
+    {
+      "name": "use_MAIN_HAND_north_1",
+      "kind": "use_item_on",
+      "packet_id": 66,
+      "body": "00fffffbc000021fc4023e8000003f0000003f40000001008201",
+      "fields": {
+        "hand": 0,
+        "position": [
+          -17,
+          -60,
+          33
+        ],
+        "face": 2,
+        "hit": [
+          0.25,
+          0.5,
+          0.75
+        ],
+        "inside": true,
+        "world_border_hit": false,
+        "sequence": 130
+      },
+      "packet": "4200fffffbc000021fc4023e8000003f0000003f40000001008201",
+      "frame": "1b4200fffffbc000021fc4023e8000003f0000003f40000001008201"
+    },
+    {
+      "name": "use_MAIN_HAND_north_2",
+      "kind": "use_item_on",
+      "packet_id": 66,
+      "body": "00fffffbc000021fc4023e8000003f0000003f40000000018201",
+      "fields": {
+        "hand": 0,
+        "position": [
+          -17,
+          -60,
+          33
+        ],
+        "face": 2,
+        "hit": [
+          0.25,
+          0.5,
+          0.75
+        ],
+        "inside": false,
+        "world_border_hit": true,
+        "sequence": 130
+      },
+      "packet": "4200fffffbc000021fc4023e8000003f0000003f40000000018201",
+      "frame": "1b4200fffffbc000021fc4023e8000003f0000003f40000000018201"
+    },
+    {
+      "name": "use_MAIN_HAND_north_3",
+      "kind": "use_item_on",
+      "packet_id": 66,
+      "body": "00fffffbc000021fc4023e8000003f0000003f40000001018201",
+      "fields": {
+        "hand": 0,
+        "position": [
+          -17,
+          -60,
+          33
+        ],
+        "face": 2,
+        "hit": [
+          0.25,
+          0.5,
+          0.75
+        ],
+        "inside": true,
+        "world_border_hit": true,
+        "sequence": 130
+      },
+      "packet": "4200fffffbc000021fc4023e8000003f0000003f40000001018201",
+      "frame": "1b4200fffffbc000021fc4023e8000003f0000003f40000001018201"
+    },
+    {
+      "name": "use_MAIN_HAND_south_0",
+      "kind": "use_item_on",
+      "packet_id": 66,
+      "body": "00fffffbc000021fc4033e8000003f0000003f40000000008201",
+      "fields": {
+        "hand": 0,
+        "position": [
+          -17,
+          -60,
+          33
+        ],
+        "face": 3,
+        "hit": [
+          0.25,
+          0.5,
+          0.75
+        ],
+        "inside": false,
+        "world_border_hit": false,
+        "sequence": 130
+      },
+      "packet": "4200fffffbc000021fc4033e8000003f0000003f40000000008201",
+      "frame": "1b4200fffffbc000021fc4033e8000003f0000003f40000000008201"
+    },
+    {
+      "name": "use_MAIN_HAND_south_1",
+      "kind": "use_item_on",
+      "packet_id": 66,
+      "body": "00fffffbc000021fc4033e8000003f0000003f40000001008201",
+      "fields": {
+        "hand": 0,
+        "position": [
+          -17,
+          -60,
+          33
+        ],
+        "face": 3,
+        "hit": [
+          0.25,
+          0.5,
+          0.75
+        ],
+        "inside": true,
+        "world_border_hit": false,
+        "sequence": 130
+      },
+      "packet": "4200fffffbc000021fc4033e8000003f0000003f40000001008201",
+      "frame": "1b4200fffffbc000021fc4033e8000003f0000003f40000001008201"
+    },
+    {
+      "name": "use_MAIN_HAND_south_2",
+      "kind": "use_item_on",
+      "packet_id": 66,
+      "body": "00fffffbc000021fc4033e8000003f0000003f40000000018201",
+      "fields": {
+        "hand": 0,
+        "position": [
+          -17,
+          -60,
+          33
+        ],
+        "face": 3,
+        "hit": [
+          0.25,
+          0.5,
+          0.75
+        ],
+        "inside": false,
+        "world_border_hit": true,
+        "sequence": 130
+      },
+      "packet": "4200fffffbc000021fc4033e8000003f0000003f40000000018201",
+      "frame": "1b4200fffffbc000021fc4033e8000003f0000003f40000000018201"
+    },
+    {
+      "name": "use_MAIN_HAND_south_3",
+      "kind": "use_item_on",
+      "packet_id": 66,
+      "body": "00fffffbc000021fc4033e8000003f0000003f40000001018201",
+      "fields": {
+        "hand": 0,
+        "position": [
+          -17,
+          -60,
+          33
+        ],
+        "face": 3,
+        "hit": [
+          0.25,
+          0.5,
+          0.75
+        ],
+        "inside": true,
+        "world_border_hit": true,
+        "sequence": 130
+      },
+      "packet": "4200fffffbc000021fc4033e8000003f0000003f40000001018201",
+      "frame": "1b4200fffffbc000021fc4033e8000003f0000003f40000001018201"
+    },
+    {
+      "name": "use_MAIN_HAND_west_0",
+      "kind": "use_item_on",
+      "packet_id": 66,
+      "body": "00fffffbc000021fc4043e8000003f0000003f40000000008201",
+      "fields": {
+        "hand": 0,
+        "position": [
+          -17,
+          -60,
+          33
+        ],
+        "face": 4,
+        "hit": [
+          0.25,
+          0.5,
+          0.75
+        ],
+        "inside": false,
+        "world_border_hit": false,
+        "sequence": 130
+      },
+      "packet": "4200fffffbc000021fc4043e8000003f0000003f40000000008201",
+      "frame": "1b4200fffffbc000021fc4043e8000003f0000003f40000000008201"
+    },
+    {
+      "name": "use_MAIN_HAND_west_1",
+      "kind": "use_item_on",
+      "packet_id": 66,
+      "body": "00fffffbc000021fc4043e8000003f0000003f40000001008201",
+      "fields": {
+        "hand": 0,
+        "position": [
+          -17,
+          -60,
+          33
+        ],
+        "face": 4,
+        "hit": [
+          0.25,
+          0.5,
+          0.75
+        ],
+        "inside": true,
+        "world_border_hit": false,
+        "sequence": 130
+      },
+      "packet": "4200fffffbc000021fc4043e8000003f0000003f40000001008201",
+      "frame": "1b4200fffffbc000021fc4043e8000003f0000003f40000001008201"
+    },
+    {
+      "name": "use_MAIN_HAND_west_2",
+      "kind": "use_item_on",
+      "packet_id": 66,
+      "body": "00fffffbc000021fc4043e8000003f0000003f40000000018201",
+      "fields": {
+        "hand": 0,
+        "position": [
+          -17,
+          -60,
+          33
+        ],
+        "face": 4,
+        "hit": [
+          0.25,
+          0.5,
+          0.75
+        ],
+        "inside": false,
+        "world_border_hit": true,
+        "sequence": 130
+      },
+      "packet": "4200fffffbc000021fc4043e8000003f0000003f40000000018201",
+      "frame": "1b4200fffffbc000021fc4043e8000003f0000003f40000000018201"
+    },
+    {
+      "name": "use_MAIN_HAND_west_3",
+      "kind": "use_item_on",
+      "packet_id": 66,
+      "body": "00fffffbc000021fc4043e8000003f0000003f40000001018201",
+      "fields": {
+        "hand": 0,
+        "position": [
+          -17,
+          -60,
+          33
+        ],
+        "face": 4,
+        "hit": [
+          0.25,
+          0.5,
+          0.75
+        ],
+        "inside": true,
+        "world_border_hit": true,
+        "sequence": 130
+      },
+      "packet": "4200fffffbc000021fc4043e8000003f0000003f40000001018201",
+      "frame": "1b4200fffffbc000021fc4043e8000003f0000003f40000001018201"
+    },
+    {
+      "name": "use_MAIN_HAND_east_0",
+      "kind": "use_item_on",
+      "packet_id": 66,
+      "body": "00fffffbc000021fc4053e8000003f0000003f40000000008201",
+      "fields": {
+        "hand": 0,
+        "position": [
+          -17,
+          -60,
+          33
+        ],
+        "face": 5,
+        "hit": [
+          0.25,
+          0.5,
+          0.75
+        ],
+        "inside": false,
+        "world_border_hit": false,
+        "sequence": 130
+      },
+      "packet": "4200fffffbc000021fc4053e8000003f0000003f40000000008201",
+      "frame": "1b4200fffffbc000021fc4053e8000003f0000003f40000000008201"
+    },
+    {
+      "name": "use_MAIN_HAND_east_1",
+      "kind": "use_item_on",
+      "packet_id": 66,
+      "body": "00fffffbc000021fc4053e8000003f0000003f40000001008201",
+      "fields": {
+        "hand": 0,
+        "position": [
+          -17,
+          -60,
+          33
+        ],
+        "face": 5,
+        "hit": [
+          0.25,
+          0.5,
+          0.75
+        ],
+        "inside": true,
+        "world_border_hit": false,
+        "sequence": 130
+      },
+      "packet": "4200fffffbc000021fc4053e8000003f0000003f40000001008201",
+      "frame": "1b4200fffffbc000021fc4053e8000003f0000003f40000001008201"
+    },
+    {
+      "name": "use_MAIN_HAND_east_2",
+      "kind": "use_item_on",
+      "packet_id": 66,
+      "body": "00fffffbc000021fc4053e8000003f0000003f40000000018201",
+      "fields": {
+        "hand": 0,
+        "position": [
+          -17,
+          -60,
+          33
+        ],
+        "face": 5,
+        "hit": [
+          0.25,
+          0.5,
+          0.75
+        ],
+        "inside": false,
+        "world_border_hit": true,
+        "sequence": 130
+      },
+      "packet": "4200fffffbc000021fc4053e8000003f0000003f40000000018201",
+      "frame": "1b4200fffffbc000021fc4053e8000003f0000003f40000000018201"
+    },
+    {
+      "name": "use_MAIN_HAND_east_3",
+      "kind": "use_item_on",
+      "packet_id": 66,
+      "body": "00fffffbc000021fc4053e8000003f0000003f40000001018201",
+      "fields": {
+        "hand": 0,
+        "position": [
+          -17,
+          -60,
+          33
+        ],
+        "face": 5,
+        "hit": [
+          0.25,
+          0.5,
+          0.75
+        ],
+        "inside": true,
+        "world_border_hit": true,
+        "sequence": 130
+      },
+      "packet": "4200fffffbc000021fc4053e8000003f0000003f40000001018201",
+      "frame": "1b4200fffffbc000021fc4053e8000003f0000003f40000001018201"
+    },
+    {
+      "name": "use_OFF_HAND_down_0",
+      "kind": "use_item_on",
+      "packet_id": 66,
+      "body": "01fffffbc000021fc4003e8000003f0000003f40000000008201",
+      "fields": {
+        "hand": 1,
+        "position": [
+          -17,
+          -60,
+          33
+        ],
+        "face": 0,
+        "hit": [
+          0.25,
+          0.5,
+          0.75
+        ],
+        "inside": false,
+        "world_border_hit": false,
+        "sequence": 130
+      },
+      "packet": "4201fffffbc000021fc4003e8000003f0000003f40000000008201",
+      "frame": "1b4201fffffbc000021fc4003e8000003f0000003f40000000008201"
+    },
+    {
+      "name": "use_OFF_HAND_down_1",
+      "kind": "use_item_on",
+      "packet_id": 66,
+      "body": "01fffffbc000021fc4003e8000003f0000003f40000001008201",
+      "fields": {
+        "hand": 1,
+        "position": [
+          -17,
+          -60,
+          33
+        ],
+        "face": 0,
+        "hit": [
+          0.25,
+          0.5,
+          0.75
+        ],
+        "inside": true,
+        "world_border_hit": false,
+        "sequence": 130
+      },
+      "packet": "4201fffffbc000021fc4003e8000003f0000003f40000001008201",
+      "frame": "1b4201fffffbc000021fc4003e8000003f0000003f40000001008201"
+    },
+    {
+      "name": "use_OFF_HAND_down_2",
+      "kind": "use_item_on",
+      "packet_id": 66,
+      "body": "01fffffbc000021fc4003e8000003f0000003f40000000018201",
+      "fields": {
+        "hand": 1,
+        "position": [
+          -17,
+          -60,
+          33
+        ],
+        "face": 0,
+        "hit": [
+          0.25,
+          0.5,
+          0.75
+        ],
+        "inside": false,
+        "world_border_hit": true,
+        "sequence": 130
+      },
+      "packet": "4201fffffbc000021fc4003e8000003f0000003f40000000018201",
+      "frame": "1b4201fffffbc000021fc4003e8000003f0000003f40000000018201"
+    },
+    {
+      "name": "use_OFF_HAND_down_3",
+      "kind": "use_item_on",
+      "packet_id": 66,
+      "body": "01fffffbc000021fc4003e8000003f0000003f40000001018201",
+      "fields": {
+        "hand": 1,
+        "position": [
+          -17,
+          -60,
+          33
+        ],
+        "face": 0,
+        "hit": [
+          0.25,
+          0.5,
+          0.75
+        ],
+        "inside": true,
+        "world_border_hit": true,
+        "sequence": 130
+      },
+      "packet": "4201fffffbc000021fc4003e8000003f0000003f40000001018201",
+      "frame": "1b4201fffffbc000021fc4003e8000003f0000003f40000001018201"
+    },
+    {
+      "name": "use_OFF_HAND_up_0",
+      "kind": "use_item_on",
+      "packet_id": 66,
+      "body": "01fffffbc000021fc4013e8000003f0000003f40000000008201",
+      "fields": {
+        "hand": 1,
+        "position": [
+          -17,
+          -60,
+          33
+        ],
+        "face": 1,
+        "hit": [
+          0.25,
+          0.5,
+          0.75
+        ],
+        "inside": false,
+        "world_border_hit": false,
+        "sequence": 130
+      },
+      "packet": "4201fffffbc000021fc4013e8000003f0000003f40000000008201",
+      "frame": "1b4201fffffbc000021fc4013e8000003f0000003f40000000008201"
+    },
+    {
+      "name": "use_OFF_HAND_up_1",
+      "kind": "use_item_on",
+      "packet_id": 66,
+      "body": "01fffffbc000021fc4013e8000003f0000003f40000001008201",
+      "fields": {
+        "hand": 1,
+        "position": [
+          -17,
+          -60,
+          33
+        ],
+        "face": 1,
+        "hit": [
+          0.25,
+          0.5,
+          0.75
+        ],
+        "inside": true,
+        "world_border_hit": false,
+        "sequence": 130
+      },
+      "packet": "4201fffffbc000021fc4013e8000003f0000003f40000001008201",
+      "frame": "1b4201fffffbc000021fc4013e8000003f0000003f40000001008201"
+    },
+    {
+      "name": "use_OFF_HAND_up_2",
+      "kind": "use_item_on",
+      "packet_id": 66,
+      "body": "01fffffbc000021fc4013e8000003f0000003f40000000018201",
+      "fields": {
+        "hand": 1,
+        "position": [
+          -17,
+          -60,
+          33
+        ],
+        "face": 1,
+        "hit": [
+          0.25,
+          0.5,
+          0.75
+        ],
+        "inside": false,
+        "world_border_hit": true,
+        "sequence": 130
+      },
+      "packet": "4201fffffbc000021fc4013e8000003f0000003f40000000018201",
+      "frame": "1b4201fffffbc000021fc4013e8000003f0000003f40000000018201"
+    },
+    {
+      "name": "use_OFF_HAND_up_3",
+      "kind": "use_item_on",
+      "packet_id": 66,
+      "body": "01fffffbc000021fc4013e8000003f0000003f40000001018201",
+      "fields": {
+        "hand": 1,
+        "position": [
+          -17,
+          -60,
+          33
+        ],
+        "face": 1,
+        "hit": [
+          0.25,
+          0.5,
+          0.75
+        ],
+        "inside": true,
+        "world_border_hit": true,
+        "sequence": 130
+      },
+      "packet": "4201fffffbc000021fc4013e8000003f0000003f40000001018201",
+      "frame": "1b4201fffffbc000021fc4013e8000003f0000003f40000001018201"
+    },
+    {
+      "name": "use_OFF_HAND_north_0",
+      "kind": "use_item_on",
+      "packet_id": 66,
+      "body": "01fffffbc000021fc4023e8000003f0000003f40000000008201",
+      "fields": {
+        "hand": 1,
+        "position": [
+          -17,
+          -60,
+          33
+        ],
+        "face": 2,
+        "hit": [
+          0.25,
+          0.5,
+          0.75
+        ],
+        "inside": false,
+        "world_border_hit": false,
+        "sequence": 130
+      },
+      "packet": "4201fffffbc000021fc4023e8000003f0000003f40000000008201",
+      "frame": "1b4201fffffbc000021fc4023e8000003f0000003f40000000008201"
+    },
+    {
+      "name": "use_OFF_HAND_north_1",
+      "kind": "use_item_on",
+      "packet_id": 66,
+      "body": "01fffffbc000021fc4023e8000003f0000003f40000001008201",
+      "fields": {
+        "hand": 1,
+        "position": [
+          -17,
+          -60,
+          33
+        ],
+        "face": 2,
+        "hit": [
+          0.25,
+          0.5,
+          0.75
+        ],
+        "inside": true,
+        "world_border_hit": false,
+        "sequence": 130
+      },
+      "packet": "4201fffffbc000021fc4023e8000003f0000003f40000001008201",
+      "frame": "1b4201fffffbc000021fc4023e8000003f0000003f40000001008201"
+    },
+    {
+      "name": "use_OFF_HAND_north_2",
+      "kind": "use_item_on",
+      "packet_id": 66,
+      "body": "01fffffbc000021fc4023e8000003f0000003f40000000018201",
+      "fields": {
+        "hand": 1,
+        "position": [
+          -17,
+          -60,
+          33
+        ],
+        "face": 2,
+        "hit": [
+          0.25,
+          0.5,
+          0.75
+        ],
+        "inside": false,
+        "world_border_hit": true,
+        "sequence": 130
+      },
+      "packet": "4201fffffbc000021fc4023e8000003f0000003f40000000018201",
+      "frame": "1b4201fffffbc000021fc4023e8000003f0000003f40000000018201"
+    },
+    {
+      "name": "use_OFF_HAND_north_3",
+      "kind": "use_item_on",
+      "packet_id": 66,
+      "body": "01fffffbc000021fc4023e8000003f0000003f40000001018201",
+      "fields": {
+        "hand": 1,
+        "position": [
+          -17,
+          -60,
+          33
+        ],
+        "face": 2,
+        "hit": [
+          0.25,
+          0.5,
+          0.75
+        ],
+        "inside": true,
+        "world_border_hit": true,
+        "sequence": 130
+      },
+      "packet": "4201fffffbc000021fc4023e8000003f0000003f40000001018201",
+      "frame": "1b4201fffffbc000021fc4023e8000003f0000003f40000001018201"
+    },
+    {
+      "name": "use_OFF_HAND_south_0",
+      "kind": "use_item_on",
+      "packet_id": 66,
+      "body": "01fffffbc000021fc4033e8000003f0000003f40000000008201",
+      "fields": {
+        "hand": 1,
+        "position": [
+          -17,
+          -60,
+          33
+        ],
+        "face": 3,
+        "hit": [
+          0.25,
+          0.5,
+          0.75
+        ],
+        "inside": false,
+        "world_border_hit": false,
+        "sequence": 130
+      },
+      "packet": "4201fffffbc000021fc4033e8000003f0000003f40000000008201",
+      "frame": "1b4201fffffbc000021fc4033e8000003f0000003f40000000008201"
+    },
+    {
+      "name": "use_OFF_HAND_south_1",
+      "kind": "use_item_on",
+      "packet_id": 66,
+      "body": "01fffffbc000021fc4033e8000003f0000003f40000001008201",
+      "fields": {
+        "hand": 1,
+        "position": [
+          -17,
+          -60,
+          33
+        ],
+        "face": 3,
+        "hit": [
+          0.25,
+          0.5,
+          0.75
+        ],
+        "inside": true,
+        "world_border_hit": false,
+        "sequence": 130
+      },
+      "packet": "4201fffffbc000021fc4033e8000003f0000003f40000001008201",
+      "frame": "1b4201fffffbc000021fc4033e8000003f0000003f40000001008201"
+    },
+    {
+      "name": "use_OFF_HAND_south_2",
+      "kind": "use_item_on",
+      "packet_id": 66,
+      "body": "01fffffbc000021fc4033e8000003f0000003f40000000018201",
+      "fields": {
+        "hand": 1,
+        "position": [
+          -17,
+          -60,
+          33
+        ],
+        "face": 3,
+        "hit": [
+          0.25,
+          0.5,
+          0.75
+        ],
+        "inside": false,
+        "world_border_hit": true,
+        "sequence": 130
+      },
+      "packet": "4201fffffbc000021fc4033e8000003f0000003f40000000018201",
+      "frame": "1b4201fffffbc000021fc4033e8000003f0000003f40000000018201"
+    },
+    {
+      "name": "use_OFF_HAND_south_3",
+      "kind": "use_item_on",
+      "packet_id": 66,
+      "body": "01fffffbc000021fc4033e8000003f0000003f40000001018201",
+      "fields": {
+        "hand": 1,
+        "position": [
+          -17,
+          -60,
+          33
+        ],
+        "face": 3,
+        "hit": [
+          0.25,
+          0.5,
+          0.75
+        ],
+        "inside": true,
+        "world_border_hit": true,
+        "sequence": 130
+      },
+      "packet": "4201fffffbc000021fc4033e8000003f0000003f40000001018201",
+      "frame": "1b4201fffffbc000021fc4033e8000003f0000003f40000001018201"
+    },
+    {
+      "name": "use_OFF_HAND_west_0",
+      "kind": "use_item_on",
+      "packet_id": 66,
+      "body": "01fffffbc000021fc4043e8000003f0000003f40000000008201",
+      "fields": {
+        "hand": 1,
+        "position": [
+          -17,
+          -60,
+          33
+        ],
+        "face": 4,
+        "hit": [
+          0.25,
+          0.5,
+          0.75
+        ],
+        "inside": false,
+        "world_border_hit": false,
+        "sequence": 130
+      },
+      "packet": "4201fffffbc000021fc4043e8000003f0000003f40000000008201",
+      "frame": "1b4201fffffbc000021fc4043e8000003f0000003f40000000008201"
+    },
+    {
+      "name": "use_OFF_HAND_west_1",
+      "kind": "use_item_on",
+      "packet_id": 66,
+      "body": "01fffffbc000021fc4043e8000003f0000003f40000001008201",
+      "fields": {
+        "hand": 1,
+        "position": [
+          -17,
+          -60,
+          33
+        ],
+        "face": 4,
+        "hit": [
+          0.25,
+          0.5,
+          0.75
+        ],
+        "inside": true,
+        "world_border_hit": false,
+        "sequence": 130
+      },
+      "packet": "4201fffffbc000021fc4043e8000003f0000003f40000001008201",
+      "frame": "1b4201fffffbc000021fc4043e8000003f0000003f40000001008201"
+    },
+    {
+      "name": "use_OFF_HAND_west_2",
+      "kind": "use_item_on",
+      "packet_id": 66,
+      "body": "01fffffbc000021fc4043e8000003f0000003f40000000018201",
+      "fields": {
+        "hand": 1,
+        "position": [
+          -17,
+          -60,
+          33
+        ],
+        "face": 4,
+        "hit": [
+          0.25,
+          0.5,
+          0.75
+        ],
+        "inside": false,
+        "world_border_hit": true,
+        "sequence": 130
+      },
+      "packet": "4201fffffbc000021fc4043e8000003f0000003f40000000018201",
+      "frame": "1b4201fffffbc000021fc4043e8000003f0000003f40000000018201"
+    },
+    {
+      "name": "use_OFF_HAND_west_3",
+      "kind": "use_item_on",
+      "packet_id": 66,
+      "body": "01fffffbc000021fc4043e8000003f0000003f40000001018201",
+      "fields": {
+        "hand": 1,
+        "position": [
+          -17,
+          -60,
+          33
+        ],
+        "face": 4,
+        "hit": [
+          0.25,
+          0.5,
+          0.75
+        ],
+        "inside": true,
+        "world_border_hit": true,
+        "sequence": 130
+      },
+      "packet": "4201fffffbc000021fc4043e8000003f0000003f40000001018201",
+      "frame": "1b4201fffffbc000021fc4043e8000003f0000003f40000001018201"
+    },
+    {
+      "name": "use_OFF_HAND_east_0",
+      "kind": "use_item_on",
+      "packet_id": 66,
+      "body": "01fffffbc000021fc4053e8000003f0000003f40000000008201",
+      "fields": {
+        "hand": 1,
+        "position": [
+          -17,
+          -60,
+          33
+        ],
+        "face": 5,
+        "hit": [
+          0.25,
+          0.5,
+          0.75
+        ],
+        "inside": false,
+        "world_border_hit": false,
+        "sequence": 130
+      },
+      "packet": "4201fffffbc000021fc4053e8000003f0000003f40000000008201",
+      "frame": "1b4201fffffbc000021fc4053e8000003f0000003f40000000008201"
+    },
+    {
+      "name": "use_OFF_HAND_east_1",
+      "kind": "use_item_on",
+      "packet_id": 66,
+      "body": "01fffffbc000021fc4053e8000003f0000003f40000001008201",
+      "fields": {
+        "hand": 1,
+        "position": [
+          -17,
+          -60,
+          33
+        ],
+        "face": 5,
+        "hit": [
+          0.25,
+          0.5,
+          0.75
+        ],
+        "inside": true,
+        "world_border_hit": false,
+        "sequence": 130
+      },
+      "packet": "4201fffffbc000021fc4053e8000003f0000003f40000001008201",
+      "frame": "1b4201fffffbc000021fc4053e8000003f0000003f40000001008201"
+    },
+    {
+      "name": "use_OFF_HAND_east_2",
+      "kind": "use_item_on",
+      "packet_id": 66,
+      "body": "01fffffbc000021fc4053e8000003f0000003f40000000018201",
+      "fields": {
+        "hand": 1,
+        "position": [
+          -17,
+          -60,
+          33
+        ],
+        "face": 5,
+        "hit": [
+          0.25,
+          0.5,
+          0.75
+        ],
+        "inside": false,
+        "world_border_hit": true,
+        "sequence": 130
+      },
+      "packet": "4201fffffbc000021fc4053e8000003f0000003f40000000018201",
+      "frame": "1b4201fffffbc000021fc4053e8000003f0000003f40000000018201"
+    },
+    {
+      "name": "use_OFF_HAND_east_3",
+      "kind": "use_item_on",
+      "packet_id": 66,
+      "body": "01fffffbc000021fc4053e8000003f0000003f40000001018201",
+      "fields": {
+        "hand": 1,
+        "position": [
+          -17,
+          -60,
+          33
+        ],
+        "face": 5,
+        "hit": [
+          0.25,
+          0.5,
+          0.75
+        ],
+        "inside": true,
+        "world_border_hit": true,
+        "sequence": 130
+      },
+      "packet": "4201fffffbc000021fc4053e8000003f0000003f40000001018201",
+      "frame": "1b4201fffffbc000021fc4053e8000003f0000003f40000001018201"
+    }
+  ]
+}

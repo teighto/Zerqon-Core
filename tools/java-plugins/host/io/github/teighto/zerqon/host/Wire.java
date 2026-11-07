@@ -11,6 +11,8 @@ import com.google.gson.stream.JsonToken;
 import io.github.teighto.zerqon.api.Action;
 import io.github.teighto.zerqon.api.Event;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.StringReader;
 import java.math.BigDecimal;
 import java.math.BigInteger;
@@ -84,6 +86,39 @@ final class Wire {
         for (String name : object.keySet()) {
             if (!allowed.contains(name)) throw new IllegalArgumentException("unknown field: " + name);
         }
+    }
+
+    static byte[] readLine(InputStream input, int limit) throws IOException {
+        ByteArrayOutputStream line = new ByteArrayOutputStream(256);
+        int next;
+        while ((next = input.read()) != -1) {
+            if (next == '\n') return line.toByteArray();
+            if (line.size() == limit) throw new IOException("protocol line exceeds " + limit + " bytes");
+            line.write(next);
+        }
+        if (line.size() != 0) throw new IOException("unterminated protocol line");
+        return null;
+    }
+
+    static JsonObject object(JsonObject object, String field) {
+        JsonElement value = object.get(field);
+        if (value == null || !value.isJsonObject()) throw new IllegalArgumentException("missing object: " + field);
+        return value.getAsJsonObject();
+    }
+
+    static boolean bool(JsonObject object, String field) {
+        JsonElement value = object.get(field);
+        if (value == null || !value.isJsonPrimitive() || !value.getAsJsonPrimitive().isBoolean()) throw new IllegalArgumentException("missing boolean: " + field);
+        return value.getAsBoolean();
+    }
+
+    static long integer(JsonObject object, String field, long minimum, long maximum) {
+        JsonElement value = object.get(field);
+        if (value == null || !value.isJsonPrimitive() || !value.getAsJsonPrimitive().isNumber()
+                || !value.getAsString().matches("0|[1-9][0-9]{0,18}")) throw new IllegalArgumentException("invalid integer: " + field);
+        long number = value.getAsBigDecimal().longValueExact();
+        if (number < minimum || number > maximum) throw new IllegalArgumentException("integer outside range: " + field);
+        return number;
     }
 
     static String string(JsonObject object, String field, int maxBytes) {

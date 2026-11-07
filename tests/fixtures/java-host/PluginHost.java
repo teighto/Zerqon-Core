@@ -15,9 +15,19 @@ public final class PluginHost {
             var match = ID.matcher(line);
             if (!match.find()) throw new IllegalArgumentException("missing id");
             String id = match.group(1);
-            if (line.contains("\"op\":\"load\"")) {
-                for (String candidate : new String[]{"timeout", "oversize", "wrong_id", "bad_json", "eof", "stderr", "bad_action", "startup_timeout", "pid", "charset"}) {
-                    if (line.contains("java-fixture-" + candidate)) mode = candidate;
+            if (line.contains("\"op\":\"hello\"")) {
+                String source = PluginHost.class.getProtectionDomain().getCodeSource().getLocation().getPath();
+                if (source.contains("no-protocol")) respond(id, true, "[]");
+                else if (source.contains("stalled-protocol")) Thread.sleep(60_000);
+                else if (source.contains("native-before-hello")) System.out.println(nativeCall(id, 1, "fixture", "server_snapshot"));
+                else {
+                    int protocol = source.contains("bad-protocol") ? 1 : 2;
+                    String capability = source.contains("bad-capability") ? "arbitrary_files" : "native_queries";
+                    System.out.println("{\"id\":" + id + ",\"ok\":true,\"results\":[],\"protocol\":" + protocol + ",\"capabilities\":[\"" + capability + "\"]}");
+                }
+            } else if (line.contains("\"op\":\"load\"")) {
+                for (String candidate : new String[]{"timeout", "oversize", "wrong_id", "bad_json", "eof", "stderr", "bad_action", "startup_timeout", "pid", "charset", "native", "native_wrong_parent", "native_wrong_id", "native_unknown_plugin", "native_unknown_query", "native_unknown_field", "native_duplicate_field", "native_oversize", "native_duplicate", "native_limit", "native_error", "native_two", "native_stall", "native_list", "native_disabled"}) {
+                    if (line.contains("java-fixture-" + candidate + "\"")) mode = candidate;
                 }
                 if (mode.equals("startup_timeout")) Thread.sleep(60_000);
                 respond(id, true, "[{\"action\":\"register_command\",\"name\":\"jhello\",\"description\":\"fixture\",\"permission\":null}]");
@@ -25,9 +35,43 @@ public final class PluginHost {
                 respond(id, false, "[]");
                 return;
             } else if (line.contains("\"op\":\"list\"")) {
-                respond(id, true, "[]");
+                if (mode.equals("native_list")) {
+                    System.out.println(nativeCall(id, 1, "fixture", "server_snapshot"));
+                    System.out.flush();
+                    reader.readLine();
+                }
+                respond(id, !mode.equals("native_disabled"), "[]");
             } else {
                 switch (mode) {
+                    case "native", "native_error", "native_two", "native_stall", "native_disabled" -> {
+                        int count = mode.equals("native_two") ? 2 : 1;
+                        for (int call = 1; call <= count; call++) {
+                            System.out.println(nativeCall(id, call, "fixture", "server_snapshot"));
+                            System.out.flush();
+                            String response = reader.readLine();
+                            if (mode.equals("native_error")) {
+                                if (response == null || !response.contains("\"ok\":false") || !response.contains("\"code\":")) throw new IllegalStateException("missing native error");
+                            } else if (response == null || !response.contains("\"tick\":123") || !response.contains("\"online_players\":2")) throw new IllegalStateException("bad native result");
+                        }
+                        if (mode.equals("native_stall")) Thread.sleep(60_000);
+                        respond(id, !mode.equals("native_disabled"), "[{\"action\":\"reply\",\"message\":\"" + (mode.equals("native_error") ? "native-error" : "snapshot:123:2") + "\"}]");
+                    }
+                    case "native_wrong_parent", "native_wrong_id", "native_unknown_plugin", "native_unknown_query", "native_unknown_field", "native_duplicate_field", "native_oversize", "native_duplicate", "native_limit" -> {
+                        int count = mode.equals("native_limit") ? 129 : mode.equals("native_duplicate") ? 2 : 1;
+                        for (int call = 1; call <= count; call++) {
+                            String parent = mode.equals("native_wrong_parent") ? "99999999" : id;
+                            int child = mode.equals("native_wrong_id") ? 2 : mode.equals("native_duplicate") ? 1 : call;
+                            String plugin = mode.equals("native_unknown_plugin") ? "unloaded" : mode.equals("native_oversize") ? "x".repeat(65_536) : "fixture";
+                            String query = mode.equals("native_unknown_query") ? "read_arbitrary_file" : "server_snapshot";
+                            String frame = nativeCall(parent, child, plugin, query);
+                            if (mode.equals("native_unknown_field")) frame = frame.replace("\"operation\":", "\"extra\":1,\"operation\":");
+                            if (mode.equals("native_duplicate_field")) frame = frame.replace("\"operation\":", "\"call_id\":1,\"operation\":");
+                            System.out.println(frame);
+                            System.out.flush();
+                            if (reader.readLine() == null) return;
+                        }
+                        throw new IllegalStateException("invalid native frame accepted");
+                    }
                     case "charset" -> {
                         if (!System.out.charset().equals(StandardCharsets.UTF_8)
                                 || !System.err.charset().equals(StandardCharsets.UTF_8)) {
@@ -60,5 +104,9 @@ public final class PluginHost {
 
     private static void respond(String id, boolean enabled, String actions) {
         System.out.println("{\"id\":" + id + ",\"ok\":true,\"results\":[{\"name\":\"fixture\",\"enabled\":" + enabled + ",\"actions\":" + actions + "}]}");
+    }
+
+    private static String nativeCall(String parent, int call, String plugin, String query) {
+        return "{\"kind\":\"native_call\",\"parent_id\":" + parent + ",\"call_id\":" + call + ",\"plugin\":\"" + plugin + "\",\"operation\":{\"query\":\"" + query + "\"}}";
     }
 }

@@ -23,7 +23,7 @@ The creative client format has a byte-length prefix for each added component. Se
 
 ## API
 
-- `decode_creative_slot`, `decode_click`, `decode_carried_slot`, `decode_use_on` consume packet **bodies**, without packet IDs or frame lengths.
+- `decode_creative_slot`, `decode_click`, `decode_carried_slot`, `decode_use_on`, `decode_player_action` consume packet **bodies**, without packet IDs or frame lengths.
 - `decode_client_stack` and `decode_server_stack` expose the two stack encodings.
 - `encode_*_body` functions and `encode_server_stack` produce bodies only. The caller provides the correct packet ID and framing.
 - `PlayerInventory` owns 46 menu slots, cursor, selected hotbar slot, 15-bit state ID and bounded drag state.
@@ -33,6 +33,8 @@ The creative client format has a byte-length prefix for each added component. Se
 Implemented click modes: pickup, quick move, hotbar/offhand swap, creative clone, throw, quick craft and pickup all. Survival transitions conserve items across slots, cursor and returned drop effects. Crafting/armor slots 0–8, bundle click hooks and equipment auto-placement return explicit unsupported errors. The caller must verify player mode/permissions and pass `InventoryPolicy`; packet data is not an authority for those flags.
 
 Dropping is disabled by default. Enable it only when the caller can commit the returned drops as real item entities together with the inventory change; discarding drop effects loses items. World placement and persistent player saves require their own transaction boundaries.
+
+`decode_player_action` covers the nine 26.3 actions, including `ChangeDestroyDirection` at ordinal 1. It reads a byte direction; `decode_use_on` reads a VarInt face. Both preserve signed packed positions and reject negative sequences or trailing bytes. Directions outside 0–5 and boolean bytes other than 0/1 are deliberately rejected. Use-on hit coordinates use vanilla's tolerance around the block center, allowing values slightly outside 0–1. World height, reach, permissions and action ordering remain the caller's responsibility.
 
 ## Verification
 
@@ -46,6 +48,8 @@ cargo clippy -p zerqon-inventory --all-targets --locked -- -D warnings
 
 The optional oracle tests require prepared official 26.3 data and Java 25. They cover every standard item plus typed component and packet fixtures in both Java→Rust and Rust→Java directions. Property tests cover Unicode encoding, truncation/malformed input, rollback and item conservation. Codec interoperability does not establish complete gameplay compatibility.
 
+`block_actions` includes nine action and six use-on fixtures encoded by the original 26.3 server codec (server bundle SHA-1 `33680f5f2ac32864d6d7cf5e56a705fdb3e05f4c`). They run without Java or downloaded game data. Additional tests cover packed-coordinate boundaries, malformed packets and hit-coordinate tolerance.
+
 ## Русский
 
 Крейт разбирает предметы Minecraft 26.3 и выполняет операции инвентаря на сервере. Все 1 658 стандартных предметов поддерживаются с их исходными компонентами из официальных данных; изменения компонентов реализованы для 11 типов из 122. Остальные типы и сложные NBT-формы явно отклоняются, а не пересылаются клиентам без проверки.
@@ -53,3 +57,5 @@ The optional oracle tests require prepared official 26.3 data and Java 25. They 
 Есть 46 слотов, курсор, hotbar, creative updates и основные режимы клика. Изменения применяются только после проверки; ошибочные действия сохраняют прежнее состояние. Клиентские хэши используются только как предсказания и не создают предметы. Компоненты разделяются через `Arc`, без глубокого копирования при каждом клике.
 
 Крафт, правила экипировки, bundle hooks, размещение блоков и item entities требуют дальнейшей реализации. Dropping по умолчанию запрещён: вызывающий код обязан создать реальные сущности предметов, прежде чем разрешать этот путь. Интеграция с игровым сервером и постоянное хранение выполняются отдельно.
+
+`decode_player_action` разбирает все девять действий 26.3, включая новое действие смены направления под номером 1. Декодеры проверяют формат пакета; высоту мира, расстояние, права и применение изменений проверяет сервер. В тестах сохранены небольшие пакеты, полученные от оригинального кодека 26.3.

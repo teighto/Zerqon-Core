@@ -13,9 +13,10 @@ const MAX_FILE_BYTES: usize = 1024 * 1024;
 
 pub struct WorldStore {
     root: PathBuf,
-    _lock: File,
     stripes: [RwLock<()>; 64],
     metadata: Option<WorldMetadata>,
+    transactions: Option<crate::transaction::Transactions>,
+    _lock: File,
 }
 
 impl WorldStore {
@@ -40,12 +41,15 @@ impl WorldStore {
             }
         }
         let incomplete = root.join("IMPORT_INCOMPLETE").try_exists()?;
-        if incomplete && !importing {
+        let storage_guard = incomplete
+            && crate::metadata::read_regular(&root.join("IMPORT_INCOMPLETE"), 4096)?
+                == crate::transaction::GUARD;
+        if incomplete && !importing && !storage_guard {
             return Err(WorldError::Corrupt(
                 "world import is incomplete; import again into a new destination",
             ));
         }
-        if importing && !incomplete {
+        if importing && (!incomplete || storage_guard) {
             return Err(WorldError::Corrupt(
                 "import store requires an incomplete marker",
             ));
@@ -85,15 +89,35 @@ impl WorldStore {
                 "imported world has no retained source snapshot".into(),
             ));
         }
+        let transactions = if importing {
+            None
+        } else {
+            Some(crate::transaction::Transactions::open(
+                root,
+                metadata.as_ref(),
+            )?)
+        };
         Ok(Self {
             root: root.to_owned(),
             _lock: lock,
             stripes: std::array::from_fn(|_| RwLock::new(())),
             metadata,
+            transactions,
         })
     }
 
     pub fn load(&self, x: i32, z: i32) -> Result<Option<Chunk>, WorldError> {
+        if let Some(transactions) = &self.transactions {
+            let chunk = transactions
+                .snapshot(&[crate::ChunkKey::new(x, z)])?
+                .into_iter()
+                .next()
+                .and_then(|snapshot| snapshot.chunk().map(|chunk| (**chunk).clone()));
+            if chunk.is_none() && self.generation_policy() == GenerationPolicy::ExistingOnly {
+                return Err(WorldError::MissingImportedChunk { x, z });
+            }
+            return Ok(chunk);
+        }
         let _guard = self.stripes[stripe(x, z)]
             .read()
             .map_err(|_| std::io::Error::other("world storage lock poisoned"))?;
@@ -101,6 +125,15 @@ impl WorldStore {
     }
 
     fn load_unlocked(&self, x: i32, z: i32) -> Result<Option<Chunk>, WorldError> {
+        crate::metadata::reject_links(&self.chunk_path(x, z))?;
+        match std::fs::symlink_metadata(self.chunk_path(x, z)) {
+            Ok(metadata) if !metadata.is_file() => {
+                return Err(WorldError::Corrupt("chunk path must be a regular file"));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
         let file = match File::open(self.chunk_path(x, z)) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -128,6 +161,29 @@ impl WorldStore {
     }
 
     pub fn save(&self, chunk: &Chunk) -> Result<(), WorldError> {
+        if let Some(transactions) = &self.transactions {
+            let key = crate::ChunkKey::new(chunk.x, chunk.z);
+            let snapshot = transactions.snapshot(&[key])?;
+            return transactions
+                .commit(
+                    uuid::Uuid::new_v4(),
+                    &snapshot,
+                    &[crate::ChunkWrite {
+                        key,
+                        replacement: std::sync::Arc::new(chunk.clone()),
+                    }],
+                )
+                .map(|_| ())
+                .map_err(|error| match error {
+                    crate::CommitError::Rejected(error) => error,
+                    crate::CommitError::Conflict => {
+                        WorldError::Storage("save conflicted with another writer".into())
+                    }
+                    crate::CommitError::Indeterminate { operation, cause } => {
+                        WorldError::CommitIndeterminate { operation, cause }
+                    }
+                });
+        }
         let _guard = self.stripes[stripe(chunk.x, chunk.z)]
             .write()
             .map_err(|_| std::io::Error::other("world storage lock poisoned"))?;
@@ -145,6 +201,40 @@ impl WorldStore {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+    pub fn check_available(&self) -> Result<(), WorldError> {
+        self.transactions
+            .as_ref()
+            .map_or(Ok(()), |transactions| transactions.healthy())
+    }
+    pub fn snapshot(
+        &self,
+        keys: &[crate::ChunkKey],
+    ) -> Result<Vec<crate::ChunkSnapshot>, WorldError> {
+        self.transactions
+            .as_ref()
+            .ok_or_else(|| WorldError::Storage("transactions unavailable during import".into()))?
+            .snapshot(keys)
+    }
+    pub fn commit(
+        &self,
+        operation: uuid::Uuid,
+        reads: &[crate::ChunkSnapshot],
+        writes: &[crate::ChunkWrite],
+    ) -> Result<crate::CommitReceipt, crate::CommitError> {
+        self.transactions
+            .as_ref()
+            .ok_or_else(|| WorldError::Storage("transactions unavailable during import".into()))?
+            .commit(operation, reads, writes)
+    }
+    pub fn receipt(
+        &self,
+        operation: uuid::Uuid,
+    ) -> Result<Option<crate::CommitReceipt>, WorldError> {
+        self.transactions
+            .as_ref()
+            .ok_or_else(|| WorldError::Storage("transactions unavailable during import".into()))?
+            .receipt(operation)
     }
     pub fn metadata(&self) -> Option<&WorldMetadata> {
         self.metadata.as_ref()

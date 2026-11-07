@@ -88,27 +88,39 @@ pub fn decode_carried_slot(mut data: &[u8]) -> Result<u8, ItemError> {
     Ok(slot as u8)
 }
 
+pub fn decode_player_action(mut data: &[u8]) -> Result<PlayerActionRequest, ItemError> {
+    let action = match get_varint(&mut data)? {
+        0 => PlayerAction::StartDestroyBlock,
+        1 => PlayerAction::ChangeDestroyDirection,
+        2 => PlayerAction::AbortDestroyBlock,
+        3 => PlayerAction::StopDestroyBlock,
+        4 => PlayerAction::DropAllItems,
+        5 => PlayerAction::DropItem,
+        6 => PlayerAction::ReleaseUseItem,
+        7 => PlayerAction::SwapItemWithOffhand,
+        8 => PlayerAction::Stab,
+        _ => return Err(ItemError::Invalid("unknown player action")),
+    };
+    let block = block_position(&mut data)?;
+    let face = block_face(i32::from(take(&mut data, 1)?[0]))?;
+    let sequence = unsigned(&mut data)?;
+    finished(data)?;
+    Ok(PlayerActionRequest {
+        action,
+        block,
+        face,
+        sequence,
+    })
+}
+
 pub fn decode_use_on(mut data: &[u8]) -> Result<UseOnRequest, ItemError> {
     let hand = match get_varint(&mut data)? {
         0 => Hand::Main,
         1 => Hand::Off,
         _ => return Err(ItemError::Invalid("invalid hand")),
     };
-    let packed = i64::from_be_bytes(array(&mut data)?);
-    let block = BlockPosition {
-        x: (packed >> 38) as i32,
-        y: (packed << 52 >> 52) as i32,
-        z: (packed << 26 >> 38) as i32,
-    };
-    let face = match get_varint(&mut data)? {
-        0 => Face::Down,
-        1 => Face::Up,
-        2 => Face::North,
-        3 => Face::South,
-        4 => Face::West,
-        5 => Face::East,
-        _ => return Err(ItemError::Invalid("invalid block face")),
-    };
+    let block = block_position(&mut data)?;
+    let face = block_face(get_varint(&mut data)?)?;
     let mut hit = [0.0; 3];
     for axis in &mut hit {
         *axis = f32::from_be_bytes(array(&mut data)?);
@@ -129,6 +141,27 @@ pub fn decode_use_on(mut data: &[u8]) -> Result<UseOnRequest, ItemError> {
         world_border_hit,
         sequence,
     })
+}
+
+fn block_position(data: &mut &[u8]) -> Result<BlockPosition, ItemError> {
+    let packed = i64::from_be_bytes(array(data)?);
+    Ok(BlockPosition {
+        x: (packed >> 38) as i32,
+        y: (packed << 52 >> 52) as i32,
+        z: (packed << 26 >> 38) as i32,
+    })
+}
+
+fn block_face(value: i32) -> Result<Face, ItemError> {
+    match value {
+        0 => Ok(Face::Down),
+        1 => Ok(Face::Up),
+        2 => Ok(Face::North),
+        3 => Ok(Face::South),
+        4 => Ok(Face::West),
+        5 => Ok(Face::East),
+        _ => Err(ItemError::Invalid("invalid block face")),
+    }
 }
 
 pub fn encode_server_stack(

@@ -286,6 +286,8 @@ async fn offline_join_claimed(
                 let teleport = get_varint(&mut view).unwrap();
                 let mut answer = vec![0];
                 put_varint(teleport, &mut answer);
+                answer.extend_from_slice(&view[..24]);
+                answer.extend_from_slice(&view[48..56]);
                 write_frame(socket, &answer, None).await.unwrap();
             }
             11 => break,

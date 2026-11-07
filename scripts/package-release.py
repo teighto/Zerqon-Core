@@ -64,7 +64,7 @@ def allowlist(version, platform, paper_files):
     for name in paper_files:
         path = "libraries/paper/" + name
         files[path] = path
-    for path in ("README.md", "LICENSE", "docs/CONFIGURATION.md", "docs/RUST_PLUGINS.md", "docs/JAVA_PLUGINS.md", "docs/JAVA_COMPATIBILITY.md", "docs/PROFILING.md", "docs/WORLD_IMPORT.md", "crates/zerqon-profiler/NOTICE.md", "tools/paper-bridge/dependencies.lock.json", "tools/paper-bridge/licenses.lock.json", "docs/ROADMAP.md", "docs/images/architecture.png", "docs/images/architecture.svg", "docs/images/performance.png", "docs/images/performance.svg", "docs/images/plugins.png", "docs/images/plugins.svg", "scripts/prepare-data.py"):
+    for path in ("README.md", "LICENSE", "docs/CONFIGURATION.md", "docs/RUST_PLUGINS.md", "docs/JAVA_PLUGINS.md", "docs/JAVA_COMPATIBILITY.md", "docs/PROFILING.md", "docs/WORLD_IMPORT.md", "docs/WORLD_STORAGE.md", "crates/zerqon-profiler/NOTICE.md", "tools/paper-bridge/dependencies.lock.json", "tools/paper-bridge/licenses.lock.json", "docs/ROADMAP.md", "docs/images/architecture.png", "docs/images/architecture.svg", "docs/images/performance.png", "docs/images/performance.svg", "docs/images/plugins.png", "docs/images/plugins.svg", "scripts/prepare-data.py"):
         files[path] = path
     return files
 

@@ -126,6 +126,8 @@ async fn offline_login_configuration_chunks_commands_and_shutdown() {
                 let teleport = get_varint(&mut data).unwrap();
                 let mut ack = vec![0];
                 put_varint(teleport, &mut ack);
+                ack.extend_from_slice(&data[..24]);
+                ack.extend_from_slice(&data[48..56]);
                 write_frame(&mut socket, &ack, Some(threshold))
                     .await
                     .unwrap();

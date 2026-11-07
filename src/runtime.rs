@@ -10,22 +10,33 @@ use crate::{
     server::TickStats,
 };
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::{RwLock, Semaphore, watch};
 use uuid::Uuid;
 use zerqon_inventory::ItemCatalog;
 use zerqon_plugin_api::{Action, Event, LogLevel, SenderKind};
 use zerqon_plugins::{Limits, PluginManager};
 use zerqon_world::{Chunk, ChunkCache, ChunkWorkers, GenerationPolicy, SpawnPoint, WorldStore};
 
+#[cfg(test)]
+mod review_tests;
+
 #[derive(Clone, Copy)]
 pub enum CommandSource<'a> {
     Console,
     Player { uuid: Uuid, name: &'a str },
+}
+
+pub enum BlockInteraction {
+    Place(zerqon_inventory::UseOnRequest),
+    Break(zerqon_inventory::PlayerActionRequest),
 }
 impl<'a> CommandSource<'a> {
     pub fn name(self) -> &'a str {
@@ -40,9 +51,12 @@ pub struct State {
     pub properties: Properties,
     pub settings: Settings,
     pub stats: Mutex<TickStats>,
+    pub tick: Arc<AtomicU64>,
+    pub gameplay: Arc<RwLock<()>>,
     pub data: Option<Arc<GameData>>,
     pub world: Option<Arc<World>>,
     pub items: Option<Arc<ItemCatalog>>,
+    pub blocks: Option<Arc<zerqon_blocks::Catalog>>,
     pub inventories: Option<Arc<InventoryService>>,
     pub mobs: Option<Arc<Mobs>>,
     pub auth: Option<Authenticator>,
@@ -59,6 +73,287 @@ pub struct State {
 }
 
 impl State {
+    pub async fn edit_block(
+        &self,
+        uuid: Uuid,
+        entity_id: i32,
+        inventory: &crate::player_inventory::InventoryHandle,
+        action: BlockInteraction,
+    ) -> Result<()> {
+        use zerqon_blocks::{
+            Aabb, Bounds, BuildError, Direction, Interaction, Placement, Position, StateId,
+        };
+        use zerqon_world::{ChunkKey, ChunkWrite, CommitError};
+        if *self.shutdown.borrow() {
+            return Err("server is stopping".into());
+        }
+        let world = self.world.as_ref().ok_or("world unavailable")?;
+        let rules = Arc::clone(self.blocks.as_ref().ok_or("block rules unavailable")?);
+        let gameplay = Arc::clone(&self.gameplay).write_owned().await;
+        let observers = self.players.snapshots()?;
+        let actor = observers
+            .iter()
+            .find(|player| player.uuid == uuid && player.id == entity_id)
+            .ok_or("player session is no longer active")?;
+        let actor_position = actor.position;
+        let (clicked, hand) = match &action {
+            BlockInteraction::Place(request) => (request.block, request.hand),
+            BlockInteraction::Break(request) => (request.block, zerqon_inventory::Hand::Main),
+        };
+        let target = Position::new(clicked.x, clicked.y, clicked.z);
+        let held = inventory.held_stack(hand)?;
+        let near = [
+            f64::from(clicked.x),
+            f64::from(clicked.y),
+            f64::from(clicked.z),
+        ];
+        let mut blockers: Vec<Aabb> = observers
+            .iter()
+            .filter_map(|player| {
+                let xyz = player.position.xyz;
+                let bounds = Aabb {
+                    min: [xyz[0] - 0.3, xyz[1], xyz[2] - 0.3],
+                    max: [xyz[0] + 0.3, xyz[1] + 1.8, xyz[2] + 0.3],
+                };
+                (0..3)
+                    .all(|axis| {
+                        bounds.max[axis] >= near[axis] - 3.0 && bounds.min[axis] <= near[axis] + 4.0
+                    })
+                    .then_some(bounds)
+            })
+            .collect();
+        if let Some(mobs) = &self.mobs {
+            blockers.extend(mobs.blockers_near(near)?);
+        }
+        if blockers.len() > 1024 {
+            return Err("too many nearby entities for block interaction".into());
+        }
+        let store = Arc::clone(&world.store);
+        let cache = Arc::clone(&world.cache);
+        let data = Arc::clone(&world.data);
+        let stripes = Arc::clone(&world.stripes);
+        let players = Arc::clone(&self.players);
+        let shutdown = self.shutdown.clone();
+        let permit = Arc::clone(&world.inflight).acquire_owned().await?;
+        let ticket = world.workers.try_submit(move || {
+            Ok((|| -> Result<()> {
+                let _gameplay = gameplay;
+                if *shutdown.borrow() {
+                    return Err("server is stopping".into());
+                }
+                store.check_available()?;
+                let center = ChunkKey::new(clicked.x.div_euclid(16), clicked.z.div_euclid(16));
+                let keys: Vec<_> = (-1..=1)
+                    .flat_map(|x| (-1..=1).map(move |z| ChunkKey::new(center.x + x, center.z + z)))
+                    .collect();
+                let lock_ids: BTreeSet<_> = keys.iter().map(|key| stripe(key.x, key.z)).collect();
+                let _locks: Vec<_> = lock_ids
+                    .iter()
+                    .map(|id| stripes[*id].lock().map_err(|_| "chunk lock poisoned"))
+                    .collect::<std::result::Result<_, _>>()?;
+                let snapshots = store.snapshot(&keys)?;
+                let chunks: BTreeMap<_, _> = snapshots
+                    .iter()
+                    .filter_map(|snapshot| {
+                        let key = snapshot.key();
+                        snapshot
+                            .chunk()
+                            .cloned()
+                            .or_else(|| {
+                                (store.generation_policy() == GenerationPolicy::NativeFlat)
+                                    .then(|| Arc::new(Chunk::flat(key.x, key.z, data.flat)))
+                            })
+                            .map(|chunk| (key, chunk))
+                    })
+                    .collect();
+                for chunk in chunks.values() {
+                    if let Err(error) = validate_chunk(chunk, &data) {
+                        let _ = shutdown.send(true);
+                        return Err(error.into());
+                    }
+                }
+                let view = |position: Position| {
+                    chunks
+                        .get(&ChunkKey::new(
+                            position.x.div_euclid(16),
+                            position.z.div_euclid(16),
+                        ))
+                        .and_then(|chunk| {
+                            chunk.get_block(
+                                position.x.rem_euclid(16) as u8,
+                                position.y,
+                                position.z.rem_euclid(16) as u8,
+                            )
+                        })
+                        .map(StateId)
+                };
+                let interaction = Interaction {
+                    eye: [
+                        actor_position.xyz[0],
+                        actor_position.xyz[1] + 1.62,
+                        actor_position.xyz[2],
+                    ],
+                    block_range: 5.0,
+                    creative: true,
+                    bounds: Bounds::default(),
+                    blockers: &blockers,
+                };
+                let correction_face = match &action {
+                    BlockInteraction::Place(request) => Direction::from_id(request.face as u8),
+                    BlockInteraction::Break(_) => None,
+                };
+                let plan = (|| -> std::result::Result<zerqon_blocks::EditPlan, BuildError> {
+                    match action {
+                        BlockInteraction::Place(request) => {
+                            let held = held.as_ref().ok_or(BuildError::UnsupportedItem)?;
+                            let properties = held
+                                .patch()
+                                .added()
+                                .values()
+                                .find_map(|value| match value {
+                                    zerqon_inventory::ComponentValue::BlockState(value) => {
+                                        Some(value.clone())
+                                    }
+                                    _ => None,
+                                })
+                                .unwrap_or_default();
+                            let facing = match ((actor_position.yaw as f64 / 90.0 + 0.5).floor()
+                                as i64)
+                                .rem_euclid(4)
+                            {
+                                0 => Direction::South,
+                                1 => Direction::West,
+                                2 => Direction::North,
+                                _ => Direction::East,
+                            };
+                            rules.plan_placement(
+                                &view,
+                                &interaction,
+                                &Placement {
+                                    clicked: target,
+                                    face: Direction::from_id(request.face as u8)
+                                        .ok_or(BuildError::Invalid)?,
+                                    local_hit: request.hit,
+                                    facing,
+                                    item: held.item().0,
+                                    secondary_use: false,
+                                    properties: &properties,
+                                },
+                            )
+                        }
+                        BlockInteraction::Break(_) => rules.plan_break(
+                            &view,
+                            &interaction,
+                            target,
+                            held.as_ref().map(|stack| stack.item().0),
+                        ),
+                    }
+                })();
+                let plan = match plan {
+                    Ok(plan) => plan,
+                    Err(error) => {
+                        let corrections = std::iter::once(target)
+                            .chain(correction_face.and_then(|face| target.relative(face)))
+                            .filter_map(|position| {
+                                view(position).map(|state| {
+                                    bytes::Bytes::from(block_update(
+                                        position.x, position.y, position.z, state.0,
+                                    ))
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        players.dispatch_batches(vec![(uuid, entity_id, corrections)])?;
+                        return Err(error.into());
+                    }
+                };
+                if plan.changes().is_empty() {
+                    return Ok(());
+                }
+                let read_keys: BTreeSet<_> = plan
+                    .reads()
+                    .iter()
+                    .map(|(position, _)| {
+                        ChunkKey::new(position.x.div_euclid(16), position.z.div_euclid(16))
+                    })
+                    .collect();
+                let reads: Vec<_> = snapshots
+                    .into_iter()
+                    .filter(|snapshot| read_keys.contains(&snapshot.key()))
+                    .collect();
+                let mut changed = BTreeMap::new();
+                for change in plan.changes() {
+                    let key = ChunkKey::new(
+                        change.position.x.div_euclid(16),
+                        change.position.z.div_euclid(16),
+                    );
+                    let chunk = changed.entry(key).or_insert_with(|| {
+                        (**chunks
+                            .get(&key)
+                            .expect("planner read set includes every changed chunk"))
+                        .clone()
+                    });
+                    chunk.set_block(
+                        change.position.x.rem_euclid(16) as u8,
+                        change.position.y,
+                        change.position.z.rem_euclid(16) as u8,
+                        change.replacement.0,
+                    )?;
+                }
+                let writes: Vec<_> = changed
+                    .into_iter()
+                    .map(|(key, chunk)| ChunkWrite {
+                        key,
+                        replacement: Arc::new(chunk),
+                    })
+                    .collect();
+                let updates: Vec<_> = plan
+                    .changes()
+                    .iter()
+                    .map(|change| {
+                        bytes::Bytes::from(block_update(
+                            change.position.x,
+                            change.position.y,
+                            change.position.z,
+                            change.replacement.0,
+                        ))
+                    })
+                    .collect();
+                match store.commit(Uuid::new_v4(), &reads, &writes) {
+                    Ok(_) => {}
+                    Err(error @ CommitError::Indeterminate { .. }) => {
+                        let _ = shutdown.send(true);
+                        return Err(error.into());
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+                match cache.lock() {
+                    Ok(mut cache) => {
+                        for write in writes {
+                            cache.insert(write.replacement);
+                        }
+                    }
+                    Err(_) => {
+                        let _ = shutdown.send(true);
+                        return Err("world edit committed but cache publication failed".into());
+                    }
+                }
+                for packet in updates {
+                    if let Err(error) = players.broadcast(packet) {
+                        let _ = shutdown.send(true);
+                        return Err(error.into());
+                    }
+                }
+                Ok(())
+            })())
+        })?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            ticket.wait()
+        })
+        .await???;
+        Ok(())
+    }
+
     pub async fn new(
         directory: &Path,
         properties: Properties,
@@ -67,6 +362,7 @@ impl State {
         shutdown: watch::Sender<bool>,
         updates: Option<watch::Receiver<Option<crate::updates::UpdateAvailable>>>,
     ) -> Result<Arc<Self>> {
+        let gameplay = Arc::new(RwLock::new(()));
         let data = if status_only {
             None
         } else {
@@ -74,17 +370,6 @@ impl State {
                 &directory.join(&settings.data_directory),
             )?))
         };
-        let world = data
-            .as_ref()
-            .map(|data| {
-                World::new(
-                    &directory.join(&properties.level_name),
-                    &settings,
-                    Arc::clone(data),
-                )
-            })
-            .transpose()?
-            .map(Arc::new);
         let items = if status_only {
             None
         } else {
@@ -113,37 +398,6 @@ impl State {
             count = operators.entries().len(),
             "Loaded UUID operator records"
         );
-        let java_present = !status_only
-            && std::fs::read_dir(directory.join("plugins/java-plugins"))?
-                .filter_map(std::result::Result::ok)
-                .any(|entry| entry.path().extension().is_some_and(|ext| ext == "jar"));
-        let mut java = if settings.java_plugins && java_present {
-            Some(
-                JavaPlugins::spawn(JavaPluginConfig {
-                    java: settings.java_executable.clone().into(),
-                    host_jar: directory.join("libraries/zerqon-java-host-0.0.1.jar"),
-                    gson_jar: directory.join("libraries/gson-2.13.2.jar"),
-                    extra_classpath: crate::paper_libraries::classpath(
-                        &directory.join("libraries/paper"),
-                    )?,
-                    directory: directory.join("plugins/java-plugins"),
-                    server_version: env!("CARGO_PKG_VERSION").into(),
-                    request_timeout: Duration::from_secs(2),
-                    startup_timeout: Duration::from_secs(20),
-                    queue_capacity: 32,
-                })
-                .await?,
-            )
-        } else {
-            None
-        };
-        if java_present && !settings.java_plugins {
-            tracing::warn!("Java plugins are disabled in server.settings");
-        }
-        let java_loaded = java
-            .as_mut()
-            .map(JavaPlugins::take_startup_results)
-            .unwrap_or_default();
         let entity_ids = Arc::new(EntityIds::default());
         let players = Players::new(
             properties.max_players,
@@ -153,6 +407,25 @@ impl State {
                 .unwrap_or(0),
             Arc::clone(&entity_ids),
         );
+        let world = data
+            .as_ref()
+            .map(|data| {
+                World::new(
+                    &directory.join(&properties.level_name),
+                    &settings,
+                    Arc::clone(data),
+                    Arc::clone(&gameplay),
+                    Arc::clone(&players),
+                    shutdown.clone(),
+                )
+            })
+            .transpose()?
+            .map(Arc::new);
+        let blocks = if status_only {
+            None
+        } else {
+            Some(Arc::new(zerqon_blocks::Catalog::embedded()?))
+        };
         let inventories = items
             .as_ref()
             .map(|catalog| {
@@ -161,6 +434,7 @@ impl State {
                     Arc::clone(catalog),
                     Arc::clone(&players),
                     properties.max_players,
+                    Arc::clone(&gameplay),
                 )
             })
             .transpose()?;
@@ -177,19 +451,63 @@ impl State {
                     Arc::clone(&players),
                     Arc::clone(data),
                     entity_ids,
+                    Arc::clone(&gameplay),
                 )
                 .await?,
             ),
             _ => None,
         };
+        let tick = Arc::new(AtomicU64::new(0));
+        let java_present = !status_only
+            && std::fs::read_dir(directory.join("plugins/java-plugins"))?
+                .filter_map(std::result::Result::ok)
+                .any(|entry| entry.path().extension().is_some_and(|ext| ext == "jar"));
+        let mut java = if settings.java_plugins && java_present {
+            Some(
+                JavaPlugins::spawn_with_services(
+                    JavaPluginConfig {
+                        java: settings.java_executable.clone().into(),
+                        host_jar: directory.join("libraries/zerqon-java-host-0.0.1.jar"),
+                        gson_jar: directory.join("libraries/gson-2.13.2.jar"),
+                        extra_classpath: crate::paper_libraries::classpath(
+                            &directory.join("libraries/paper"),
+                        )?,
+                        directory: directory.join("plugins/java-plugins"),
+                        server_version: env!("CARGO_PKG_VERSION").into(),
+                        request_timeout: Duration::from_secs(2),
+                        startup_timeout: Duration::from_secs(20),
+                        queue_capacity: 32,
+                    },
+                    Arc::new(crate::server_queries::ServerQueries {
+                        players: Arc::clone(&players),
+                        tick: Arc::clone(&tick),
+                        max_players: u32::try_from(properties.max_players)?,
+                        shutdown: shutdown.subscribe(),
+                    }),
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        if java_present && !settings.java_plugins {
+            tracing::warn!("Java plugins are disabled in server.settings");
+        }
+        let java_loaded = java
+            .as_mut()
+            .map(JavaPlugins::take_startup_results)
+            .unwrap_or_default();
         let state = Arc::new(Self {
             slots: Arc::new(Semaphore::new(properties.max_players)),
             properties,
             settings,
             stats: Mutex::new(TickStats::new()),
+            tick,
+            gameplay,
             data,
             world,
             items,
+            blocks,
             inventories,
             mobs,
             auth,
@@ -281,10 +599,6 @@ impl State {
             Ok(operators.revoke(uuid)?)
         }
     }
-    pub fn broadcast(&self, packet: Vec<u8>) {
-        self.players.broadcast(packet.into());
-    }
-
     fn apply_actions(&self, plugin: &str, actions: Vec<Action>) -> Vec<String> {
         let mut replies = Vec::new();
         for action in actions {
@@ -312,6 +626,9 @@ impl State {
     }
 
     pub async fn event(&self, event: Event) -> Result<()> {
+        if let Event::Tick { tick } = &event {
+            self.tick.fetch_max(*tick, Ordering::Release);
+        }
         let disabling = matches!(event, Event::Disable);
         let mut failures = Vec::new();
         if let Some(java) = &self.java {
@@ -410,7 +727,6 @@ impl State {
                 let x=args[0].parse::<i32>()?;let y=args[1].parse::<i32>()?;let z=args[2].parse::<i32>()?;let block=args[3].parse::<u32>()?;
                 let world=self.world.as_ref().ok_or("world unavailable")?;
                 world.set_block(x,y,z,block).await?;
-                self.broadcast(block_update(x,y,z,block));
                 Ok(vec![format!("Block set at {x} {y} {z}")])
             },
             "give"=>{
@@ -475,6 +791,9 @@ pub fn block_update(x: i32, y: i32, z: i32, state: u32) -> Vec<u8> {
 }
 
 pub struct World {
+    players: Arc<Players>,
+    shutdown: watch::Sender<bool>,
+    gameplay: Arc<RwLock<()>>,
     store: Arc<WorldStore>,
     cache: Arc<Mutex<ChunkCache>>,
     workers: ChunkWorkers,
@@ -483,6 +802,13 @@ pub struct World {
     stripes: Arc<[Mutex<()>; 64]>,
 }
 impl World {
+    pub fn check_available(&self) -> Result<()> {
+        if *self.shutdown.borrow() {
+            return Err(zerqon_world::WorldError::StorageUnavailable.into());
+        }
+        self.store.check_available()?;
+        Ok(())
+    }
     pub fn spawn(&self) -> SpawnPoint {
         self.store.metadata().map_or_else(
             || SpawnPoint {
@@ -511,11 +837,12 @@ impl World {
         let ticket = self.workers.try_submit(move || Ok(job()))?;
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            ticket.wait_timeout(Duration::from_secs(30))
+            ticket.wait()
         })
         .await??
     }
     pub fn cached_chunks(&self) -> Result<Vec<Arc<Chunk>>> {
+        self.check_available()?;
         Ok(self
             .cache
             .lock()
@@ -523,6 +850,7 @@ impl World {
             .snapshot())
     }
     pub async fn chunk(&self, x: i32, z: i32) -> Result<Arc<Chunk>> {
+        self.check_available()?;
         let store = Arc::clone(&self.store);
         let cache = Arc::clone(&self.cache);
         let data = Arc::clone(&self.data);
@@ -531,6 +859,7 @@ impl World {
             let _guard = stripes[stripe(x, z)]
                 .lock()
                 .map_err(|_| "chunk lock poisoned")?;
+            store.check_available()?;
             let cached = cache.lock().map_err(|_| "cache lock poisoned")?.get(x, z);
             if let Some(chunk) = cached {
                 return Ok(chunk);
@@ -549,7 +878,14 @@ impl World {
         })
         .await
     }
-    fn new(path: &Path, settings: &Settings, data: Arc<GameData>) -> Result<Self> {
+    fn new(
+        path: &Path,
+        settings: &Settings,
+        data: Arc<GameData>,
+        gameplay: Arc<RwLock<()>>,
+        players: Arc<Players>,
+        shutdown: watch::Sender<bool>,
+    ) -> Result<Self> {
         let store = WorldStore::open(path)?;
         if let Some(metadata) = store.metadata() {
             let [x, _, z] = metadata.spawn.position;
@@ -559,6 +895,9 @@ impl World {
             validate_chunk(&spawn, &data)?;
         }
         Ok(Self {
+            players,
+            shutdown,
+            gameplay,
             store: Arc::new(store),
             cache: Arc::new(Mutex::new(ChunkCache::with_limits(
                 settings.chunk_cache_capacity,
@@ -571,6 +910,7 @@ impl World {
         })
     }
     pub async fn packet(&self, x: i32, z: i32) -> Result<Vec<u8>> {
+        self.check_available()?;
         let permit = Arc::clone(&self.inflight).acquire_owned().await?;
         let store = Arc::clone(&self.store);
         let cache = Arc::clone(&self.cache);
@@ -580,6 +920,7 @@ impl World {
             let _guard = stripes[stripe(x, z)]
                 .lock()
                 .map_err(|_| zerqon_world::WorldError::Corrupt("chunk lock poisoned"))?;
+            store.check_available()?;
             let cached = cache
                 .lock()
                 .map_err(|_| zerqon_world::WorldError::Corrupt("cache lock poisoned"))?
@@ -610,18 +951,25 @@ impl World {
         Ok(result)
     }
     pub async fn set_block(&self, x: i32, y: i32, z: i32, block: u32) -> Result<()> {
+        let gameplay = Arc::clone(&self.gameplay).write_owned().await;
         if x.unsigned_abs() > 30_000_000
             || z.unsigned_abs() > 30_000_000
             || !self.data.is_valid_state(block)
         {
             return Err("invalid block position or state".into());
         }
+        let players = Arc::clone(&self.players);
+        let shutdown = self.shutdown.clone();
         let permit = Arc::clone(&self.inflight).acquire_owned().await?;
         let store = Arc::clone(&self.store);
         let cache = Arc::clone(&self.cache);
         let data = Arc::clone(&self.data);
         let stripes = Arc::clone(&self.stripes);
         let ticket = self.workers.try_submit(move || {
+            let _gameplay = gameplay;
+            if *shutdown.borrow() {
+                return Err(zerqon_world::WorldError::StorageUnavailable);
+            }
             let cx = x.div_euclid(16);
             let cz = z.div_euclid(16);
             let _guard = stripes[stripe(cx, cz)]
@@ -640,16 +988,33 @@ impl World {
             };
             validate_chunk(&chunk, &data)?;
             chunk.set_block(x.rem_euclid(16) as u8, y, z.rem_euclid(16) as u8, block)?;
-            store.save(&chunk)?;
-            cache
-                .lock()
-                .map_err(|_| zerqon_world::WorldError::Corrupt("cache lock poisoned"))?
-                .insert(Arc::new(chunk));
+            if let Err(error) = store.save(&chunk) {
+                if store.check_available().is_err() {
+                    let _ = shutdown.send(true);
+                }
+                return Err(error);
+            }
+            match cache.lock() {
+                Ok(mut cache) => {
+                    cache.insert(Arc::new(chunk));
+                }
+                Err(_) => {
+                    let _ = shutdown.send(true);
+                    return Err(zerqon_world::WorldError::StorageUnavailable);
+                }
+            }
+            if players
+                .broadcast(block_update(x, y, z, block).into())
+                .is_err()
+            {
+                let _ = shutdown.send(true);
+                return Err(zerqon_world::WorldError::StorageUnavailable);
+            }
             Ok(())
         })?;
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            ticket.wait_timeout(Duration::from_secs(30))
+            ticket.wait()
         })
         .await??;
         Ok(())

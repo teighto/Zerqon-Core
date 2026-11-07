@@ -26,7 +26,7 @@ class PackageTests(unittest.TestCase):
             "README.md", "LICENSE", "docs/CONFIGURATION.md",
             "docs/RUST_PLUGINS.md", "docs/JAVA_PLUGINS.md", "docs/JAVA_COMPATIBILITY.md", "docs/ROADMAP.md", "docs/images/architecture.png", "docs/images/architecture.svg",
             "docs/images/performance.png", "docs/images/performance.svg", "docs/images/plugins.png", "docs/images/plugins.svg",
-            "docs/PROFILING.md", "docs/WORLD_IMPORT.md", "crates/zerqon-profiler/NOTICE.md", "tools/paper-bridge/licenses.lock.json",
+            "docs/PROFILING.md", "docs/WORLD_IMPORT.md", "docs/WORLD_STORAGE.md", "crates/zerqon-profiler/NOTICE.md", "tools/paper-bridge/licenses.lock.json",
             "libraries/paper/zerqon-paper-bridge-0.0.1.jar", "libraries/paper/paper-api-test.jar", "libraries/paper/adventure-test.jar",
             "scripts/prepare-data.py", "target/notices.txt", "target/release-notices/PAPER-LICENSES.txt",
         ]

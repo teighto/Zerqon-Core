@@ -15,9 +15,11 @@ mod paper_libraries;
 mod player_inventory;
 mod player_store;
 mod players;
+mod plugin_services;
 mod profiling;
 mod runtime;
 mod server;
+mod server_queries;
 mod updates;
 mod world_view;
 

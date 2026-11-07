@@ -5,6 +5,7 @@ pub mod metadata;
 mod section;
 mod source_data;
 mod storage;
+mod transaction;
 mod workers;
 
 pub use cache::ChunkCache;
@@ -12,10 +13,22 @@ pub use chunk::{Chunk, FlatPalette, MIN_Y, SECTION_COUNT, WORLD_HEIGHT};
 pub use metadata::{GenerationPolicy, SpawnPoint, WorldMetadata};
 pub use section::{SECTION_VOLUME, Section};
 pub use storage::WorldStore;
+pub use transaction::{
+    ChunkKey, ChunkSnapshot, ChunkWrite, CommitError, CommitReceipt, CommittedChunk,
+};
 pub use workers::{ChunkTicket, ChunkWorkers};
 
 #[derive(Debug, thiserror::Error)]
 pub enum WorldError {
+    #[error("world storage: {0}")]
+    Storage(String),
+    #[error("world storage requires reopening after an uncertain commit")]
+    StorageUnavailable,
+    #[error("world commit {operation} has an uncertain outcome: {cause}")]
+    CommitIndeterminate {
+        operation: uuid::Uuid,
+        cause: String,
+    },
     #[error("block coordinates are outside the chunk")]
     OutOfBounds,
     #[error("invalid chunk data: {0}")]

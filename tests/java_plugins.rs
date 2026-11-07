@@ -1,5 +1,7 @@
 #[path = "../src/java_launch.rs"]
 mod java_launch;
+#[path = "../src/plugin_services.rs"]
+mod plugin_services;
 
 include!("../src/java_plugins.rs");
 
@@ -9,6 +11,619 @@ mod tests {
     use crate::java_launch::classpath_manifest;
     use std::sync::OnceLock;
     use tokio::io::BufReader;
+
+    impl JavaPlugins {
+        async fn spawn(config: JavaPluginConfig) -> Result<Self, JavaPluginError> {
+            Self::spawn_internal(config, None).await
+        }
+    }
+
+    struct SnapshotService;
+    impl plugin_services::NativeQueryService for SnapshotService {
+        fn query(
+            &self,
+            context: plugin_services::NativeCallContext,
+            query: plugin_services::NativeQuery,
+        ) -> plugin_services::NativeQueryFuture<'_> {
+            assert_eq!(context.plugin, "fixture");
+            assert!(context.parent_id > 0 && context.call_id > 0);
+            assert!(context.deadline > Instant::now());
+            assert_eq!(query, plugin_services::NativeQuery::ServerSnapshot);
+            Box::pin(async {
+                Ok(plugin_services::ServerSnapshot {
+                    server_version: "0.0.1".into(),
+                    minecraft_version: "26.3".into(),
+                    protocol: 777,
+                    max_players: 64,
+                    online_players: 2,
+                    tick: 123,
+                })
+            })
+        }
+    }
+
+    fn snapshot() -> plugin_services::ServerSnapshot {
+        plugin_services::ServerSnapshot {
+            server_version: "0.0.1".into(),
+            minecraft_version: "26.3".into(),
+            protocol: 777,
+            max_players: 64,
+            online_players: 2,
+            tick: 123,
+        }
+    }
+
+    struct ObservedService {
+        calls: std::sync::atomic::AtomicUsize,
+        dropped: Arc<std::sync::atomic::AtomicUsize>,
+        delay: Duration,
+        result: Result<ServerSnapshot, NativeQueryError>,
+        contexts: std::sync::Mutex<Vec<(String, u64, u64)>>,
+    }
+
+    impl ObservedService {
+        fn new(delay: Duration, result: Result<ServerSnapshot, NativeQueryError>) -> Arc<Self> {
+            Arc::new(Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                dropped: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                delay,
+                result,
+                contexts: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl NativeQueryService for ObservedService {
+        fn query(
+            &self,
+            context: NativeCallContext,
+            _: NativeQuery,
+        ) -> plugin_services::NativeQueryFuture<'_> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.contexts.lock().unwrap().push((
+                context.plugin,
+                context.parent_id,
+                context.call_id,
+            ));
+            struct QueryDrop(Arc<std::sync::atomic::AtomicUsize>);
+            impl Drop for QueryDrop {
+                fn drop(&mut self) {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            let guard = QueryDrop(Arc::clone(&self.dropped));
+            Box::pin(async move {
+                let _guard = guard;
+                tokio::time::sleep(self.delay).await;
+                self.result.clone()
+            })
+        }
+    }
+
+    fn native_config(mode: &str, directory: &std::path::Path) -> JavaPluginConfig {
+        let settings = config(mode, directory);
+        std::fs::create_dir_all(&settings.directory).unwrap();
+        std::fs::copy(&settings.host_jar, settings.directory.join("fixture.jar")).unwrap();
+        settings
+    }
+
+    #[tokio::test]
+    async fn negotiated_native_query_roundtrip_preserves_parent_response() {
+        let directory = tempfile::tempdir().unwrap();
+        let settings = native_config("native", directory.path());
+        let plugins =
+            JavaPlugins::spawn_with_services(settings, std::sync::Arc::new(SnapshotService))
+                .await
+                .unwrap();
+        let response = plugins
+            .dispatch(Event::Tick { tick: 5 }, Some("fixture".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            response[0].actions,
+            [Action::Reply {
+                message: "snapshot:123:2".into()
+            }]
+        );
+        assert!(plugins.list().await.unwrap()[0].enabled);
+        plugins.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_host_rejects_unsolicited_native_queries() {
+        let directory = tempfile::tempdir().unwrap();
+        let plugins = JavaPlugins::spawn(config("native", directory.path()))
+            .await
+            .unwrap();
+        assert!(matches!(
+            plugins.dispatch(Event::Tick { tick: 1 }, None).await,
+            Err(JavaPluginError::Protocol(_))
+        ));
+        assert!(plugins.list().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn native_host_rejects_hostile_frames_before_calling_services() {
+        for mode in [
+            "native_wrong_parent",
+            "native_wrong_id",
+            "native_unknown_plugin",
+            "native_unknown_query",
+            "native_unknown_field",
+            "native_duplicate_field",
+            "native_oversize",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let service = ObservedService::new(Duration::ZERO, Ok(snapshot()));
+            let plugins = JavaPlugins::spawn_with_services(
+                native_config(mode, directory.path()),
+                service.clone(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(
+                    plugins
+                        .dispatch(Event::Tick { tick: 1 }, Some("fixture".into()))
+                        .await,
+                    Err(JavaPluginError::Protocol(_))
+                ),
+                "{mode}"
+            );
+            assert_eq!(service.calls.load(Ordering::SeqCst), 0, "{mode}");
+            assert!(plugins.list().await.is_err(), "{mode}");
+        }
+    }
+
+    #[tokio::test]
+    async fn native_host_rejects_duplicate_and_excessive_calls_without_reexecution() {
+        for (mode, expected) in [("native_duplicate", 1), ("native_limit", 128)] {
+            let directory = tempfile::tempdir().unwrap();
+            let service = ObservedService::new(Duration::ZERO, Ok(snapshot()));
+            let plugins = JavaPlugins::spawn_with_services(
+                native_config(mode, directory.path()),
+                service.clone(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(
+                    plugins.dispatch(Event::Tick { tick: 1 }, None).await,
+                    Err(JavaPluginError::Protocol(_))
+                ),
+                "{mode}"
+            );
+            assert_eq!(service.calls.load(Ordering::SeqCst), expected);
+            assert_eq!(service.dropped.load(Ordering::SeqCst), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn native_queries_are_forbidden_in_list_requests() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = ObservedService::new(Duration::ZERO, Ok(snapshot()));
+        let plugins = JavaPlugins::spawn_with_services(
+            native_config("native_list", directory.path()),
+            service.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            plugins.list().await,
+            Err(JavaPluginError::Protocol(_))
+        ));
+        assert_eq!(service.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn native_service_errors_and_subdeadlines_do_not_poison_the_host() {
+        for (delay, result) in [
+            (
+                Duration::ZERO,
+                Err(NativeQueryError::new(
+                    NativeErrorCode::Unavailable,
+                    "Unavailable",
+                )),
+            ),
+            (Duration::from_secs(30), Ok(snapshot())),
+            (
+                Duration::ZERO,
+                Ok(ServerSnapshot {
+                    online_players: 65,
+                    ..snapshot()
+                }),
+            ),
+            (
+                Duration::ZERO,
+                Err(NativeQueryError::new(
+                    NativeErrorCode::Internal,
+                    "x".repeat(4096),
+                )),
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let service = ObservedService::new(delay, result);
+            let plugins = JavaPlugins::spawn_with_services(
+                native_config("native_error", directory.path()),
+                service.clone(),
+            )
+            .await
+            .unwrap();
+            let result = plugins
+                .dispatch(Event::Tick { tick: 1 }, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                result[0].actions,
+                [Action::Reply {
+                    message: "native-error".into()
+                }]
+            );
+            assert_eq!(service.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(service.dropped.load(Ordering::SeqCst), 1);
+            assert!(plugins.list().await.unwrap()[0].enabled);
+            plugins.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn native_queries_share_the_original_parent_deadline() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = ObservedService::new(Duration::from_millis(150), Ok(snapshot()));
+        let mut settings = native_config("native_two", directory.path());
+        settings.request_timeout = Duration::from_millis(240);
+        let plugins = JavaPlugins::spawn_with_services(settings, service.clone())
+            .await
+            .unwrap();
+        let started = Instant::now();
+        assert!(matches!(
+            plugins.dispatch(Event::Tick { tick: 1 }, None).await,
+            Err(JavaPluginError::Timeout)
+        ));
+        assert!(plugins.list().await.is_err());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(service.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn cancelling_inflight_native_query_releases_service_future_and_stops_host() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = ObservedService::new(Duration::from_secs(30), Ok(snapshot()));
+        let plugins = Arc::new(
+            JavaPlugins::spawn_with_services(
+                native_config("native", directory.path()),
+                service.clone(),
+            )
+            .await
+            .unwrap(),
+        );
+        let requested = Arc::clone(&plugins);
+        let request =
+            tokio::spawn(async move { requested.dispatch(Event::Tick { tick: 1 }, None).await });
+        let started = Instant::now();
+        while service.calls.load(Ordering::SeqCst) == 0 {
+            assert!(started.elapsed() < Duration::from_secs(3));
+            tokio::task::yield_now().await;
+        }
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        while service.dropped.load(Ordering::SeqCst) == 0 {
+            assert!(started.elapsed() < Duration::from_secs(3));
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(plugins.list().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn native_protocol_negotiation_rejects_legacy_mismatch_and_stalled_hosts() {
+        for mode in [
+            "no-protocol",
+            "bad-protocol",
+            "bad-capability",
+            "native-before-hello",
+            "stalled-protocol",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let service = ObservedService::new(Duration::ZERO, Ok(snapshot()));
+            let mut settings = native_config("native", directory.path());
+            let host = directory.path().join(format!("{mode}.jar"));
+            std::fs::copy(&settings.host_jar, &host).unwrap();
+            settings.host_jar = host;
+            settings.startup_timeout = Duration::from_millis(500);
+            let result = JavaPlugins::spawn_with_services(settings, service.clone()).await;
+            if mode == "stalled-protocol" {
+                assert!(matches!(result, Err(JavaPluginError::Timeout)), "{mode}");
+            } else {
+                assert!(
+                    matches!(result, Err(JavaPluginError::Protocol(_))),
+                    "{mode}"
+                );
+            }
+            assert_eq!(service.calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_plugins_remain_listable_but_cannot_query_native_services() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = ObservedService::new(Duration::ZERO, Ok(snapshot()));
+        let plugins = JavaPlugins::spawn_with_services(
+            native_config("native_disabled", directory.path()),
+            service.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !plugins
+                .dispatch(Event::Tick { tick: 1 }, None)
+                .await
+                .unwrap()[0]
+                .enabled
+        );
+        assert!(!plugins.list().await.unwrap()[0].enabled);
+        assert!(matches!(
+            plugins.dispatch(Event::Tick { tick: 2 }, None).await,
+            Err(JavaPluginError::Protocol(_))
+        ));
+        assert_eq!(service.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn service_snapshots_and_errors_reject_invalid_values() {
+        let mut value = snapshot();
+        for invalid in ["", "line\nbreak"] {
+            value.server_version = invalid.into();
+            assert!(!value.valid());
+        }
+        value = snapshot();
+        value.minecraft_version = "😀".repeat(33);
+        assert!(!value.valid());
+        value = snapshot();
+        value.max_players = 0;
+        assert!(!value.valid());
+        value = snapshot();
+        value.online_players = value.max_players + 1;
+        assert!(!value.valid());
+        value = snapshot();
+        value.tick = i64::MAX as u64 + 1;
+        assert!(!value.valid());
+        assert!(!NativeQueryError::new(NativeErrorCode::Internal, "bad\u{0}error").valid());
+        assert!(!NativeQueryError::new(NativeErrorCode::Internal, "x".repeat(1025)).valid());
+        assert!(NativeQueryError::new(NativeErrorCode::Unavailable, "Не готово").valid());
+    }
+
+    fn real_native_config(directory: &std::path::Path) -> JavaPluginConfig {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        JavaPluginConfig {
+            java: "java".into(),
+            host_jar: root.join("libraries/zerqon-java-host-0.0.1.jar"),
+            gson_jar: root.join("libraries/gson-2.13.2.jar"),
+            extra_classpath: Vec::new(),
+            directory: directory.to_owned(),
+            server_version: "0.0.1".into(),
+            request_timeout: Duration::from_secs(5),
+            startup_timeout: Duration::from_secs(15),
+            queue_capacity: 4,
+        }
+    }
+
+    fn native_command(command: &str) -> Event {
+        Event::Command {
+            sender: "NativeOperator".into(),
+            sender_kind: zerqon_plugin_api::SenderKind::Console,
+            operator: true,
+            command: command.into(),
+            args: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires python scripts/build-java-plugins.py"]
+    async fn actual_java_sdk_queries_rust_services_and_restricts_callback_threads() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::copy(
+            root.join("target/java-plugins/native-query-plugin.jar"),
+            directory.path().join("native.jar"),
+        )
+        .unwrap();
+        let service = ObservedService::new(Duration::ZERO, Ok(snapshot()));
+        let plugins =
+            JavaPlugins::spawn_with_services(real_native_config(directory.path()), service.clone())
+                .await
+                .unwrap();
+        for command in ["native", "twice"] {
+            let reply = plugins
+                .dispatch(native_command(command), Some("native".into()))
+                .await
+                .unwrap();
+            assert!(reply[0].enabled, "{reply:?}");
+            assert_eq!(
+                reply[0].actions,
+                [Action::Reply {
+                    message: "0.0.1:26.3:777:64:2:123".into()
+                }]
+            );
+        }
+        let reply = plugins
+            .dispatch(native_command("thread"), Some("native".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            reply[0].actions,
+            [Action::Reply {
+                message: "thread rejected".into()
+            }]
+        );
+        assert_eq!(service.calls.load(Ordering::SeqCst), 3);
+        let contexts = service.contexts.lock().unwrap().clone();
+        assert_eq!(
+            contexts
+                .iter()
+                .map(|(plugin, _, call)| (plugin.as_str(), *call))
+                .collect::<Vec<_>>(),
+            [("native", 1), ("native", 1), ("native", 2)]
+        );
+        assert_ne!(contexts[0].1, contexts[1].1);
+        assert_eq!(contexts[1].1, contexts[2].1);
+        plugins.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires python scripts/build-java-plugins.py"]
+    async fn actual_java_sdk_receives_typed_service_errors_without_losing_the_session() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::copy(
+            root.join("target/java-plugins/native-query-plugin.jar"),
+            directory.path().join("native.jar"),
+        )
+        .unwrap();
+        let service = ObservedService::new(
+            Duration::ZERO,
+            Err(NativeQueryError::new(
+                NativeErrorCode::Unavailable,
+                "Not ready",
+            )),
+        );
+        let plugins =
+            JavaPlugins::spawn_with_services(real_native_config(directory.path()), service.clone())
+                .await
+                .unwrap();
+        let reply = plugins
+            .dispatch(native_command("native"), Some("native".into()))
+            .await
+            .unwrap();
+        assert!(reply[0].enabled);
+        assert_eq!(
+            reply[0].actions,
+            [Action::Reply {
+                message: "UNAVAILABLE".into()
+            }]
+        );
+        assert!(plugins.list().await.unwrap()[0].enabled);
+        plugins.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires python scripts/build-java-plugins.py"]
+    async fn actual_java_lifecycle_queries_preserve_file_identity_and_parent_budgets() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let directory = tempfile::tempdir().unwrap();
+        for name in ["one", "two"] {
+            std::fs::copy(
+                root.join("target/java-plugins/native-lifecycle-plugin.jar"),
+                directory.path().join(format!("{name}.jar")),
+            )
+            .unwrap();
+        }
+        let service = ObservedService::new(Duration::ZERO, Ok(snapshot()));
+        let mut plugins =
+            JavaPlugins::spawn_with_services(real_native_config(directory.path()), service.clone())
+                .await
+                .unwrap();
+        assert_eq!(plugins.take_startup_results().len(), 2);
+        assert_eq!(
+            plugins
+                .dispatch(Event::Tick { tick: 1 }, None)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(plugins.shutdown().await.unwrap().len(), 2);
+        let contexts = service.contexts.lock().unwrap().clone();
+        assert_eq!(contexts.len(), 6);
+        for pair in contexts.chunks(2) {
+            assert_eq!(pair[0].0, "one");
+            assert_eq!(pair[1].0, "two");
+            assert_eq!(pair[0].2, 1);
+            assert_eq!(pair[1].2, 2);
+            assert_eq!(pair[0].1, pair[1].1);
+        }
+        assert!(contexts[0].1 < contexts[2].1 && contexts[2].1 < contexts[4].1);
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires python scripts/build-java-plugins.py"]
+    async fn actual_paper_callbacks_keep_native_identity_through_nested_dispatch() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let directory = tempfile::tempdir().unwrap();
+        for (filename, metadata) in [("file-a", "NativeA"), ("file-b", "NativeB")] {
+            let mut jar = zip::ZipWriter::new(
+                std::fs::File::create(directory.path().join(format!("{filename}.jar"))).unwrap(),
+            );
+            let options = zip::write::SimpleFileOptions::default();
+            jar.start_file("plugin.yml", options).unwrap();
+            std::io::Write::write_all(&mut jar, format!("name: {metadata}\nversion: 1\nmain: io.github.teighto.zerqon.fixtures.NativePaperProbe\napi-version: '26.3'\ncommands:\n  nativepaper: {{}}\n").as_bytes()).unwrap();
+            for class in [
+                "NativePaperProbe.class",
+                "NativePaperProbe$ProbeEvent.class",
+            ] {
+                let path = format!("io/github/teighto/zerqon/fixtures/{class}");
+                jar.start_file(&path, options).unwrap();
+                std::io::Write::write_all(
+                    &mut jar,
+                    &std::fs::read(root.join("target/paper-bridge/fixtures").join(path)).unwrap(),
+                )
+                .unwrap();
+            }
+            jar.finish().unwrap();
+        }
+        let mut settings = real_native_config(directory.path());
+        settings.extra_classpath = std::fs::read_dir(root.join("libraries/paper"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "jar"))
+            .collect();
+        settings.extra_classpath.sort();
+        let service = ObservedService::new(Duration::ZERO, Ok(snapshot()));
+        let mut plugins = JavaPlugins::spawn_with_services(settings, service.clone())
+            .await
+            .unwrap();
+        assert!(
+            plugins
+                .take_startup_results()
+                .iter()
+                .all(|result| result.enabled)
+        );
+        assert_eq!(service.calls.load(Ordering::SeqCst), 4);
+        plugins
+            .dispatch(Event::Tick { tick: 1 }, None)
+            .await
+            .unwrap();
+        let mut event = native_command("nativepaper");
+        if let Event::Command { args, .. } = &mut event {
+            *args = vec!["nested".into(), "nativeb:nativepaper".into()];
+        }
+        let before = service.calls.load(Ordering::SeqCst);
+        let response = plugins
+            .dispatch(event, Some("file-a".into()))
+            .await
+            .unwrap();
+        assert!(response[0].enabled, "{response:?}");
+        assert_eq!(
+            response[0].actions,
+            [
+                Action::Reply {
+                    message: "tick=123".into()
+                },
+                Action::Reply {
+                    message: "tick=123".into()
+                }
+            ]
+        );
+        let nested = service.contexts.lock().unwrap()[before..].to_vec();
+        assert_eq!(
+            nested
+                .iter()
+                .map(|(plugin, _, call)| (plugin.as_str(), *call))
+                .collect::<Vec<_>>(),
+            [("file-b", 1), ("file-b", 2), ("file-a", 3)]
+        );
+        assert!(nested.iter().all(|(_, parent, _)| *parent == nested[0].1));
+        assert_eq!(plugins.shutdown().await.unwrap().len(), 2);
+    }
 
     #[test]
     fn stderr_decoder_preserves_unicode_at_every_fragment_boundary() {

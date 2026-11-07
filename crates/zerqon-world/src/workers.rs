@@ -89,6 +89,24 @@ impl ChunkWorkers {
 
     fn join(&mut self) -> Result<(), WorldError> {
         self.sender.take();
+        let current = thread::current().id();
+        if self
+            .workers
+            .iter()
+            .any(|worker| worker.thread().id() == current)
+        {
+            let workers = std::mem::take(&mut self.workers);
+            thread::Builder::new()
+                .name("zerqon-world-reaper".into())
+                .spawn(move || {
+                    for worker in workers {
+                        if worker.join().is_err() {
+                            eprintln!("Zerqon world worker stopped with a panic");
+                        }
+                    }
+                })?;
+            return Ok(());
+        }
         let mut panicked = false;
         for worker in self.workers.drain(..) {
             panicked |= worker.join().is_err();

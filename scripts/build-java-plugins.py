@@ -9,6 +9,7 @@ import subprocess
 import sys
 import urllib.request
 import json
+import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 GSON_NAME = "gson-2.13.2.jar"
@@ -102,6 +103,12 @@ def main():
     run(jar, "--create", "--file", example_jar, "--manifest", ROOT / "examples/hello-java-plugin/MANIFEST.MF", "-C", example_classes, ".")
     if not args.skip_tests:
         compile_java(javac, ROOT / "tools/java-plugins/tests/fixtures", fixture_classes, [api_jar])
+        for name, entry in (("native-query", "NativeQueryPlugin"), ("native-lifecycle", "NativeLifecyclePlugin")):
+            with zipfile.ZipFile(build / f"{name}-plugin.jar", "w", zipfile.ZIP_DEFLATED) as fixture:
+                fixture.writestr("META-INF/MANIFEST.MF", f"Manifest-Version: 1.0\nZerqon-Plugin: io.github.teighto.zerqon.fixtures.{entry}\nZerqon-API: 1\n\n")
+                for source in sorted(fixture_classes.rglob("*.class")):
+                    if source.stem == entry or source.stem.startswith(entry + "$"):
+                        fixture.write(source, source.relative_to(fixture_classes).as_posix())
         run(sys.executable, ROOT / "tools/java-plugins/tests/test_host.py", "--java", java, "--fixtures", fixture_classes)
     print(f"Built {api_jar.name}, {host_jar.name}, {example_jar.name}")
 

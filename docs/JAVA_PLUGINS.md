@@ -20,7 +20,7 @@ Outputs:
 | `libraries/zerqon-java-host-0.0.1.jar` | Optional host, including SDK classes |
 | `libraries/gson-2.13.2.jar` | Host JSON library |
 | `libraries/paper/*.jar` | Optional pinned Paper API, dependencies and experimental bridge |
-| `dist/hello-java-plugin-0.0.1.jar` | Example registering `/jhello` |
+| `dist/hello-java-plugin-0.0.1.jar` | Example registering `/jhello` and `/jserver` |
 
 Copy the example JAR into the server's `plugins/java-plugins/hello.jar`. Place the host and Gson JARs in the server's `libraries/` directory. `java_plugins = true` in `server.settings` enables the host when Java plugin files are present; `java_executable` selects Java 25. Rust plugins remain in `plugins/rust-plugins/`.
 
@@ -93,6 +93,23 @@ ABI 1 does not yet provide world, inventory, entity manipulation, a task schedul
 
 Callbacks execute serially on the host thread. Constructor and callback thread context classloaders point to the plugin. Keep callbacks short and release resources during Disable. Do not retain thread-local data or spawn threads that outlive Disable. `System.out` is redirected to stderr, but return `Action.Log` for normal server logging.
 
+## Native server queries
+
+`NativeQueries.serverSnapshot()` reads an immutable snapshot from the Rust core. It is available inside synchronous callbacks, including Enable and Disable, when the host connection negotiates protocol 2. The plugin manifest remains `Zerqon-API: 1`; existing plugin interfaces and events are unchanged. Constructors and plugin-created threads cannot issue native queries.
+
+```java
+import io.github.teighto.zerqon.api.NativeQueries;
+
+NativeQueries.ServerSnapshot server = NativeQueries.serverSnapshot();
+String message = "Players " + server.onlinePlayers() + "/" + server.maxPlayers();
+```
+
+The snapshot contains `serverVersion()`, `minecraftVersion()`, `protocol()`, `maxPlayers()`, `onlinePlayers()` and `tick()`. This API only reads server information; it does not expose world or inventory changes. `/jserver` in the example demonstrates the complete command path.
+
+Catch `NativeQueries.NativeQueryException` for a service error and inspect `code()`. `UNSUPPORTED` means native queries are unavailable on the legacy host protocol; `UNAVAILABLE` means the connected native service cannot currently answer. Other typed codes include `CAPACITY`, `CANCELLED` and `DEADLINE_EXCEEDED`. Errors do not become empty or invented snapshots. A malformed response terminates the Java host even if a plugin catches the resulting exception.
+
+Each native query has a 250 ms deadline, capped by the time remaining on the original Rust request; making another query does not extend that parent deadline. One host request, including all plugin callbacks it dispatches, permits at most 128 native calls. A call frame is limited to 64 KiB, a result frame to 256 KiB and all result frames together to 1 MiB. Avoid polling the same snapshot repeatedly within one callback.
+
 ## Isolation and limits
 
 Java plugins are trusted code with the operating-system permissions of the host process. Classloader separation and the subprocess boundary do not form a security sandbox. Plugins can use Java file/network APIs. Install reviewed plugins and run the server under an account with appropriate permissions.
@@ -103,7 +120,9 @@ The Rust bridge applies a request deadline. A hung callback or broken host proce
 
 ## Host protocol
 
-UTF-8 JSON Lines on stdin/stdout, with no unsolicited startup output. Every request has an unsigned 64-bit `id`, echoed exactly in the response. The line limit is 65,536 bytes; the response limit is 8 MiB.
+UTF-8 JSON Lines on stdin/stdout, with no unsolicited startup output. Legacy protocol 1 is the default and accepts an unsigned 64-bit `id`, echoed exactly in the response. The line limit is 65,536 bytes; the response limit is 8 MiB.
+
+The Rust host explicitly negotiates protocol 2 before loading plugins to enable native queries. Protocol 2 uses positive IDs up to `Long.MAX_VALUE`; native-query replies are handled inside the current request. Plugin authors use `NativeQueries` rather than writing transport messages. Ordinary event responses retain their protocol 1 shape.
 
 ```json
 {"id":1,"op":"load","directory":"/srv/zerqon/plugins/java-plugins","server_version":"0.0.1"}
@@ -126,11 +145,15 @@ Direct diagnostic launch uses `java -Xms16M -Xmx128M -cp "libraries/zerqon-java-
 
 У Zerqon собственный Java API. Ядро и мир работают на Rust; Java-плагины исполняются в одном дополнительном процессе Java 25. Этот же host распознаёт `plugin.yml` и запускает проверенную часть Paper 26.3 API при наличии `libraries/paper/` в classpath. Полной совместимости Paper пока нет; ограничения указаны в матрице. Папка Java-плагинов — `plugins/java-plugins/`, для Rust — `plugins/rust-plugins/`.
 
-Сборка: `python scripts/build-java-plugins.py`. Она проверяет SHA-256 библиотеки Gson, компилирует SDK, хост и пример, запускает интеграционные тесты с настоящими JAR и JVM. Скопируйте `dist/hello-java-plugin-0.0.1.jar` в `plugins/java-plugins/hello.jar`, хост и Gson — в `libraries/`. Настройка `java_plugins = true` в `server.settings` включает хост при наличии JAR; `java_executable` задаёт Java 25. Пример добавляет `/jhello`.
+Сборка: `python scripts/build-java-plugins.py`. Она проверяет SHA-256 библиотеки Gson, компилирует SDK, хост и пример, запускает интеграционные тесты с настоящими JAR и JVM. Скопируйте `dist/hello-java-plugin-0.0.1.jar` в `plugins/java-plugins/hello.jar`, хост и Gson — в `libraries/`. Настройка `java_plugins = true` в `server.settings` включает хост при наличии JAR; `java_executable` задаёт Java 25. Пример добавляет `/jhello` и `/jserver`.
 
 Плагин собственного API реализует `Plugin.onEvent(Event)` и возвращает действия `Action`. В манифесте обязательны `Zerqon-Plugin` с именем класса и `Zerqon-API: 1`. Есть события включения, выключения, команд, тиков и входа/выхода игроков. Действия — журнал, ответ на команду и регистрация команды. Java-host проверяет права по доверенным признакам `senderKind` и `operator`, полученным от Rust; конфликты команд проверяет ядро.
 
 `senderKind()` различает консоль и игрока. Строка `sender()` — отображаемое имя; игрок с ником `CONSOLE` остаётся игроком. Не проверяйте привилегии по этому тексту.
+
+`NativeQueries.serverSnapshot()` возвращает неизменяемый снимок состояния Rust-ядра: версии сервера и Minecraft, номер протокола, число игроков, лимит игроков и номер тика. Метод доступен только внутри синхронного обработчика, включая Enable и Disable, после согласования протокола хоста 2. В манифесте остаётся `Zerqon-API: 1`. Конструктор и созданные плагином потоки не могут делать такие запросы. Пример `/jserver` показывает полный рабочий сценарий; при старом протоколе он сообщает о недоступности запросов.
+
+Ошибка сервиса представлена `NativeQueries.NativeQueryException`: `code()` возвращает `UNSUPPORTED` для старого протокола, `UNAVAILABLE` для недоступного сервиса или другой конкретный код. Ошибки не подменяются пустыми снимками. Один запрос ограничен 250 мс и оставшимся временем исходного вызова Rust; новые запросы не продлевают общий дедлайн. На один вызов хоста, включая все обработчики плагинов, разрешено до 128 вложенных запросов; пределы сообщения запроса, ответа и суммы ответов — 64 КиБ, 256 КиБ и 1 МиБ. Повреждение протокола завершает Java-хост. Новый API только читает сведения о сервере.
 
 API мира, инвентарей, сущностей, планировщика и постоянного хранения пока отсутствуют. Обработчики последовательные; долгие операции блокируют Java-хост. При исключении отключается плагин, при зависании таймаут Rust-моста завершает весь Java-процесс. Java-плагины имеют права пользователя ОС и не изолированы как WASM; лимит JVM относится ко всем Java-плагинам вместе. Остановка процесса не отменяет уже выполненные внешние действия плагина.
 

@@ -7,7 +7,6 @@ import com.google.gson.JsonObject;
 import io.github.teighto.zerqon.api.Event;
 import io.github.teighto.zerqon.api.Plugin;
 import java.io.BufferedInputStream;
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.PrintStream;
@@ -31,9 +30,10 @@ public final class PluginHost implements AutoCloseable {
     private static final int MAX_PLUGINS = 64;
     private static final int MAX_LINE_BYTES = 65536;
     private final Map<String, LoadedPlugin> plugins = new TreeMap<>();
+    private final NativeTransport nativeTransport;
     private PaperSupport paper;
 
-    private PluginHost() {}
+    private PluginHost(NativeTransport nativeTransport) { this.nativeTransport = nativeTransport; }
 
     public static void main(String[] args) throws IOException {
         PrintStream protocol = new PrintStream(System.out, true, StandardCharsets.UTF_8);
@@ -41,9 +41,10 @@ public final class PluginHost implements AutoCloseable {
         System.setErr(new PrintStream(System.err, true, StandardCharsets.UTF_8));
         System.setOut(System.err);
         System.setIn(InputStream.nullInputStream());
-        try (PluginHost host = new PluginHost()) {
+        NativeTransport nativeTransport = new NativeTransport(protocol, requests);
+        try (PluginHost host = new PluginHost(nativeTransport)) {
             byte[] line;
-            while ((line = readLine(requests)) != null) {
+            while ((line = Wire.readLine(requests, MAX_LINE_BYTES)) != null) {
                 JsonElement id = JsonNull.INSTANCE;
                 JsonObject response;
                 boolean shutdown = false;
@@ -61,6 +62,7 @@ public final class PluginHost implements AutoCloseable {
                     response = response(id, false, new JsonArray());
                     response.addProperty("error", Wire.error(exception));
                 }
+                nativeTransport.checkHealthy();
                 String output = response.toString();
                 if (output.getBytes(StandardCharsets.UTF_8).length > 8 * 1024 * 1024) throw new IOException("response exceeds 8 MiB");
                 protocol.println(output);
@@ -72,32 +74,36 @@ public final class PluginHost implements AutoCloseable {
     }
 
     private JsonObject handle(JsonElement id, String operation, JsonObject request) throws IOException {
-        JsonArray results = switch (operation) {
-            case "load" -> {
-                Wire.fields(request, "id", "op", "directory", "server_version");
-                yield loadDirectory(Path.of(Wire.string(request, "directory", 4096)), Wire.string(request, "server_version", 128));
-            }
-            case "event" -> {
-                Wire.fields(request, "id", "op", "plugin", "event");
-                JsonElement event = request.get("event");
-                if (event == null || !event.isJsonObject()) throw new IllegalArgumentException("event must be an object");
-                String target = request.has("plugin") ? Wire.string(request, "plugin", 64) : null;
-                yield dispatch(target, Wire.event(event.getAsJsonObject()));
-            }
-            case "list" -> {
-                Wire.fields(request, "id", "op");
-                JsonArray list = new JsonArray();
-                for (LoadedPlugin plugin : plugins.values()) list.add(result(plugin.name, plugin.enabled(), new JsonArray(), plugin.error));
-                if (paper != null) list.addAll(paper.list());
-                yield list;
-            }
-            case "shutdown" -> {
-                Wire.fields(request, "id", "op");
-                yield shutdown();
-            }
-            default -> throw new IllegalArgumentException("unknown operation: " + operation);
-        };
-        return response(id, true, results);
+        if (operation.equals("hello")) return nativeTransport.negotiate(id, request);
+        nativeTransport.begin(request, operation);
+        try {
+            JsonArray results = switch (operation) {
+                case "load" -> {
+                    Wire.fields(request, "id", "op", "directory", "server_version");
+                    yield loadDirectory(Path.of(Wire.string(request, "directory", 4096)), Wire.string(request, "server_version", 128));
+                }
+                case "event" -> {
+                    Wire.fields(request, "id", "op", "plugin", "event");
+                    JsonElement event = request.get("event");
+                    if (event == null || !event.isJsonObject()) throw new IllegalArgumentException("event must be an object");
+                    String target = request.has("plugin") ? Wire.string(request, "plugin", 64) : null;
+                    yield dispatch(target, Wire.event(event.getAsJsonObject()));
+                }
+                case "list" -> {
+                    Wire.fields(request, "id", "op");
+                    JsonArray list = new JsonArray();
+                    for (LoadedPlugin plugin : plugins.values()) list.add(result(plugin.name, plugin.enabled(), new JsonArray(), plugin.error));
+                    if (paper != null) list.addAll(paper.list());
+                    yield list;
+                }
+                case "shutdown" -> {
+                    Wire.fields(request, "id", "op");
+                    yield shutdown();
+                }
+                default -> throw new IllegalArgumentException("unknown operation: " + operation);
+            };
+            return response(id, true, results);
+        } finally { nativeTransport.end(); }
     }
 
     private JsonArray loadDirectory(Path directory, String serverVersion) throws IOException {
@@ -135,7 +141,7 @@ public final class PluginHost implements AutoCloseable {
         }
         if (!paperJars.isEmpty()) {
             try {
-                if (paper == null) paper = new PaperSupport(directory);
+                if (paper == null) paper = new PaperSupport(directory, nativeTransport);
                 results.addAll(paper.load(paperJars, serverVersion));
             } catch (RuntimeException | LinkageError failure) {
                 for (Path path : paperJars) results.add(result(path.getFileName().toString().replaceFirst("\\.jar$", ""), false, new JsonArray(), "Paper bridge unavailable: " + Wire.error(failure)));
@@ -203,9 +209,10 @@ public final class PluginHost implements AutoCloseable {
         return results;
     }
 
-    private static JsonObject invoke(LoadedPlugin plugin, Event event) {
+    private JsonObject invoke(LoadedPlugin plugin, Event event) {
         Thread thread = Thread.currentThread();
         ClassLoader previous = thread.getContextClassLoader();
+        var scope = nativeTransport.bind(plugin.name);
         try {
             thread.setContextClassLoader(plugin.loader);
             if (event instanceof Event.Command command && plugin.permissions.containsKey(command.command()) && !command.operator() && command.senderKind() != Event.SenderKind.CONSOLE) {
@@ -226,6 +233,7 @@ public final class PluginHost implements AutoCloseable {
             closeLoader(plugin.loader, error);
             return result(plugin.name, false, new JsonArray(), plugin.error);
         } finally {
+            scope.close();
             thread.setContextClassLoader(previous);
         }
     }
@@ -278,18 +286,6 @@ public final class PluginHost implements AutoCloseable {
         result.add("actions", actions);
         if (error != null) result.addProperty("error", error);
         return result;
-    }
-
-    private static byte[] readLine(InputStream input) throws IOException {
-        ByteArrayOutputStream line = new ByteArrayOutputStream(256);
-        int next;
-        while ((next = input.read()) != -1) {
-            if (next == '\n') return line.toByteArray();
-            if (line.size() == MAX_LINE_BYTES) throw new IOException("request exceeds 64 KiB");
-            line.write(next);
-        }
-        if (line.size() != 0) throw new IOException("unterminated protocol request");
-        return null;
     }
 
     private static final class LoadedPlugin {

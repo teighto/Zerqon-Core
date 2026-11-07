@@ -38,7 +38,7 @@ Ryzen 9 9900X, Windows 11, Rust 1.97 release build. Median of three runs with 10
 | Generate chunks with four workers | 64,288 chunks/s |
 | Decode saved chunks | 115,524 chunks/s |
 
-One flat chunk uses 2,920 bytes for its structure and section allocations; its saved file is 1,790 bytes. These figures exclude allocator overhead and total process memory. The test measures chunk processing, not gameplay or player capacity.
+One flat chunk uses 2,920 bytes for its structure and section allocations; its encoded payload is 1,790 bytes. These figures exclude database overhead, allocator overhead and total process memory. The test measures chunk processing, not gameplay or player capacity.
 
 ```sh
 cargo run -p zerqon-world --example world_bench --release --locked -- 10000 4
@@ -122,7 +122,7 @@ Ryzen 9 9900X, Windows 11, Rust 1.97, release-сборка. Медиана тр�
 | Генерация в четыре потока | 64 288 чанков/с |
 | Чтение сохранённых чанков | 115 524 чанков/с |
 
-Структура плоского чанка и выделенная память секций занимают 2 920 байт, файл чанка на диске занимает 1 790 байт. Накладные расходы аллокатора и остальная память процесса сюда не входят. Это замер обработки чанков; по нему нельзя определить количество игроков на сервере.
+Структура плоского чанка и выделенная память секций занимают 2 920 байт, закодированные данные чанка занимают 1 790 байт. Накладные расходы базы данных, аллокатора и остальная память процесса сюда не входят. Это замер обработки чанков; по нему нельзя определить количество игроков на сервере.
 
 ```sh
 cargo run -p zerqon-world --example world_bench --release --locked -- 10000 4
