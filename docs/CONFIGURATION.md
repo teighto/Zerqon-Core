@@ -59,7 +59,7 @@ This file uses TOML. Missing keys use defaults; unknown keys are errors.
 | `max_packet_bytes` | `2097151` | 1,024–2,097,151 frame/decompression bound |
 | `packet_memory_mib` | `64` | 1–4,096 MiB for received packet buffers across all connections |
 | `connection_packet_memory_mib` | `2` | 1–64 MiB for one connection; cannot exceed `packet_memory_mib` |
-| `connection_timeout_seconds` | `30` | 1–300 seconds |
+| `connection_timeout_seconds` | `30` | 1–300 seconds per read/write or wait for a closing player session |
 | `chunk_cache_capacity` | `256` | 1–65,536 cached chunks; the cache also has a 256 MiB byte bound |
 | `work_queue_capacity` | `128` | 1–65,536 queued world jobs |
 | `data_directory` | `.cache/vanilla/26.3` | Prepared official game data |
@@ -83,6 +83,8 @@ The packet-memory limits cover received buffers until those buffers are freed. Q
 The update checker runs in the background, starting with one check at startup. It uses no GitHub token, skips drafts and prereleases, and downloads no software. New-version notices appear once in the console and once per operator session and version, in English, with the GitHub release link. Failed checks back off; status-only mode never starts the checker. Set `update_check = false` to disable all update-check requests.
 
 ## Client connections
+
+When the same player reconnects during logout, the new login waits for the previous session's Quit callbacks and cleanup. The wait uses `connection_timeout_seconds` and does not take another player slot. A login for a still active session is rejected.
 
 Both client settings are enabled by default. Set `allow_java_clients = false` to require the Horizon connection profile, or `allow_horizon_clients = false` to refuse that profile. Setting both to `false` closes player admission; server-list status remains available.
 
@@ -117,6 +119,8 @@ Players currently use Creative mode. Ordinary blocks, logs, dry slabs and stairs
 `/tps` reports the recent coordinator tick rate and average measured tick work. The built-in Rust CPU profiler uses `/spark profiler start` and `/spark profiler stop` on Linux. It saves reports in `profiles/`; see [Profiling](PROFILING.md). The append-only `logs/latest.log` is not automatically rotated. `RUST_LOG` selects log verbosity, for example `info` or `zerqon=debug`.
 
 ## Русский
+
+При быстром повторном входе сервер ждёт завершения `Quit` и очистки прежней закрывающейся сессии. На это отведено `connection_timeout_seconds`; дополнительный слот игрока во время ожидания не занят. Если прежнее соединение ещё активно, повторный вход отклоняется.
 
 `server_brand = "zerqon"` задаёт название сервера в F3. Можно указать свой текст, например `server_brand = "teighto"`, и перезапустить сервер. Допускаются кириллица и эмодзи; пустая строка, переносы строк и управляющие символы запрещены. Предел длины, как в Java, составляет 128 единиц UTF-16.
 

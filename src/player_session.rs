@@ -2,9 +2,12 @@ use crate::{
     Result, lifecycle::JobGuard, player_inventory::InventoryHandle, players::PlayerHandle,
     runtime::State,
 };
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicUsize, Ordering},
+use std::{
+    collections::{BTreeMap, btree_map::Entry},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use tokio::sync::{Notify, OwnedSemaphorePermit, watch};
 use uuid::Uuid;
@@ -14,33 +17,118 @@ pub struct SessionRegistry(Arc<RegistryInner>);
 
 #[derive(Default)]
 struct RegistryInner {
-    active: AtomicUsize,
+    entries: Mutex<BTreeMap<(Uuid, i32), Arc<RegistryEntry>>>,
     changed: Notify,
 }
 
+#[derive(Default)]
+struct RegistryEntry {
+    closing: AtomicBool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoginAdmission {
+    Available,
+    Active,
+}
+
 impl SessionRegistry {
+    /// Waits for closing sessions only; the caller must still reserve the identity.
+    pub async fn wait_for_login(&self, uuid: Uuid) -> LoginAdmission {
+        loop {
+            let changed = self.0.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let entries = self
+                    .0
+                    .entries
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                let mut closing = false;
+                for (_, entry) in entries.range((uuid, i32::MIN)..=(uuid, i32::MAX)) {
+                    if !entry.closing.load(Ordering::Acquire) {
+                        return LoginAdmission::Active;
+                    }
+                    closing = true;
+                }
+                if !closing {
+                    return LoginAdmission::Available;
+                }
+            }
+            changed.await;
+        }
+    }
+
     pub async fn drain(&self) {
         loop {
             let changed = self.0.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            if self.0.active.load(Ordering::Acquire) == 0 {
+            if self
+                .0
+                .entries
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty()
+            {
                 return;
             }
             changed.await;
         }
     }
-    fn enter(&self) -> RegistryLease {
-        self.0.active.fetch_add(1, Ordering::AcqRel);
-        RegistryLease(Arc::clone(&self.0))
+    fn enter(&self, uuid: Uuid, id: i32) -> Result<RegistryLease> {
+        if uuid.is_nil() || id <= 0 {
+            return Err("invalid player session identity".into());
+        }
+        let key = (uuid, id);
+        let entry = Arc::new(RegistryEntry::default());
+        {
+            let mut entries = self
+                .0
+                .entries
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            match entries.entry(key) {
+                Entry::Occupied(_) => return Err("player session is already registered".into()),
+                Entry::Vacant(slot) => slot.insert(Arc::clone(&entry)),
+            };
+        }
+        self.0.changed.notify_waiters();
+        Ok(RegistryLease {
+            registry: Arc::clone(&self.0),
+            key,
+            entry,
+        })
+    }
+
+    fn mark_closing(&self, entry: &RegistryEntry) {
+        entry.closing.store(true, Ordering::Release);
+        self.0.changed.notify_waiters();
     }
 }
 
-struct RegistryLease(Arc<RegistryInner>);
+struct RegistryLease {
+    registry: Arc<RegistryInner>,
+    key: (Uuid, i32),
+    entry: Arc<RegistryEntry>,
+}
 impl Drop for RegistryLease {
     fn drop(&mut self) {
-        self.0.active.fetch_sub(1, Ordering::AcqRel);
-        self.0.changed.notify_waiters();
+        {
+            let mut entries = self
+                .registry
+                .entries
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if entries
+                .get(&self.key)
+                .is_some_and(|entry| Arc::ptr_eq(entry, &self.entry))
+            {
+                entries.remove(&self.key);
+            }
+        }
+        self.registry.changed.notify_waiters();
     }
 }
 
@@ -90,6 +178,7 @@ struct SessionInner {
     closed: watch::Sender<Option<Outcome>>,
     outcome: Arc<Mutex<Option<Outcome>>>,
     failure: Mutex<Option<String>>,
+    registry_entry: Arc<RegistryEntry>,
 }
 
 pub struct ConnectionSession {
@@ -106,6 +195,18 @@ impl ConnectionSession {
         slot: OwnedSemaphorePermit,
     ) -> Result<Self> {
         let job = state.lifecycle.register("player session events")?;
+        let id = registration.id();
+        let registry = match state.sessions.enter(uuid, id) {
+            Ok(registry) => registry,
+            Err(error) => {
+                drop(registration);
+                drop(inventory);
+                drop(slot);
+                job.finish(Ok(()));
+                return Err(error);
+            }
+        };
+        let registry_entry = Arc::clone(&registry.entry);
         let outcome = Arc::new(Mutex::new(None));
         let resources = SessionResources {
             registration,
@@ -114,10 +215,9 @@ impl ConnectionSession {
             _completion: SessionCompletion {
                 outcome: Arc::clone(&outcome),
                 job: Some(job),
-                registry: Some(state.sessions.enter()),
+                registry: Some(registry),
             },
         };
-        let id = resources.registration.id();
         let (joined, _) = watch::channel(None);
         let (closed, _) = watch::channel(None);
         Ok(Self {
@@ -136,6 +236,7 @@ impl ConnectionSession {
                 closed,
                 outcome,
                 failure: Mutex::new(None),
+                registry_entry,
             }),
         })
     }
@@ -222,6 +323,7 @@ impl SessionInner {
             if phase.closing {
                 return;
             }
+            self.state.sessions.mark_closing(&self.registry_entry);
             phase.closing = true;
             phase.joining
         };
@@ -284,5 +386,152 @@ async fn wait_result(mut receiver: watch::Receiver<Option<Outcome>>) -> Outcome 
         if receiver.changed().await.is_err() {
             return Err("player event owner ended without completion".into());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{future::Future, pin::Pin, task::Poll, time::Duration};
+
+    async fn pending<F: Future>(mut future: Pin<&mut F>) {
+        std::future::poll_fn(|context| {
+            assert!(future.as_mut().poll(context).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+    }
+
+    async fn complete<F: Future>(future: F) -> F::Output {
+        tokio::time::timeout(Duration::from_secs(1), future)
+            .await
+            .expect("session registry did not observe resource release")
+    }
+
+    #[tokio::test]
+    async fn active_sessions_reject_duplicate_login_without_blocking_unrelated_identity() {
+        let registry = SessionRegistry::default();
+        let uuid = Uuid::from_u128(1);
+        let _active = registry.enter(uuid, 1).unwrap();
+        assert_eq!(
+            complete(registry.wait_for_login(uuid)).await,
+            LoginAdmission::Active
+        );
+        assert_eq!(
+            complete(registry.wait_for_login(Uuid::from_u128(2))).await,
+            LoginAdmission::Available
+        );
+    }
+
+    #[tokio::test]
+    async fn closing_login_and_global_drain_wait_for_the_final_resource_lease() {
+        let registry = SessionRegistry::default();
+        let uuid = Uuid::from_u128(1);
+        let owner = Arc::new(registry.enter(uuid, 1).unwrap());
+        let retained = Arc::clone(&owner);
+        let metadata = Arc::clone(&owner.entry);
+        registry.mark_closing(&metadata);
+        let mut login = Box::pin(registry.wait_for_login(uuid));
+        let mut drain = Box::pin(registry.drain());
+        pending(login.as_mut()).await;
+        pending(drain.as_mut()).await;
+        drop(owner);
+        pending(login.as_mut()).await;
+        pending(drain.as_mut()).await;
+        drop(retained);
+        assert_eq!(complete(login).await, LoginAdmission::Available);
+        complete(drain).await;
+    }
+
+    #[tokio::test]
+    async fn abandoning_a_login_waiter_does_not_release_the_closing_session() {
+        let registry = SessionRegistry::default();
+        let uuid = Uuid::from_u128(1);
+        let owner = registry.enter(uuid, 1).unwrap();
+        registry.mark_closing(&owner.entry);
+        let mut abandoned = Box::pin(registry.wait_for_login(uuid));
+        pending(abandoned.as_mut()).await;
+        drop(abandoned);
+        assert!(registry.enter(uuid, 1).is_err());
+        let mut next = Box::pin(registry.wait_for_login(uuid));
+        pending(next.as_mut()).await;
+        drop(owner);
+        assert_eq!(complete(next).await, LoginAdmission::Available);
+    }
+
+    #[tokio::test]
+    async fn releasing_an_older_generation_does_not_remove_a_newer_active_session() {
+        let registry = SessionRegistry::default();
+        let uuid = Uuid::from_u128(1);
+        let old = registry.enter(uuid, 1).unwrap();
+        let current = registry.enter(uuid, 2).unwrap();
+        registry.mark_closing(&old.entry);
+        assert_eq!(
+            complete(registry.wait_for_login(uuid)).await,
+            LoginAdmission::Active
+        );
+        drop(old);
+        assert_eq!(
+            complete(registry.wait_for_login(uuid)).await,
+            LoginAdmission::Active
+        );
+        registry.mark_closing(&current.entry);
+        let mut waiting = Box::pin(registry.wait_for_login(uuid));
+        pending(waiting.as_mut()).await;
+        drop(current);
+        assert_eq!(complete(waiting).await, LoginAdmission::Available);
+    }
+
+    #[tokio::test]
+    async fn duplicate_registration_cannot_replace_the_original_resource_fence() {
+        let registry = SessionRegistry::default();
+        let uuid = Uuid::from_u128(1);
+        let owner = registry.enter(uuid, 1).unwrap();
+        assert!(registry.enter(uuid, 1).is_err());
+        registry.mark_closing(&owner.entry);
+        let mut waiting = Box::pin(registry.wait_for_login(uuid));
+        pending(waiting.as_mut()).await;
+        drop(owner);
+        assert_eq!(complete(waiting).await, LoginAdmission::Available);
+        complete(registry.drain()).await;
+    }
+
+    #[tokio::test]
+    async fn a_retained_old_closing_marker_cannot_close_a_reused_key() {
+        let registry = SessionRegistry::default();
+        let uuid = Uuid::from_u128(1);
+        let old = registry.enter(uuid, 1).unwrap();
+        let marker = Arc::clone(&old.entry);
+        registry.mark_closing(&marker);
+        drop(old);
+        let current = registry.enter(uuid, 1).unwrap();
+        registry.mark_closing(&marker);
+        assert_eq!(
+            complete(registry.wait_for_login(uuid)).await,
+            LoginAdmission::Active
+        );
+        registry.mark_closing(&current.entry);
+        let mut waiting = Box::pin(registry.wait_for_login(uuid));
+        pending(waiting.as_mut()).await;
+        drop(current);
+        assert_eq!(complete(waiting).await, LoginAdmission::Available);
+    }
+
+    #[tokio::test]
+    async fn per_identity_release_does_not_wait_for_other_players_but_drain_does() {
+        let registry = SessionRegistry::default();
+        let uuid = Uuid::from_u128(1);
+        let closing = registry.enter(uuid, 1).unwrap();
+        let other = registry.enter(Uuid::from_u128(2), 2).unwrap();
+        registry.mark_closing(&closing.entry);
+        let mut login = Box::pin(registry.wait_for_login(uuid));
+        let mut drain = Box::pin(registry.drain());
+        pending(login.as_mut()).await;
+        pending(drain.as_mut()).await;
+        drop(closing);
+        assert_eq!(complete(login).await, LoginAdmission::Available);
+        pending(drain.as_mut()).await;
+        drop(other);
+        complete(drain).await;
     }
 }

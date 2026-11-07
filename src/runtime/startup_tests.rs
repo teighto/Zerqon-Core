@@ -202,11 +202,571 @@ async fn join_barrier_state(lifecycle: &Lifecycle) -> (tempfile::TempDir, Arc<St
     paired_barrier_state(lifecycle, 1).await
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires prepared 26.3 data, Java25 JoinBarrier and native-read Rust WASM fixtures"]
+async fn reconnect_waits_for_closing_session_after_java_quit_before_login_success() {
+    use crate::native_query_runtime::{
+        MAX_PROVIDER_WORKING_SET_BYTES, NativeAdmission, NativeBackend, NativePluginKey,
+        NativeProviderContract, NativeQueryRuntime, NativeScopeContext, WORKSPACE_BYTES,
+    };
+    use tokio::net::{TcpListener, TcpStream};
+    use zerqon_protocol::codec::{
+        get_string, get_varint, put_string, put_varint, read_frame, write_frame,
+    };
+
+    let lifecycle = Lifecycle::new();
+    let (directory, state) = join_barrier_state(&lifecycle).await;
+    let java_directory = directory.path().join("plugins/java-plugins");
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let guest = std::env::var_os("ZERQON_TEST_NATIVE_WASM").map_or_else(
+        || root.join(".cache/rust-plugin-fixtures/hello-native-read.wasm"),
+        std::path::PathBuf::from,
+    );
+    drop(
+        state
+            .plugins
+            .load(
+                "native-quit",
+                &std::fs::read(guest).expect("build the native-read Rust WASM fixture"),
+                &lifecycle.token(),
+                Instant::now() + Duration::from_secs(5),
+            )
+            .await
+            .unwrap(),
+    );
+    let uuid = Uuid::parse_str("34e0a659-c68d-35ad-bc0a-fc5378e6b5b9").unwrap();
+    let (outbound, _packets) = tokio::sync::mpsc::channel(32);
+    let (disconnect, _closed) = tokio::sync::watch::channel(false);
+    let slot = Arc::clone(&state.slots).acquire_owned().await.unwrap();
+    let player = state
+        .players
+        .reserve(
+            crate::players::Identity {
+                uuid,
+                name: "CONSOLE".into(),
+                properties: Vec::new(),
+            },
+            outbound,
+            disconnect,
+        )
+        .unwrap();
+    let old_id = player.id();
+    let inventory = state
+        .inventories
+        .as_ref()
+        .unwrap()
+        .open(uuid, old_id)
+        .await
+        .unwrap();
+    player.activate().unwrap();
+    let session = crate::player_session::ConnectionSession::new(
+        Arc::clone(&state),
+        uuid,
+        "CONSOLE".into(),
+        player,
+        inventory,
+        slot,
+    )
+    .unwrap();
+    std::fs::write(java_directory.join("join-release"), "release").unwrap();
+    session.join().await.unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut client = TcpStream::connect(listener.local_addr().unwrap())
+        .await
+        .unwrap();
+    client.set_nodelay(true).unwrap();
+    let (socket, _) = listener.accept().await.unwrap();
+    let mut handshake = vec![0];
+    put_varint(zerqon_protocol::PROTOCOL_VERSION, &mut handshake);
+    put_string("localhost", &mut handshake);
+    handshake.extend_from_slice(&listener.local_addr().unwrap().port().to_be_bytes());
+    handshake.push(2);
+    let mut hello = vec![0];
+    put_string("CONSOLE", &mut hello);
+    hello.extend_from_slice(&[0; 16]);
+    assert!(hello.len() > handshake.len());
+    write_frame(&mut client, &handshake, None).await.unwrap();
+    write_frame(&mut client, &hello, None).await.unwrap();
+    assert_eq!(state.packet_budget.snapshot().peak_bytes, 0);
+    let mut incoming = Box::pin(crate::connection::handle(socket, Arc::clone(&state)));
+
+    let queries = NativeQueryRuntime::new(
+        state.queries.clone(),
+        state.native_read_budget.clone(),
+        lifecycle.clone(),
+        NativeProviderContract::future_owned(MAX_PROVIDER_WORKING_SET_BYTES).unwrap(),
+    );
+    assert_eq!(state.native_read_budget.snapshot().reserved_bytes, 0);
+    let workspace_count = state.native_read_budget.snapshot().limit_bytes / WORKSPACE_BYTES;
+    let mut workspaces = Vec::with_capacity(workspace_count);
+    for index in 0..workspace_count {
+        workspaces.push(
+            queries
+                .try_scope(NativeScopeContext {
+                    key: NativePluginKey::new(
+                        NativeBackend::Wasm,
+                        &format!("reconnect-held-{index}"),
+                        1,
+                    )
+                    .unwrap(),
+                    parent_id: index as u64 + 1,
+                    deadline: Instant::now() + Duration::from_secs(30),
+                    stop: lifecycle.token().child(),
+                    admission: NativeAdmission::Normal,
+                })
+                .unwrap(),
+        );
+    }
+    let mut closing = tokio::spawn(async move { session.close().await });
+    let barrier = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let java_finished = std::fs::read_to_string(java_directory.join("join-counts"))
+                .is_ok_and(|counts| counts == "1:1");
+            if java_finished && state.plugins.stats().callbacks > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    let retained_before_login = state.players.query_snapshot(uuid);
+    let closing_was_pending = !closing.is_finished();
+    let slots_before_login = state.slots.available_permits();
+    let mut incoming_result = None;
+    let progress = tokio::time::timeout(
+        Duration::from_secs(5),
+        std::future::poll_fn(|context| match incoming.as_mut().poll(context) {
+            Poll::Ready(result) => {
+                incoming_result = Some(result);
+                Poll::Ready(())
+            }
+            Poll::Pending => {
+                let budget = state.packet_budget.snapshot();
+                if budget.peak_bytes >= hello.len() && budget.used_bytes == 0 {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            }
+        }),
+    )
+    .await;
+    let parsed = state.packet_budget.snapshot();
+    let waited_for_old_session = incoming_result.is_none();
+    let slots_while_waiting = state.slots.available_permits();
+    let retained_during_login = state.players.query_snapshot(uuid);
+
+    drop(workspaces);
+    let first_frame = if incoming_result.is_some() {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            read_frame(&mut client, 65_536, None),
+        )
+        .await
+    } else {
+        let mut reading = Box::pin(read_frame(&mut client, 65_536, None));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                biased;
+                frame = &mut reading => frame,
+                result = &mut incoming => {
+                    incoming_result = Some(result);
+                    (&mut reading).await
+                },
+            }
+        })
+        .await
+    };
+    let first_frame = first_frame
+        .map_err(|error| error.to_string())
+        .and_then(|frame| frame.map_err(|error| error.to_string()));
+    let first_login = first_frame.and_then(|packet| {
+        let mut body = packet.as_slice();
+        let id = get_varint(&mut body).map_err(|error| error.to_string())?;
+        let description = match id {
+            0 => {
+                let json = get_string(&mut body, 32767).map_err(|error| error.to_string())?;
+                serde_json::from_str::<serde_json::Value>(json)
+                    .map_err(|error| error.to_string())?
+                    .to_string()
+            }
+            3 => format!(
+                "compression={}",
+                get_varint(&mut body).map_err(|error| error.to_string())?
+            ),
+            other => return Err(format!("unexpected login packet {other}")),
+        };
+        if !body.is_empty() {
+            return Err("trailing login packet bytes".into());
+        }
+        Ok((id, description))
+    });
+    drop(client);
+    drop(incoming);
+    let close_result = tokio::time::timeout(Duration::from_secs(5), &mut closing).await;
+    if close_result.is_err() {
+        closing.abort();
+        let _ = closing.await;
+    }
+    let drained_sessions =
+        tokio::time::timeout(Duration::from_secs(5), state.sessions.drain()).await;
+    let remaining_player = state.players.query_snapshot(uuid);
+    let slots_after_cleanup = state.slots.available_permits();
+    let java_counts = std::fs::read_to_string(java_directory.join("join-counts"));
+    lifecycle.stop();
+    let java_shutdown = state.java.as_ref().unwrap().shutdown().await;
+    let rust_shutdown = state
+        .plugins
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await;
+    let rust_errors: Vec<_> = rust_shutdown
+        .iter()
+        .filter_map(|result| result.result.as_ref().err().map(ToString::to_string))
+        .collect();
+    drop(rust_shutdown);
+    let profiler_shutdown = state.profiler.shutdown().await;
+    let drained = lifecycle
+        .drain(Instant::now() + Duration::from_secs(5))
+        .await;
+    assert!(
+        barrier.is_ok(),
+        "Java Quit/Rust workspace barrier did not settle"
+    );
+    assert!(
+        closing_was_pending,
+        "old session cleanup already finished before reconnect"
+    );
+    assert!(matches!(retained_before_login, Ok(Some(ref player)) if player.id == old_id));
+    assert!(
+        progress.is_ok(),
+        "new login did not reach its admission boundary"
+    );
+    assert!(parsed.peak_bytes >= hello.len() && parsed.used_bytes == 0);
+    assert!(matches!(retained_during_login, Ok(Some(ref player)) if player.id == old_id));
+    assert!(
+        matches!(close_result, Ok(Ok(Ok(())))),
+        "old session close failed: {close_result:?}"
+    );
+    assert!(drained_sessions.is_ok(), "sessions did not drain");
+    assert!(
+        matches!(remaining_player, Ok(None)),
+        "registration survived cleanup: {remaining_player:?}"
+    );
+    assert_eq!(slots_after_cleanup, state.properties.max_players);
+    assert_eq!(java_counts.unwrap(), "1:1");
+    assert!(
+        java_shutdown
+            .unwrap()
+            .iter()
+            .all(|result| result.error.is_none())
+    );
+    assert!(
+        rust_errors.is_empty(),
+        "Rust Disable failed: {rust_errors:?}"
+    );
+    assert!(profiler_shutdown.is_ok());
+    assert!(drained.is_ok(), "lifecycle did not drain: {drained:?}");
+    assert_eq!(slots_before_login, state.properties.max_players - 1);
+    assert_eq!(slots_while_waiting, slots_before_login);
+    assert!(
+        waited_for_old_session,
+        "login finished while old Rust Quit was held: {first_login:?}; handler={incoming_result:?}"
+    );
+    assert!(
+        matches!(first_login, Ok((3, _))),
+        "reconnect did not enter login after cleanup: {first_login:?}"
+    );
+}
+
 async fn paired_barrier_state(
     lifecycle: &Lifecycle,
     expected_pairs: usize,
 ) -> (tempfile::TempDir, Arc<State>) {
     paired_barrier_state_with_timeout(lifecycle, expected_pairs, Duration::from_secs(5)).await
+}
+
+#[derive(Clone, Copy)]
+enum RetainedReconnectEnd {
+    Deadline,
+    Stop,
+    Active,
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires prepared 26.3 data and Java25 JoinBarrier fixture"]
+async fn reconnect_deadline_keeps_closed_session_resources_and_does_not_take_a_slot() {
+    retained_resources_reconnect(RetainedReconnectEnd::Deadline).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires prepared 26.3 data and Java25 JoinBarrier fixture"]
+async fn stopping_reconnect_wait_does_not_release_closed_session_resources() {
+    retained_resources_reconnect(RetainedReconnectEnd::Stop).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires prepared 26.3 data and Java25 JoinBarrier fixture"]
+async fn active_session_duplicate_login_is_rejected_without_replacement() {
+    retained_resources_reconnect(RetainedReconnectEnd::Active).await;
+}
+
+async fn retained_resources_reconnect(end: RetainedReconnectEnd) {
+    use tokio::net::{TcpListener, TcpStream};
+    use zerqon_protocol::codec::{
+        get_string, get_varint, put_string, put_varint, read_frame, write_frame,
+    };
+
+    let lifecycle = Lifecycle::new();
+    let (directory, mut state) = join_barrier_state(&lifecycle).await;
+    Arc::get_mut(&mut state)
+        .unwrap()
+        .settings
+        .connection_timeout_seconds = 1;
+    let java_directory = directory.path().join("plugins/java-plugins");
+    let uuid = Uuid::parse_str("34e0a659-c68d-35ad-bc0a-fc5378e6b5b9").unwrap();
+    let (outbound, _packets) = tokio::sync::mpsc::channel(32);
+    let (disconnect, _closed) = tokio::sync::watch::channel(false);
+    let slot = Arc::clone(&state.slots).acquire_owned().await.unwrap();
+    let player = state
+        .players
+        .reserve(
+            crate::players::Identity {
+                uuid,
+                name: "CONSOLE".into(),
+                properties: Vec::new(),
+            },
+            outbound,
+            disconnect,
+        )
+        .unwrap();
+    let old_id = player.id();
+    let inventory = state
+        .inventories
+        .as_ref()
+        .unwrap()
+        .open(uuid, old_id)
+        .await
+        .unwrap();
+    player.activate().unwrap();
+    let session = crate::player_session::ConnectionSession::new(
+        Arc::clone(&state),
+        uuid,
+        "CONSOLE".into(),
+        player,
+        inventory,
+        slot,
+    )
+    .unwrap();
+    let retained = session.resources();
+    std::fs::write(java_directory.join("join-release"), "release").unwrap();
+    session.join().await.unwrap();
+    if !matches!(end, RetainedReconnectEnd::Active) {
+        session.close().await.unwrap();
+    }
+    let java_counts_before_login = std::fs::read_to_string(java_directory.join("join-counts"));
+    let mut pending_drain = Box::pin(state.sessions.drain());
+    let resources_still_registered = std::future::poll_fn(|context| {
+        Poll::Ready(pending_drain.as_mut().poll(context).is_pending())
+    })
+    .await;
+    drop(pending_drain);
+    let slots_before_login = state.slots.available_permits();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut client = TcpStream::connect(listener.local_addr().unwrap())
+        .await
+        .unwrap();
+    client.set_nodelay(true).unwrap();
+    let (socket, _) = listener.accept().await.unwrap();
+    let mut handshake = vec![0];
+    put_varint(zerqon_protocol::PROTOCOL_VERSION, &mut handshake);
+    put_string("localhost", &mut handshake);
+    handshake.extend_from_slice(&listener.local_addr().unwrap().port().to_be_bytes());
+    handshake.push(2);
+    let mut hello = vec![0];
+    put_string("CONSOLE", &mut hello);
+    hello.extend_from_slice(&[0; 16]);
+    assert!(hello.len() > handshake.len());
+    write_frame(&mut client, &handshake, None).await.unwrap();
+    write_frame(&mut client, &hello, None).await.unwrap();
+    assert_eq!(state.packet_budget.snapshot().peak_bytes, 0);
+    let mut incoming = Box::pin(crate::connection::handle(socket, Arc::clone(&state)));
+    let started = Instant::now();
+    let mut incoming_result = None;
+    let progress = tokio::time::timeout(
+        Duration::from_secs(5),
+        std::future::poll_fn(|context| match incoming.as_mut().poll(context) {
+            Poll::Ready(result) => {
+                incoming_result = Some(result);
+                Poll::Ready(())
+            }
+            Poll::Pending => {
+                let budget = state.packet_budget.snapshot();
+                if budget.peak_bytes >= hello.len() && budget.used_bytes == 0 {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            }
+        }),
+    )
+    .await;
+    let parsed = state.packet_budget.snapshot();
+    let waited = incoming_result.is_none();
+    let slots_while_waiting = state.slots.available_permits();
+    let mut stop_completed = true;
+    if matches!(end, RetainedReconnectEnd::Stop) {
+        lifecycle.stop();
+        if incoming_result.is_none() {
+            match tokio::time::timeout(Duration::from_secs(5), &mut incoming).await {
+                Ok(result) => incoming_result = Some(result),
+                Err(_) => stop_completed = false,
+            }
+        }
+    }
+    let first_frame = if incoming_result.is_some() || !stop_completed {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            read_frame(&mut client, 65_536, None),
+        )
+        .await
+    } else {
+        let mut reading = Box::pin(read_frame(&mut client, 65_536, None));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                biased;
+                frame = &mut reading => frame,
+                result = &mut incoming => {
+                    incoming_result = Some(result);
+                    (&mut reading).await
+                },
+            }
+        })
+        .await
+    };
+    let elapsed = started.elapsed();
+    let first_read_completed = first_frame.is_ok();
+    let first_frame = first_frame
+        .map_err(|error| error.to_string())
+        .and_then(|frame| frame.map_err(|error| error.to_string()));
+    let first_login = first_frame.and_then(|packet| {
+        let mut body = packet.as_slice();
+        let id = get_varint(&mut body).map_err(|error| error.to_string())?;
+        if id != 0 {
+            return Err(format!("unexpected login packet {id}"));
+        }
+        let json = get_string(&mut body, 32767).map_err(|error| error.to_string())?;
+        let reason = serde_json::from_str::<serde_json::Value>(json)
+            .map_err(|error| error.to_string())?
+            .to_string();
+        if !body.is_empty() {
+            return Err("trailing login-disconnect data".into());
+        }
+        Ok(reason)
+    });
+    let stopped_login = matches!(&incoming_result, Some(Err(error)) if crate::managed_tasks::is_cancelled(error.as_ref()));
+    let retained_after_end = state.players.query_snapshot(uuid);
+    let slots_after_end = state.slots.available_permits();
+    drop(client);
+    drop(incoming);
+    let close_result = session.close().await;
+    drop(session);
+    let retained_after_close = state.players.query_snapshot(uuid);
+    drop(retained);
+    let session_drain = tokio::time::timeout(Duration::from_secs(5), state.sessions.drain()).await;
+    let remaining = state.players.query_snapshot(uuid);
+    let free_slots = state.slots.available_permits();
+    let java_counts = std::fs::read_to_string(java_directory.join("join-counts"));
+    lifecycle.stop();
+    let java_shutdown = state.java.as_ref().unwrap().shutdown().await;
+    let rust_shutdown = state
+        .plugins
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await;
+    let rust_errors: Vec<_> = rust_shutdown
+        .iter()
+        .filter_map(|result| result.result.as_ref().err().map(ToString::to_string))
+        .collect();
+    drop(rust_shutdown);
+    let profiler_shutdown = state.profiler.shutdown().await;
+    let drain = lifecycle
+        .drain(Instant::now() + Duration::from_secs(5))
+        .await;
+
+    assert!(
+        resources_still_registered,
+        "session.close returned but its held resources lost their registration"
+    );
+    assert!(
+        progress.is_ok(),
+        "login did not reach its admission boundary"
+    );
+    assert!(parsed.peak_bytes >= hello.len() && parsed.used_bytes == 0);
+    assert_eq!(slots_before_login, state.properties.max_players - 1);
+    assert_eq!(slots_while_waiting, slots_before_login);
+    assert!(matches!(retained_after_end, Ok(Some(ref player)) if player.id == old_id));
+    assert_eq!(slots_after_end, slots_before_login);
+    assert!(
+        close_result.is_ok(),
+        "old session close failed: {close_result:?}"
+    );
+    assert!(matches!(retained_after_close, Ok(Some(ref player)) if player.id == old_id));
+    assert!(session_drain.is_ok());
+    assert!(matches!(remaining, Ok(None)));
+    assert_eq!(free_slots, state.properties.max_players);
+    assert_eq!(java_counts.unwrap(), "1:1");
+    assert!(
+        java_shutdown
+            .unwrap()
+            .iter()
+            .all(|result| result.error.is_none())
+    );
+    assert!(
+        rust_errors.is_empty(),
+        "Rust Disable failed: {rust_errors:?}"
+    );
+    assert!(profiler_shutdown.is_ok());
+    assert!(drain.is_ok(), "lifecycle did not drain: {drain:?}");
+    match end {
+        RetainedReconnectEnd::Deadline => {
+            assert_eq!(java_counts_before_login.unwrap(), "1:1");
+            assert!(
+                waited,
+                "closed notification bypassed the final resource fence: {first_login:?}"
+            );
+            assert!(
+                elapsed >= Duration::from_secs(1),
+                "login did not wait for its configured deadline: {elapsed:?}"
+            );
+            assert!(
+                first_login
+                    .as_ref()
+                    .is_ok_and(|reason| reason.contains("closing")),
+                "unclear deadline refusal: {first_login:?}"
+            );
+        }
+        RetainedReconnectEnd::Stop => {
+            assert_eq!(java_counts_before_login.unwrap(), "1:1");
+            assert!(waited, "login did not wait on held resources before stop");
+            assert!(
+                stop_completed && stopped_login,
+                "global stop did not cancel login: {incoming_result:?}"
+            );
+            assert!(
+                first_read_completed && first_login.is_err(),
+                "stopped login unexpectedly received a response: {first_login:?}"
+            );
+        }
+        RetainedReconnectEnd::Active => {
+            assert!(
+                first_login
+                    .as_ref()
+                    .is_ok_and(|reason| reason.contains("already connected")),
+                "active identity was not rejected: {first_login:?}"
+            );
+        }
+    }
 }
 
 async fn paired_barrier_state_with_timeout(

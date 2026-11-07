@@ -3,7 +3,8 @@ use crate::{
     auth::{self, CipherReader, CipherWriter, VerifiedProfile},
     packets,
     player_inventory::InventoryHandle,
-    players::{Identity, PacketBatch, PlayerHandle, Position},
+    player_session::LoginAdmission,
+    players::{Identity, PacketBatch, PlayerError, PlayerHandle, Position},
     runtime::{BlockInteraction, CommandSource, State, World},
     world_view,
 };
@@ -14,7 +15,7 @@ use tokio::{
     net::TcpStream,
     sync::{mpsc, watch},
     task::JoinHandle,
-    time::{Instant, timeout},
+    time::{Instant, timeout, timeout_at},
 };
 use uuid::Uuid;
 #[cfg(test)]
@@ -177,6 +178,29 @@ pub async fn handle(socket: TcpStream, state: Arc<State>) -> Result<()> {
             properties: Vec::new(),
         }
     };
+    let stop = state.lifecycle.token();
+    let admission_deadline = Instant::now() + deadline;
+    let admission = tokio::select! {
+        biased;
+        _ = stop.cancelled() => return Err(crate::lifecycle::Stopped.into()),
+        result = timeout_at(admission_deadline, state.sessions.wait_for_login(profile.uuid)) => {
+            match result {
+                Ok(admission) => admission,
+                Err(_) => return login_disconnect(&mut writer, "Previous connection is still closing; please try again").await,
+            }
+        },
+    };
+    stop.check()?;
+    if Instant::now() >= admission_deadline {
+        return login_disconnect(
+            &mut writer,
+            "Previous connection is still closing; please try again",
+        )
+        .await;
+    }
+    if matches!(admission, LoginAdmission::Active) {
+        return login_disconnect(&mut writer, &PlayerError::Duplicate.to_string()).await;
+    }
     let Ok(slot) = Arc::clone(&state.slots).try_acquire_owned() else {
         return login_disconnect(&mut writer, "The server is full").await;
     };

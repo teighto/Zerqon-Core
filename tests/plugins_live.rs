@@ -135,7 +135,16 @@ impl Client {
             write_frame(&mut socket, &hello, None).await.unwrap();
             let compression = read_frame(&mut socket, 65536, None).await.unwrap();
             let mut bytes = compression.as_slice();
-            assert_eq!(get_varint(&mut bytes).unwrap(), 3);
+            let id = get_varint(&mut bytes).unwrap();
+            if id == 0 {
+                let reason =
+                    get_string(&mut bytes, 32767).expect("invalid login-disconnect string");
+                let reason: serde_json::Value =
+                    serde_json::from_str(reason).expect("invalid login-disconnect JSON");
+                assert!(bytes.is_empty(), "trailing login-disconnect data");
+                panic!("login rejected for {username}: {reason}");
+            }
+            assert_eq!(id, 3, "unexpected first login packet for {username}");
             let threshold = get_varint(&mut bytes).unwrap() as usize;
             let mut client = Self {
                 socket,
