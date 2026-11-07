@@ -26,6 +26,10 @@ for name in ("wasmi", "wasmi_core", "wasmi_ir", "wasmi_collections"):
     FALLBACKS[(name, "2.0.0")] = ("wasmi-labs/wasmi", "2970aa871cc1001b57b267ccecdcd1e42306199e", "LICENSE-MIT", "172bc1497507c1c363496bc23b0f16de8fa8e94befa85db6c8d9fa790e0a8657")
 
 GSON = ("google/gson", "686fad782d969d8f15c7581a5435a208b810caa7", "LICENSE", "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30")
+MUSL_RUNTIME = (
+    "https://git.musl-libc.org/cgit/musl/plain/COPYRIGHT?id=0784374d561435f7c787a555aeab8ede699ed298",
+    "f9bc4423732350eb0b3f7ed7e91d530298476f8fec0c6c427a1c04ade22655af",
+)
 LICENSE_NAME = re.compile(r"^(LICENSE|LICENCE|COPYING|NOTICE|COPYRIGHT)([._-]|$)", re.I)
 
 
@@ -34,6 +38,12 @@ def fetched_document(pin, cache):
     if not re.fullmatch(r"[0-9a-f]{40}", revision):
         raise ValueError("Fallback must use a commit revision")
     url = f"https://raw.githubusercontent.com/{repository}/{revision}/{name}"
+    return fetched_url(url, digest, cache)
+
+
+def fetched_url(url, digest, cache):
+    if not url.startswith("https://") or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise ValueError("License source must use HTTPS and a pinned SHA-256")
     cached = cache / f"{digest}.txt"
     data = cached.read_bytes() if cached.is_file() else b""
     if hashlib.sha256(data).hexdigest() != digest:
@@ -42,7 +52,7 @@ def fetched_document(pin, cache):
                 raise ValueError("License download redirected away from HTTPS")
             data = response.read(4 * 1024 * 1024 + 1)
         if len(data) > 4 * 1024 * 1024 or hashlib.sha256(data).hexdigest() != digest:
-            raise ValueError(f"License checksum mismatch: {repository}/{name}")
+            raise ValueError(f"License checksum mismatch: {url}")
         cache.mkdir(parents=True, exist_ok=True)
         cached.write_bytes(data)
     return url, data.decode("utf-8")
@@ -103,7 +113,9 @@ def generate(metadata, cache):
         count += 1
     name, content = fetched_document(GSON, cache)
     sections.append(f"\n{'=' * 78}\nGoogle Gson 2.13.2\nDeclared license: Apache-2.0\nUpstream: https://github.com/google/gson\n\n--- {name} ---\n{content}")
-    return "".join(sections), count + 1
+    name, content = fetched_url(*MUSL_RUNTIME, cache)
+    sections.append(f"\n{'=' * 78}\nmusl libc 1.2.5 (Linux release C runtime)\nDeclared license: MIT and notices below\nBundled by Rust 1.97.0 with Rust-maintained fixes.\nToolchain source: https://github.com/rust-lang/rust/blob/1.97.0/src/ci/docker/scripts/musl.sh\n\n--- {name} ---\n{content}")
+    return "".join(sections), count + 2
 
 
 def main():

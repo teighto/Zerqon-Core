@@ -99,6 +99,7 @@ impl Client {
         };
         assert_eq!(client.read().await[0], 2);
         client.send(&[3]).await;
+        assert_eq!(client.read().await, b"\x01\x10horizon:mod_list\x00");
         let mut known = client.read().await;
         assert_eq!(known[0], 15);
         known[0] = 7;

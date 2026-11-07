@@ -86,6 +86,12 @@ async fn offline_login_configuration_chunks_commands_and_shutdown() {
     write_frame(&mut socket, &[3], Some(threshold))
         .await
         .unwrap();
+    assert_eq!(
+        read_frame(&mut socket, 65536, Some(threshold))
+            .await
+            .unwrap(),
+        b"\x01\x10horizon:mod_list\x00"
+    );
     let known = read_frame(&mut socket, 65536, Some(threshold))
         .await
         .unwrap();

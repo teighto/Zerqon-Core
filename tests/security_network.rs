@@ -267,6 +267,10 @@ async fn offline_join_claimed(
     assert_eq!(success[0], 2);
     let actual = uuid::Uuid::from_slice(&success[1..17]).unwrap();
     write_frame(socket, &[3], None).await.unwrap();
+    assert_eq!(
+        read_frame(socket, 65_536, None).await.unwrap(),
+        b"\x01\x10horizon:mod_list\x00"
+    );
     let mut known = read_frame(socket, 65_536, None).await.unwrap();
     assert_eq!(known[0], 15);
     known[0] = 7;

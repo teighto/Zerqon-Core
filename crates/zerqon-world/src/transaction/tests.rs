@@ -95,6 +95,7 @@ fn reset(disk: &Disk) {
 fn store(db: Database) -> Transactions {
     Transactions {
         db,
+        world_uuid: Uuid::new_v4(),
         token_owner: Uuid::new_v4(),
         policy: GenerationPolicy::NativeFlat,
         failed: AtomicBool::new(false),

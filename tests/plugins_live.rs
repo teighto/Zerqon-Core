@@ -24,6 +24,8 @@ fn server_executable() -> PathBuf {
 
 impl Server {
     fn start(directory: &Path, data: &Path) -> (Self, String) {
+        let data =
+            std::env::var_os("ZERQON_TEST_DATA").map_or_else(|| data.to_owned(), PathBuf::from);
         let mut server = Self(
             Command::new(server_executable())
                 .args([
@@ -128,6 +130,13 @@ impl Client {
             client.uuid = Uuid::from_slice(&success[1..17]).unwrap();
             client.send(&[3]).await;
             let mut known = client.read().await;
+            if known.first() == Some(&1) {
+                let mut probe = vec![1];
+                put_string("horizon:mod_list", &mut probe);
+                probe.push(0);
+                assert_eq!(known, probe);
+                known = client.read().await;
+            }
             assert_eq!(known[0], 15);
             known[0] = 7;
             client.send(&known).await;
@@ -137,6 +146,8 @@ impl Client {
                 }
             }
             client.send(&[3]).await;
+            client.pending.clear();
+            client.observed.clear();
             let mut chunks = Vec::new();
             let mut login = false;
             let mut teleported = false;
@@ -233,16 +244,21 @@ impl Client {
     }
 
     async fn reply(&mut self, command: &str, expected: &str) {
+        let text = self.response(command).await;
+        assert!(
+            text.contains(expected),
+            "command /{command}: expected {expected:?}, received {text:?}"
+        );
+    }
+
+    async fn response(&mut self, command: &str) -> String {
         self.command(command).await;
         let packet = self.until(|packet| packet[0] == 124).await;
         let mut body = &packet[1..];
         assert_eq!(take(&mut body, 1).unwrap(), &[8]);
         let length = u16::from_be_bytes(take(&mut body, 2).unwrap().try_into().unwrap()) as usize;
         let text = std::str::from_utf8(take(&mut body, length).unwrap()).unwrap();
-        assert!(
-            text.contains(expected),
-            "command /{command}: expected {expected:?}, received {text:?}"
-        );
+        text.to_owned()
     }
 
     async fn move_to(&mut self, position: [f64; 3], yaw: f32, pitch: f32) {
@@ -273,6 +289,131 @@ impl Client {
             .await;
         mob_spawn(&packet).unwrap()
     }
+}
+
+fn install_read_model_probes(directory: &Path, root: &Path) {
+    let libraries = directory.join("libraries/paper");
+    fs::create_dir_all(&libraries).unwrap();
+    for entry in fs::read_dir(root.join("libraries/paper")).unwrap() {
+        let entry = entry.unwrap();
+        if entry
+            .path()
+            .extension()
+            .is_some_and(|extension| extension == "jar")
+        {
+            fs::copy(entry.path(), libraries.join(entry.file_name())).unwrap();
+        }
+    }
+    for index in 0..2 {
+        let path = directory.join(format!("plugins/java-plugins/reader-{index}.jar"));
+        let mut jar = zip::ZipWriter::new(fs::File::create(path).unwrap());
+        let options = zip::write::SimpleFileOptions::default();
+        jar.start_file("plugin.yml", options).unwrap();
+        let permissions = if index == 0 {
+            "permissions:\n  native.public:\n    default: true\n  native.operator:\n    default: op\n"
+        } else {
+            ""
+        };
+        jar.write_all(format!("name: ReadProbe{index}\nversion: 1\nmain: io.github.teighto.zerqon.fixtures.ReadOnlyPaperProbe\napi-version: '26.3'\ncommands:\n  read{index}:\n    permission: native.public\n{permissions}").as_bytes()).unwrap();
+        let class = "io/github/teighto/zerqon/fixtures/ReadOnlyPaperProbe.class";
+        jar.start_file(class, options).unwrap();
+        jar.write_all(&fs::read(root.join("target/paper-bridge/fixtures").join(class)).unwrap())
+            .unwrap();
+        jar.finish().unwrap();
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires prepared 26.3 data, Java25 Paper probes and Rust WASM example"]
+async fn paper_read_models_observe_real_players_worlds_and_once_only_join_quit_events() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let directory = tempfile::tempdir().unwrap();
+    setup(directory.path(), &root);
+    install_read_model_probes(directory.path(), &root);
+    let data = std::env::var_os("ZERQON_TEST_DATA")
+        .map_or_else(|| root.join(".cache/vanilla/26.3"), PathBuf::from);
+    let (mut server, address) = Server::start(directory.path(), &data);
+    let (mut operator, _) = Client::join(&address, "LiveOp").await;
+    let (mut ordinary, _) = Client::join(&address, "CONSOLE").await;
+    for command in ["read0", "read1"] {
+        operator
+            .reply(
+                command,
+                &format!(
+                    "{}:{}:LiveOp:true:true:true:true:world:-64:320:0.5",
+                    operator.uuid, operator.entity_id
+                ),
+            )
+            .await;
+        ordinary
+            .reply(
+                command,
+                &format!(
+                    "{}:{}:CONSOLE:true:false:true:false:world:-64:320:0.5",
+                    ordinary.uuid, ordinary.entity_id
+                ),
+            )
+            .await;
+        operator.reply(&format!("{command} counts"), "2:0").await;
+    }
+    operator.move_to([4.25, 70.0, 1.5], 90.0, -15.0).await;
+    operator
+        .reply(
+            "read0",
+            &format!(
+                "{}:{}:LiveOp:true:true:true:true:world:-64:320:4.25",
+                operator.uuid, operator.entity_id
+            ),
+        )
+        .await;
+    operator
+        .reply(
+            &format!("read0 other-message {}", ordinary.uuid),
+            "other message rejected",
+        )
+        .await;
+    ordinary.reply("read0 lookup Li", "LiveOp").await;
+    let world = operator.response("read0 world").await;
+    let world_uuid = Uuid::parse_str(world.split(':').next().unwrap()).unwrap();
+    assert!(!world_uuid.is_nil());
+    assert!(
+        world.contains(":minecraft:overworld:NORMAL:-64:320:0.0:64.0:0.0:0.0:0.0"),
+        "{world}"
+    );
+    let departed_uuid = ordinary.uuid;
+    let departed_entity = ordinary.entity_id;
+    drop(ordinary);
+    let started = std::time::Instant::now();
+    loop {
+        let counts = operator.response("read0 counts").await;
+        if counts == "2:1" {
+            break;
+        }
+        assert!(started.elapsed() < Duration::from_secs(5), "{counts}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    operator.reply("read1 counts", "2:1").await;
+    let (mut rejoined, _) = Client::join(&address, "CONSOLE").await;
+    assert_eq!(rejoined.uuid, departed_uuid);
+    assert_ne!(rejoined.entity_id, departed_entity);
+    for command in ["read0", "read1"] {
+        rejoined
+            .reply(
+                &format!("{command} previous"),
+                &format!("true:false:true:false:{departed_entity}"),
+            )
+            .await;
+        operator.reply(&format!("{command} counts"), "3:1").await;
+    }
+    drop(rejoined);
+    drop(operator);
+    server.stop().await;
+    let (mut restarted, address) = Server::start(directory.path(), &data);
+    let (mut reader, _) = Client::join(&address, "LiveOp").await;
+    assert_eq!(reader.response("read0 world").await, world);
+    reader.reply("read0 counts", "1:0").await;
+    drop(reader);
+    restarted.stop().await;
 }
 
 fn setup(directory: &Path, root: &Path) {
@@ -913,10 +1054,16 @@ async fn two_clients_replicate_tab_entities_motion_visibility_and_departures() {
         .until(|packet| spawned_entity(packet) == Some((first_id, first_uuid)))
         .await;
     drop(second);
-    first.until(|packet| removes_tab(packet, second_uuid)).await;
-    first
-        .until(|packet| removes_entity(packet, second_id))
-        .await;
+    let mut entity_removed = false;
+    let mut tab_removed = false;
+    for _ in 0..2 {
+        let packet = first
+            .until(|packet| removes_entity(packet, second_id) || removes_tab(packet, second_uuid))
+            .await;
+        entity_removed |= removes_entity(&packet, second_id);
+        tab_removed |= removes_tab(&packet, second_uuid);
+    }
+    assert!(entity_removed && tab_removed);
     first.reply("list", "Players (1): CONSOLE").await;
     let reconnect_mark = first.observed.len();
     let (mut reconnected, _) = Client::join(&address, "Peer").await;

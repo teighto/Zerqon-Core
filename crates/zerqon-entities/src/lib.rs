@@ -5,6 +5,7 @@ use std::{
 };
 use uuid::Uuid;
 mod physics;
+pub use physics::{Movement, PhysicsError, body_bounds, clip_motion, clip_shapes, move_mob};
 
 pub const TICKS_PER_SECOND: u32 = 20;
 const MAX_ENTITIES: usize = 10_000;
@@ -19,6 +20,9 @@ pub enum MobKind {
 }
 
 impl MobKind {
+    pub fn step_height(self) -> f32 {
+        0.6
+    }
     pub fn dimensions(self) -> [f64; 2] {
         match self {
             Self::Pig => [f64::from(0.9_f32), f64::from(0.9_f32)],
@@ -77,10 +81,29 @@ pub struct PlayerTarget {
 
 pub trait WorldQuery {
     fn block_solid(&self, x: i32, y: i32, z: i32) -> bool;
+    fn block_collision(&self, x: i32, y: i32, z: i32) -> BlockCollision<'_> {
+        if self.block_solid(x, y, z) {
+            BlockCollision::Full
+        } else {
+            BlockCollision::Empty
+        }
+    }
     fn surface_y(&self, x: i32, z: i32) -> Option<i32>;
+    fn surface_height(&self, x: i32, z: i32) -> Option<f64> {
+        self.surface_y(x, z).map(f64::from)
+    }
     fn loaded_at(&self, _x: i32, _z: i32) -> bool {
         true
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum BlockCollision<'a> {
+    Empty,
+    Full,
+    Static(&'a [zerqon_blocks::Aabb]),
+    Unavailable,
+    Unsupported,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -92,6 +115,10 @@ pub enum RemovalReason {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum EntityChange {
+    PhysicsBlocked {
+        id: i32,
+        reason: PhysicsError,
+    },
     Spawned(Mob),
     Moved {
         id: i32,
@@ -118,6 +145,8 @@ pub enum EntityChange {
 
 #[derive(Debug, thiserror::Error)]
 pub enum EntityError {
+    #[error(transparent)]
+    Physics(#[from] PhysicsError),
     #[error("invalid entity input: {0}")]
     Invalid(&'static str),
     #[error("entity capacity reached")]
@@ -137,6 +166,8 @@ pub struct EntityWorld {
     entities: BTreeMap<i32, Mob>,
     identities: HashSet<Uuid>,
     buckets: BTreeMap<(i32, i32), BTreeSet<i32>>,
+    physics: physics::Scratch,
+    blocked: BTreeMap<i32, PhysicsError>,
 }
 impl EntityWorld {
     pub fn new(seed: u64, capacity: usize) -> Result<Self, EntityError> {
@@ -150,6 +181,8 @@ impl EntityWorld {
             entities: BTreeMap::new(),
             identities: HashSet::new(),
             buckets: BTreeMap::new(),
+            physics: physics::Scratch::default(),
+            blocked: BTreeMap::new(),
         })
     }
     pub fn spawn(
@@ -169,7 +202,7 @@ impl EntityWorld {
         if self.len() == self.capacity {
             return Err(EntityError::Capacity);
         }
-        if !self.spawn_space(position, kind, world) {
+        if !self.spawn_space(position, kind, world)? {
             return Err(EntityError::Collision);
         }
         let mob = Mob {
@@ -202,7 +235,13 @@ impl EntityWorld {
             ) {
                 continue;
             }
+            if mob.position[1] < -80.0 {
+                void.push(mob.id);
+                continue;
+            }
             let old = (mob.position, mob.yaw, mob.on_ground);
+            let before = mob.clone();
+            let random_before = self.random_state;
             mob.attack_cooldown = mob.attack_cooldown.saturating_sub(1);
             let target = if mob.kind == MobKind::Zombie {
                 nearest_player(mob.position, &targets)
@@ -248,23 +287,37 @@ impl EntityWorld {
                 mob.yaw = (-dx).atan2(dz).to_degrees() as f32;
             }
             mob.velocity[1] = (mob.velocity[1] - 0.08).max(-3.92);
-            if !physics::overlaps(mob.position, mob.kind, world) {
-                let movement = mob.velocity;
-                let (next, hit) = physics::move_body(mob.position, mob.kind, movement, world);
-                mob.position = next;
-                mob.on_ground = movement[1] < 0.0 && hit[1];
-                for (axis, collided) in hit.into_iter().enumerate() {
-                    if collided {
-                        mob.velocity[axis] = 0.0;
+            match physics::move_with_scratch(
+                mob.position,
+                mob.kind,
+                mob.velocity,
+                mob.on_ground,
+                world,
+                &mut self.physics,
+            ) {
+                Ok(movement) => {
+                    self.blocked.remove(&mob.id);
+                    let hit = movement.collided;
+                    mob.position = movement.position;
+                    mob.on_ground = movement.on_ground;
+                    for (axis, collided) in hit.into_iter().enumerate() {
+                        if collided {
+                            mob.velocity[axis] = 0.0;
+                        }
+                    }
+                    mob.velocity[1] *= 0.98;
+                    if hit[0] || hit[2] {
+                        mob.wander_ticks = 0;
                     }
                 }
-                mob.velocity[1] *= 0.98;
-                if hit[0] || hit[2] {
-                    mob.wander_ticks = 0;
+                Err(reason) => {
+                    *mob = before;
+                    self.random_state = random_before;
+                    if self.blocked.insert(mob.id, reason) != Some(reason) {
+                        changes.push(EntityChange::PhysicsBlocked { id: mob.id, reason });
+                    }
+                    continue;
                 }
-            } else {
-                mob.velocity = [0.0; 3];
-                mob.on_ground = false;
             }
             if bucket(old.0) != bucket(mob.position) {
                 moved_buckets.push((mob.id, bucket(old.0), bucket(mob.position)));
@@ -280,7 +333,7 @@ impl EntityWorld {
                 target_eye[1] += 1.62;
                 if mob.attack_cooldown == 0
                     && distance_squared(mob.position, player.position) <= 3.24
-                    && line_clear(eye, target_eye, world)
+                    && physics::line_clear(eye, target_eye, world)
                 {
                     changes.push(EntityChange::AttackPlayer {
                         attacker: mob.id,
@@ -337,7 +390,7 @@ impl EntityWorld {
         eye[1] += 1.62;
         let mut target = mob.position;
         target[1] += mob.kind.dimensions()[1] * 0.5;
-        line_clear(eye, target, world)
+        physics::line_clear(eye, target, world)
     }
     pub fn remove(&mut self, id: i32) -> Result<EntityChange, EntityError> {
         self.remove_with_reason(id, RemovalReason::Explicit)
@@ -445,15 +498,14 @@ impl EntityWorld {
             let z = player.position[2].floor() as i32
                 + (random(&mut self.random_state) % 97) as i32
                 - 48;
-            let Some(y) = world.surface_y(x, z) else {
+            let Some(y) = world.surface_height(x, z) else {
                 continue;
             };
-            let position = [f64::from(x) + 0.5, f64::from(y), f64::from(z) + 0.5];
+            let position = [f64::from(x) + 0.5, y, f64::from(z) + 0.5];
             if !valid_position(position)
                 || players
                     .iter()
                     .any(|player| distance_squared(position, player.position) < 24.0 * 24.0)
-                || !world.block_solid(x, y.saturating_sub(1), z)
             {
                 continue;
             }
@@ -462,7 +514,21 @@ impl EntityWorld {
                 1 => MobKind::Cow,
                 _ => MobKind::Zombie,
             };
-            if !self.spawn_space(position, kind, world) {
+            match self.spawn_space(position, kind, world) {
+                Ok(true) => {}
+                Ok(false) | Err(EntityError::Physics(_)) => continue,
+                Err(error) => return Err(error),
+            }
+            if !physics::move_with_scratch(
+                position,
+                kind,
+                [0.0, -0.001, 0.0],
+                false,
+                world,
+                &mut self.physics,
+            )
+            .is_ok_and(|movement| movement.on_ground)
+            {
                 continue;
             }
             let (id, uuid) = identity();
@@ -470,14 +536,19 @@ impl EntityWorld {
         }
         Ok(None)
     }
-    fn spawn_space(&self, position: [f64; 3], kind: MobKind, world: &impl WorldQuery) -> bool {
-        if physics::overlaps(position, kind, world) {
-            return false;
+    fn spawn_space(
+        &self,
+        position: [f64; 3],
+        kind: MobKind,
+        world: &impl WorldQuery,
+    ) -> Result<bool, EntityError> {
+        if physics::try_overlaps(position, kind, world)? {
+            return Ok(false);
         }
-        self.nearby(position, 4.0).is_ok_and(|near| {
-            near.into_iter()
-                .all(|other| !physics::bodies_overlap(position, kind, other.position, other.kind))
-        })
+        Ok(self
+            .nearby(position, 4.0)?
+            .into_iter()
+            .all(|other| !physics::bodies_overlap(position, kind, other.position, other.kind)))
     }
     fn insert(&mut self, mob: Mob) {
         self.buckets
@@ -501,6 +572,7 @@ impl EntityWorld {
         reason: RemovalReason,
     ) -> Result<EntityChange, EntityError> {
         let mob = self.entities.remove(&id).ok_or(EntityError::Missing)?;
+        self.blocked.remove(&id);
         self.identities.remove(&mob.uuid);
         self.unindex(id, bucket(mob.position));
         Ok(EntityChange::Removed {
@@ -589,39 +661,9 @@ fn nearest_player<'a>(
     }
     nearest
 }
+#[cfg(test)]
 fn line_clear(first: [f64; 3], second: [f64; 3], world: &impl WorldQuery) -> bool {
-    let min: [i32; 3] = std::array::from_fn(|axis| first[axis].min(second[axis]).floor() as i32);
-    let max: [i32; 3] = std::array::from_fn(|axis| first[axis].max(second[axis]).floor() as i32);
-    for x in min[0]..=max[0] {
-        for y in min[1]..=max[1] {
-            for z in min[2]..=max[2] {
-                if !world.block_solid(x, y, z) {
-                    continue;
-                }
-                let block = [f64::from(x), f64::from(y), f64::from(z)];
-                let mut enter = 0.0_f64;
-                let mut leave = 1.0_f64;
-                for axis in 0..3 {
-                    let movement = second[axis] - first[axis];
-                    if movement == 0.0 {
-                        if first[axis] < block[axis] || first[axis] > block[axis] + 1.0 {
-                            leave = -1.0;
-                            break;
-                        }
-                    } else {
-                        let first_hit = (block[axis] - first[axis]) / movement;
-                        let last_hit = (block[axis] + 1.0 - first[axis]) / movement;
-                        enter = enter.max(first_hit.min(last_hit));
-                        leave = leave.min(first_hit.max(last_hit));
-                    }
-                }
-                if enter < leave {
-                    return false;
-                }
-            }
-        }
-    }
-    true
+    physics::line_clear(first, second, world)
 }
 
 mod array_bits {

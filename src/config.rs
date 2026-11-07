@@ -33,6 +33,8 @@ pub struct Settings {
     pub plugin_fuel: u64,
     pub plugin_memory_mib: usize,
     pub java_plugins: bool,
+    pub allow_java_clients: bool,
+    pub allow_horizon_clients: bool,
     pub java_executable: String,
     pub update_check: bool,
     pub update_check_interval_hours: u64,
@@ -58,6 +60,8 @@ impl Default for Settings {
             plugin_fuel: 1_000_000,
             plugin_memory_mib: 16,
             java_plugins: true,
+            allow_java_clients: true,
+            allow_horizon_clients: true,
             java_executable: "java".into(),
             update_check: true,
             update_check_interval_hours: 6,
@@ -384,6 +388,44 @@ fn create_new(path: &Path, content: &str) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_profile_flags_roundtrip_independently_including_closed_admission() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("server.settings");
+        for (java, horizon) in [(true, true), (true, false), (false, true), (false, false)] {
+            fs::write(
+                &path,
+                format!("allow_java_clients={java}\nallow_horizon_clients={horizon}\n"),
+            )
+            .unwrap();
+            let settings = Settings::load(&path).unwrap();
+            settings
+                .validate_with_properties(&Properties::parse("").unwrap())
+                .unwrap();
+            let saved: toml::Value = toml::from_str(&toml::to_string(&settings).unwrap()).unwrap();
+            assert_eq!(saved["allow_java_clients"].as_bool(), Some(java));
+            assert_eq!(saved["allow_horizon_clients"].as_bool(), Some(horizon));
+        }
+    }
+
+    #[test]
+    fn old_settings_keep_both_client_profiles_enabled() {
+        let settings: Settings = toml::from_str("network_threads=2\n").unwrap();
+        let saved: toml::Value = toml::from_str(&toml::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(
+            saved
+                .get("allow_java_clients")
+                .and_then(toml::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            saved
+                .get("allow_horizon_clients")
+                .and_then(toml::Value::as_bool),
+            Some(true)
+        );
+    }
 
     #[test]
     fn update_checker_can_be_disabled_and_interval_is_bounded() {

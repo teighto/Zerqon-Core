@@ -82,9 +82,11 @@ def main():
                 metadata += "depend: [BaseProbe]\n"
             archive.writestr("plugin.yml", metadata)
             archive.writestr("config.yml", "greeting: hello\n")
-    compile_java(javac, [SOURCE / "tests/PaperBridgeTest.java"], tests, [*libraries, bridge])
+    compile_java(javac, [SOURCE / "tests/PaperBridgeTest.java", SOURCE / "tests/PaperReadModelTest.java"], tests, [*libraries, bridge])
     with tempfile.TemporaryDirectory(prefix="zerqon-paper-") as directory:
         run(java, "-cp", os.pathsep.join(map(str, [*libraries, bridge, tests])), "io.github.teighto.zerqon.paper.PaperBridgeTest", directory, probe, failed, base, dependent)
+    with tempfile.TemporaryDirectory(prefix="zerqon-paper-reads-") as directory:
+        run(java, "-cp", os.pathsep.join(map(str, [*libraries, bridge, tests])), "io.github.teighto.zerqon.paper.PaperReadModelTest", directory)
     output = ROOT / "dist" / bridge.name
     output.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(bridge, output)

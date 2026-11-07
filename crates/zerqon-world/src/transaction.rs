@@ -108,6 +108,7 @@ struct SavedReceipt {
 
 pub(crate) struct Transactions {
     db: Database,
+    world_uuid: Uuid,
     token_owner: Uuid,
     policy: GenerationPolicy,
     failed: AtomicBool,
@@ -193,10 +194,15 @@ impl Transactions {
         }
         Ok(Self {
             db,
+            world_uuid: identity.world,
             token_owner: Uuid::new_v4(),
             policy,
             failed: AtomicBool::new(false),
         })
+    }
+
+    pub(crate) fn uuid(&self) -> Uuid {
+        self.world_uuid
     }
 
     fn migrate(

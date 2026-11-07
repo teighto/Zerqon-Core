@@ -17,7 +17,6 @@ use tokio::{
     time::{Instant, timeout},
 };
 use uuid::Uuid;
-use zerqon_plugin_api::Event;
 use zerqon_protocol::{
     MINECRAFT_VERSION, PROTOCOL_VERSION,
     codec::{get_string, get_varint, put_string, put_varint, read_frame, take, write_frame},
@@ -121,6 +120,13 @@ pub async fn handle(socket: TcpStream, state: Arc<State>) -> Result<()> {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
     {
         return login_disconnect(&mut writer, "Invalid username").await;
+    }
+    if !state.settings.allow_java_clients && !state.settings.allow_horizon_clients {
+        return login_disconnect(
+            &mut writer,
+            crate::client_policy::PolicyError::AllDisabled.disconnect_reason(),
+        )
+        .await;
     }
     let profile = if let Some(authenticator) = &state.auth {
         let token = auth::fresh_verify_token()?;
@@ -229,10 +235,22 @@ pub async fn handle(socket: TcpStream, state: Arc<State>) -> Result<()> {
     if reader.packet().await? != [3] {
         return Err("expected login acknowledgement".into());
     }
-    writer.send(&packets::known_packs()).await?;
+    let mut client_profile = crate::client_policy::Negotiation::new(
+        state.settings.allow_java_clients,
+        state.settings.allow_horizon_clients,
+        std::time::Instant::now(),
+        deadline,
+    )?;
+    configuration_send(
+        &mut writer,
+        crate::client_policy::PROBE_PACKET,
+        &client_profile,
+    )
+    .await?;
+    configuration_send(&mut writer, &packets::known_packs(), &client_profile).await?;
     let mut known = false;
     for _ in 0..32 {
-        let packet = reader.packet().await?;
+        let packet = configuration_packet(&mut reader, &client_profile).await?;
         let mut view = packet.as_slice();
         match get_varint(&mut view)? {
             7 => {
@@ -251,44 +269,79 @@ pub async fn handle(socket: TcpStream, state: Arc<State>) -> Result<()> {
                 }
                 break;
             }
-            0 | 2 => {}
+            0 => {}
+            2 => {
+                if let Err(error) =
+                    client_profile.observe_custom_payload(view, std::time::Instant::now())
+                {
+                    configuration_send(
+                        &mut writer,
+                        &disconnect(2, error.disconnect_reason()),
+                        &client_profile,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            }
             _ => return Err("unexpected configuration packet".into()),
         }
     }
     if !known {
-        writer
-            .send(&disconnect(
-                2,
-                "The client must provide Minecraft 26.3 built-in data",
-            ))
-            .await?;
+        configuration_send(
+            &mut writer,
+            &disconnect(2, "The client must provide Minecraft 26.3 built-in data"),
+            &client_profile,
+        )
+        .await?;
         return Ok(());
+    }
+    match client_profile.finish(std::time::Instant::now()) {
+        Ok(profile) => tracing::debug!(?profile, "Client capability negotiation complete"),
+        Err(error) => {
+            configuration_send(
+                &mut writer,
+                &disconnect(2, error.disconnect_reason()),
+                &client_profile,
+            )
+            .await?;
+            return Ok(());
+        }
     }
     let data = state.data.as_ref().ok_or("game data unavailable")?;
     for packet in data.configuration_packets() {
-        writer.send(packet).await?;
+        configuration_send(&mut writer, packet, &client_profile).await?;
     }
     let mut finished = false;
     for _ in 0..32 {
-        let packet = reader.packet().await?;
+        let packet = configuration_packet(&mut reader, &client_profile).await?;
         if packet == [3] {
             finished = true;
             break;
         }
-        if !matches!(packet.first(), Some(0 | 2)) {
-            return Err("expected finish configuration".into());
+        let mut view = packet.as_slice();
+        match get_varint(&mut view)? {
+            0 => {}
+            2 => {
+                if let Err(error) =
+                    client_profile.observe_custom_payload(view, std::time::Instant::now())
+                {
+                    configuration_send(
+                        &mut writer,
+                        &disconnect(2, error.disconnect_reason()),
+                        &client_profile,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            }
+            _ => return Err("expected finish configuration".into()),
         }
     }
     if !finished {
         return Err("configuration did not finish".into());
     }
-    tracing::info!(player=%profile.name,"Player joined");
-    state
-        .event(Event::PlayerJoin {
-            uuid: profile.uuid.to_string(),
-            name: profile.name.clone(),
-        })
-        .await?;
+    configuration_deadline(&client_profile)?;
+    let mut joined = false;
     let result = play(
         (reader, writer),
         Arc::clone(&state),
@@ -296,16 +349,49 @@ pub async fn handle(socket: TcpStream, state: Arc<State>) -> Result<()> {
         (&registration, &inventory),
         packets,
         disconnect_rx,
+        &mut joined,
     )
     .await;
-    state
-        .event(Event::PlayerQuit {
-            uuid: profile.uuid.to_string(),
-            name: profile.name.clone(),
-        })
-        .await?;
-    tracing::info!(player=%profile.name,"Player left");
+    if joined {
+        state
+            .player_event(profile.uuid, registration.id(), &profile.name, false)
+            .await?;
+        tracing::info!(player=%profile.name,"Player left");
+    }
     result
+}
+
+async fn configuration_packet(
+    reader: &mut Reader,
+    profile: &crate::client_policy::Negotiation,
+) -> Result<Vec<u8>> {
+    let deadline = configuration_deadline(profile)?;
+    let packet = tokio::time::timeout_at(deadline, reader.packet())
+        .await
+        .map_err(|_| "client capability negotiation timed out")??;
+    configuration_deadline(profile)?;
+    Ok(packet)
+}
+
+async fn configuration_send(
+    writer: &mut Writer,
+    packet: &[u8],
+    profile: &crate::client_policy::Negotiation,
+) -> Result<()> {
+    let deadline = configuration_deadline(profile)?;
+    tokio::time::timeout_at(deadline, writer.send(packet))
+        .await
+        .map_err(|_| "client capability negotiation timed out")??;
+    configuration_deadline(profile)?;
+    Ok(())
+}
+
+fn configuration_deadline(profile: &crate::client_policy::Negotiation) -> Result<Instant> {
+    let deadline = Instant::from_std(profile.deadline());
+    if Instant::now() >= deadline {
+        return Err("client capability negotiation timed out".into());
+    }
+    Ok(deadline)
 }
 
 async fn status(reader: &mut Reader, writer: &mut Writer, state: &State) -> Result<()> {
@@ -361,6 +447,7 @@ async fn play(
     (registration, inventory): (&PlayerHandle, &InventoryHandle),
     mut outbound: mpsc::Receiver<PacketBatch>,
     mut disconnected: watch::Receiver<bool>,
+    joined: &mut bool,
 ) -> Result<()> {
     let (incoming_tx, mut incoming) = mpsc::channel(32);
     let _reader_task = AbortTask(tokio::spawn(async move {
@@ -449,6 +536,11 @@ async fn play(
         writer.send(&packets::position(1, 0.5, 64.0, 0.5)).await?;
     }
     writer.send(&packets::game_event(13, 0.0)).await?;
+    state
+        .player_event(profile.uuid, registration.id(), &profile.name, true)
+        .await?;
+    *joined = true;
+    tracing::info!(player=%profile.name,"Player joined");
     let radius = i32::from(state.properties.view_distance);
     let mut loaded = HashSet::new();
     let mut center = world_view::center(initial.xyz[0], initial.xyz[2]);
@@ -715,6 +807,207 @@ fn stream_chunks(
         sender.send(ChunkEvent::Finished).await?;
         Ok(())
     }))
+}
+
+#[cfg(test)]
+mod configuration_deadline_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn profile(timeout: Duration) -> crate::client_policy::Negotiation {
+        crate::client_policy::Negotiation::new(true, true, std::time::Instant::now(), timeout)
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn expired_configuration_deadline_rejects_buffered_finish() {
+        let (shutdown, _) = watch::channel(false);
+        let (input, mut peer) = tokio::io::duplex(1024);
+        let mut reader = Reader {
+            io: Box::new(input),
+            compression: None,
+            limit: 1024,
+            deadline: Duration::from_secs(30),
+            shutdown: shutdown.subscribe(),
+        };
+        let start = std::time::Instant::now() - Duration::from_secs(2);
+        let mut profile =
+            crate::client_policy::Negotiation::new(true, true, start, Duration::from_secs(1))
+                .unwrap();
+        profile.finish(start).unwrap();
+        write_frame(&mut peer, &[3], None).await.unwrap();
+        assert!(configuration_packet(&mut reader, &profile).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn expired_configuration_send_writes_no_frame_bytes() {
+        let (shutdown, _) = watch::channel(false);
+        let (output, mut peer) = tokio::io::duplex(1024);
+        let mut writer = Writer {
+            io: Box::new(output),
+            compression: None,
+            deadline: Duration::from_secs(30),
+            shutdown: shutdown.subscribe(),
+        };
+        let start = std::time::Instant::now() - Duration::from_secs(2);
+        let profile =
+            crate::client_policy::Negotiation::new(true, true, start, Duration::from_secs(1))
+                .unwrap();
+        assert!(
+            configuration_send(&mut writer, &[3], &profile)
+                .await
+                .is_err()
+        );
+        drop(writer);
+        let mut received = Vec::new();
+        peer.read_to_end(&mut received).await.unwrap();
+        assert!(received.is_empty());
+    }
+
+    #[tokio::test]
+    async fn interrupted_configuration_write_does_not_append_a_disconnect_frame() {
+        let (shutdown, _) = watch::channel(false);
+        let (output, mut peer) = tokio::io::duplex(1);
+        let mut writer = Writer {
+            io: Box::new(output),
+            compression: None,
+            deadline: Duration::from_secs(30),
+            shutdown: shutdown.subscribe(),
+        };
+        let profile = profile(Duration::from_millis(50));
+        let pending =
+            tokio::spawn(
+                async move { configuration_send(&mut writer, &[13; 1024], &profile).await },
+            );
+        let first = peer.read_u8().await.unwrap();
+        assert_eq!(first, 0x80);
+        let result = timeout(Duration::from_secs(2), pending)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_err());
+        let mut tail = Vec::new();
+        timeout(Duration::from_secs(1), peer.read_to_end(&mut tail))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            tail,
+            [8],
+            "only the unfinished original frame prefix may remain"
+        );
+    }
+
+    #[tokio::test]
+    async fn configuration_frames_share_one_outbound_deadline() {
+        let (shutdown, _) = watch::channel(false);
+        let (output, mut peer) = tokio::io::duplex(1);
+        let mut writer = Writer {
+            io: Box::new(output),
+            compression: None,
+            deadline: Duration::from_secs(30),
+            shutdown: shutdown.subscribe(),
+        };
+        let profile = profile(Duration::from_millis(90));
+        let pending = tokio::spawn(async move {
+            let mut completed = 0;
+            for packet in [&[13, 1][..], &[7, 0], &[3]] {
+                if configuration_send(&mut writer, packet, &profile)
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                completed += 1;
+            }
+            completed
+        });
+        let drain = tokio::spawn(async move {
+            for _ in 0..3 {
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                if read_frame(&mut peer, 1024, None).await.is_err() {
+                    break;
+                }
+            }
+        });
+        assert!(
+            timeout(Duration::from_secs(2), pending)
+                .await
+                .unwrap()
+                .unwrap()
+                < 3
+        );
+        timeout(Duration::from_secs(1), drain)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn configuration_cancellation_interrupts_a_partial_inbound_frame() {
+        let (shutdown, _) = watch::channel(false);
+        let (input, mut peer) = tokio::io::duplex(1024);
+        let mut reader = Reader {
+            io: Box::new(input),
+            compression: None,
+            limit: 1024,
+            deadline: Duration::from_secs(30),
+            shutdown: shutdown.subscribe(),
+        };
+        peer.write_all(&[128, 8, 2]).await.unwrap();
+        let profile = profile(Duration::from_secs(30));
+        let pending =
+            tokio::spawn(async move { configuration_packet(&mut reader, &profile).await });
+        tokio::task::yield_now().await;
+        shutdown.send_replace(true);
+        assert!(
+            timeout(Duration::from_secs(1), pending)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn configuration_rejects_a_ready_read_that_finishes_after_the_deadline() {
+        struct SlowReady {
+            delayed: bool,
+            bytes: &'static [u8],
+        }
+        impl AsyncRead for SlowReady {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                buffer: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                if !self.delayed {
+                    self.delayed = true;
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                let count = self.bytes.len().min(buffer.remaining());
+                buffer.put_slice(&self.bytes[..count]);
+                self.bytes = &self.bytes[count..];
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+        let (shutdown, _) = watch::channel(false);
+        let mut reader = Reader {
+            io: Box::new(SlowReady {
+                delayed: false,
+                bytes: &[1, 3],
+            }),
+            compression: None,
+            limit: 1024,
+            deadline: Duration::from_secs(30),
+            shutdown: shutdown.subscribe(),
+        };
+        assert!(
+            configuration_packet(&mut reader, &profile(Duration::from_millis(50)))
+                .await
+                .is_err()
+        );
+    }
 }
 
 #[cfg(test)]

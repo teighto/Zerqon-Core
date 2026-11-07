@@ -171,7 +171,6 @@ impl GameData {
                 }
                 *flags = 1
                     | (u8::from(air) << 1)
-                    | (u8::from(fluid) << 3)
                     | (u8::from(
                         fluid
                             || state
@@ -226,11 +225,6 @@ impl GameData {
         self.block_flags
             .get(state as usize)
             .is_some_and(|flags| flags & 4 != 0)
-    }
-    pub fn is_fluid_block(&self, state: u32) -> bool {
-        self.block_flags
-            .get(state as usize)
-            .is_some_and(|flags| flags & 8 != 0)
     }
 }
 

@@ -109,6 +109,10 @@ pub async fn run(
         update_receiver,
     )
     .await?;
+    #[cfg(unix)]
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    #[cfg(unix)]
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     tracing::info!(
         "Zerqon {} | Minecraft {MINECRAFT_VERSION} | protocol {PROTOCOL_VERSION}",
         env!("CARGO_PKG_VERSION")
@@ -142,6 +146,15 @@ pub async fn run(
     }
     let signal = shutdown_tx.clone();
     let signal_task = tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                _ = terminate.recv() => {},
+                _ = interrupt.recv() => {},
+            }
+            let _ = signal.send(true);
+        }
+        #[cfg(not(unix))]
         if tokio::signal::ctrl_c().await.is_ok() {
             let _ = signal.send(true);
         }
@@ -167,6 +180,7 @@ pub async fn run(
                 }
                 if marker.as_ref().is_some_and(|path|path.exists()){break;}
                 tick_number=tick_number.wrapping_add(1);
+                if let Err(error)=state.players.tracking_tick(){tracing::error!(%error,"Player tracking tick failed");}
                 if let Some(mobs)=&state.mobs&&let Err(error)=mobs.tick(tick_number).await{tracing::error!(%error,"Mob tick failed");}
                 if let Err(error)=state.event(zerqon_plugin_api::Event::Tick{tick:tick_number}).await{tracing::error!(%error,"Plugin tick failed");}
                 if let Ok(mut stats)=state.stats.lock(){stats.record(started,started.elapsed());}

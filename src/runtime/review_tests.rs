@@ -5,6 +5,126 @@ use crate::{
 };
 use tokio::sync::mpsc;
 
+#[tokio::test]
+#[ignore = "requires official game data and a built Java25 plugin host"]
+async fn java_quit_context_failure_still_delivers_the_rust_quit_event() {
+    let (_directory, mut state) = state().await;
+    let (player, _inventory, _receiver) = actor(&state).await;
+    // The guest counts PlayerQuit and reports 0, 1 or 2+ through a command reply.
+    let observer: &[u8] = &[
+        0, 97, 115, 109, 1, 0, 0, 0, 1, 11, 2, 96, 0, 1, 127, 96, 2, 127, 127, 1, 127, 2, 54, 3, 6,
+        122, 101, 114, 113, 111, 110, 9, 101, 118, 101, 110, 116, 95, 108, 101, 110, 0, 0, 6, 122,
+        101, 114, 113, 111, 110, 10, 101, 118, 101, 110, 116, 95, 114, 101, 97, 100, 0, 1, 6, 122,
+        101, 114, 113, 111, 110, 4, 101, 109, 105, 116, 0, 1, 3, 3, 2, 0, 0, 5, 3, 1, 0, 1, 6, 6,
+        1, 127, 1, 65, 0, 11, 7, 49, 3, 6, 109, 101, 109, 111, 114, 121, 2, 0, 18, 122, 101, 114,
+        113, 111, 110, 95, 97, 98, 105, 95, 118, 101, 114, 115, 105, 111, 110, 0, 3, 15, 122, 101,
+        114, 113, 111, 110, 95, 111, 110, 95, 101, 118, 101, 110, 116, 0, 4, 10, 79, 2, 4, 0, 65,
+        1, 11, 72, 0, 65, 0, 16, 0, 16, 1, 26, 65, 17, 45, 0, 0, 65, 241, 0, 70, 4, 64, 35, 0, 65,
+        1, 106, 36, 0, 11, 65, 10, 45, 0, 0, 65, 227, 0, 70, 4, 64, 35, 0, 69, 4, 127, 65, 128, 8,
+        5, 35, 0, 65, 1, 70, 4, 127, 65, 192, 8, 5, 65, 128, 9, 11, 11, 65, 32, 16, 2, 26, 11, 65,
+        0, 11, 11, 115, 3, 0, 65, 128, 8, 11, 32, 123, 34, 97, 99, 116, 105, 111, 110, 34, 58, 34,
+        114, 101, 112, 108, 121, 34, 44, 34, 109, 101, 115, 115, 97, 103, 101, 34, 58, 34, 48, 34,
+        125, 0, 65, 192, 8, 11, 32, 123, 34, 97, 99, 116, 105, 111, 110, 34, 58, 34, 114, 101, 112,
+        108, 121, 34, 44, 34, 109, 101, 115, 115, 97, 103, 101, 34, 58, 34, 49, 34, 125, 0, 65,
+        128, 9, 11, 32, 123, 34, 97, 99, 116, 105, 111, 110, 34, 58, 34, 114, 101, 112, 108, 121,
+        34, 44, 34, 109, 101, 115, 115, 97, 103, 101, 34, 58, 34, 50, 34, 125, 0, 35, 4, 110, 97,
+        109, 101, 1, 18, 3, 0, 3, 108, 101, 110, 1, 4, 114, 101, 97, 100, 2, 4, 101, 109, 105, 116,
+        7, 8, 1, 0, 5, 113, 117, 105, 116, 115,
+    ];
+    state
+        .plugins
+        .lock()
+        .unwrap()
+        .load("quit-observer", observer)
+        .unwrap();
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let java = JavaPlugins::spawn_with_services(
+        JavaPluginConfig {
+            java: "java".into(),
+            host_jar: root.join("libraries/zerqon-java-host-0.0.1.jar"),
+            gson_jar: root.join("libraries/gson-2.13.2.jar"),
+            extra_classpath: Vec::new(),
+            directory: _directory.path().join("plugins/java-plugins"),
+            server_version: "0.0.1".into(),
+            request_timeout: Duration::from_secs(2),
+            startup_timeout: Duration::from_secs(15),
+            queue_capacity: 4,
+        },
+        state.queries.clone(),
+    )
+    .await
+    .unwrap();
+    Arc::get_mut(&mut state).unwrap().java = Some(java);
+    state
+        .player_event(Uuid::from_u128(42), player.id(), "Builder", true)
+        .await
+        .unwrap();
+    let count = Event::Command {
+        sender: "CONSOLE".into(),
+        sender_kind: SenderKind::Console,
+        operator: true,
+        command: "count".into(),
+        args: Vec::new(),
+    };
+    assert_eq!(
+        state
+            .plugins
+            .lock()
+            .unwrap()
+            .dispatch("quit-observer", &count)
+            .unwrap(),
+        [Action::Reply {
+            message: "0".into()
+        }]
+    );
+    let mut control = PluginManager::new(Limits::default()).unwrap();
+    control.load("control", observer).unwrap();
+    control
+        .dispatch(
+            "control",
+            &Event::PlayerQuit {
+                uuid: Uuid::from_u128(42).to_string(),
+                name: "Builder".into(),
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        control.dispatch("control", &count).unwrap(),
+        [Action::Reply {
+            message: "1".into()
+        }]
+    );
+    let operators = Arc::clone(&state.operators);
+    let (locked, ready) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let _guard = operators.lock().unwrap();
+        locked.send(()).unwrap();
+        let _ = released.recv_timeout(Duration::from_secs(3));
+    });
+    ready.await.unwrap();
+    let quit = state
+        .player_event(Uuid::from_u128(42), player.id(), "Builder", false)
+        .await;
+    release.send(()).unwrap();
+    holder.join().unwrap();
+    let observed = state
+        .plugins
+        .lock()
+        .unwrap()
+        .dispatch("quit-observer", &count)
+        .unwrap();
+    state.java.as_ref().unwrap().shutdown().await.unwrap();
+    assert!(quit.is_err(), "Java context error must remain observable");
+    assert_eq!(
+        observed,
+        [Action::Reply {
+            message: "1".into()
+        }],
+        "Rust PlayerQuit must be delivered exactly once despite Java context failure"
+    );
+}
+
 async fn state() -> (tempfile::TempDir, Arc<State>) {
     let directory = tempfile::tempdir().unwrap();
     crate::config::initialize(directory.path()).unwrap();
@@ -72,6 +192,41 @@ fn placement() -> BlockInteraction {
         world_border_hit: false,
         sequence: 1,
     })
+}
+
+#[tokio::test]
+#[ignore = "requires prepared official Minecraft 26.3 data"]
+async fn native_player_context_waits_for_transient_permissions_without_blocking_network_tasks() {
+    let (_directory, state) = state().await;
+    let (player, _inventory, _receiver) = actor(&state).await;
+    let operators = Arc::clone(&state.operators);
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let _guard = operators.lock().unwrap();
+        ready_tx.send(()).unwrap();
+        let _ = release_rx.recv_timeout(Duration::from_secs(2));
+    });
+    ready_rx.await.unwrap();
+    let mut context = Box::pin(state.player_context(Uuid::from_u128(42), Some(player.id())));
+    let started = std::time::Instant::now();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(15), &mut context)
+            .await
+            .is_err()
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "context lookup blocked the executor"
+    );
+    release_tx.send(()).unwrap();
+    let context = tokio::time::timeout(Duration::from_millis(250), context)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(context.player.session_id, player.id());
+    assert_eq!(context.player.uuid, Uuid::from_u128(42));
+    holder.join().unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

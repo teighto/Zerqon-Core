@@ -58,6 +58,65 @@ mod tests {
         std::env::var_os("ZERQON_RUNTIME_TEST_ROOT").map(PathBuf::from)
     }
 
+    fn official_fixture(cache: &Path) -> PathBuf {
+        let asset = current_asset().unwrap();
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let archive = std::env::var_os("ZERQON_TEST_JRE_ARCHIVE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                root.join(match asset.platform {
+                    Platform::WindowsX64 => ".local/adoptium-windows25.zip",
+                    Platform::LinuxX64 => ".local/adoptium-linux25.tar.gz",
+                })
+            });
+        let mut input =
+            File::open(&archive).expect("verified official runtime archive fixture is required");
+        assert_eq!(input.metadata().unwrap().len(), asset.size);
+        let mut digest = Context::new(&SHA256);
+        let mut buffer = [0_u8; 65_536];
+        loop {
+            let count = input.read(&mut buffer).unwrap();
+            if count == 0 {
+                break;
+            }
+            digest.update(&buffer[..count]);
+        }
+        assert_eq!(
+            digest
+                .finish()
+                .as_ref()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+            asset.sha256
+        );
+        let runtime = cache
+            .join("25")
+            .join(asset.platform.cache_name())
+            .join(ARCHIVE_ROOT);
+        fs::create_dir_all(&runtime).unwrap();
+        extract_archive(&archive, &runtime, asset.platform).unwrap();
+        fs::write(runtime.join("zerqon-runtime.json"), serde_json::to_vec(&json!({
+            "release":RELEASE,"sha256":asset.sha256,"size":asset.size,"platform":asset.platform.cache_name(),"source":"Eclipse Adoptium"
+        })).unwrap()).unwrap();
+        runtime
+    }
+
+    fn copy_official_tree(source: &Path, target: &Path) {
+        fs::create_dir_all(target).unwrap();
+        for entry in fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let metadata = fs::symlink_metadata(entry.path()).unwrap();
+            assert!(!is_runtime_link(&metadata));
+            if metadata.is_dir() {
+                copy_official_tree(&entry.path(), &target.join(entry.file_name()));
+            } else {
+                assert!(metadata.is_file());
+                fs::copy(entry.path(), target.join(entry.file_name())).unwrap();
+            }
+        }
+    }
+
     fn run_resolver_child(test: &str, root: &Path) {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", test, "--include-ignored", "--nocapture"])
@@ -76,11 +135,407 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn offline_resolver_preserves_working_unicode_cache() {
+    async fn forged_managed_marker_never_executes_a_regular_replacement_binary() {
+        if let Some(root) = resolver_child_root() {
+            assert!(probe_java(Path::new("java")).await.is_err());
+            let cache = root.join("cache");
+            let runtime = cache
+                .join("25")
+                .join(current_asset().unwrap().platform.cache_name())
+                .join(ARCHIVE_ROOT);
+            let result = resolve_java(Path::new("java"), &cache, false).await;
+            assert!(
+                !runtime.join("executed").exists(),
+                "unverified replacement binary executed from an official-looking managed cache"
+            );
+            assert!(result.is_err());
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = cached_probe_fixture(&directory.path().join("cache"), "valid");
+        let binary = runtime
+            .join("bin")
+            .join(current_asset().unwrap().platform.executable());
+        let original = fs::read(&binary).unwrap();
+        run_resolver_child(
+            "tests::forged_managed_marker_never_executes_a_regular_replacement_binary",
+            directory.path(),
+        );
+        assert_eq!(fs::read(binary).unwrap(), original);
+        assert!(!runtime.join("executed").exists());
+    }
+
+    #[tokio::test]
+    async fn default_java_does_not_execute_a_current_directory_candidate() {
+        if let Some(root) = resolver_child_root() {
+            let runtime = root
+                .join("working")
+                .join("25")
+                .join(current_asset().unwrap().platform.cache_name())
+                .join(ARCHIVE_ROOT);
+            let result =
+                resolve_java(Path::new("java"), &root.join("requested-cache"), false).await;
+            assert!(
+                !runtime.join("executed").exists(),
+                "default Java lookup executed a current-directory binary before cache validation"
+            );
+            assert!(result.is_err());
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = cached_probe_fixture(&directory.path().join("working"), "valid");
+        let empty_path = directory.path().join("empty-path");
+        fs::create_dir(&empty_path).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::default_java_does_not_execute_a_current_directory_candidate",
+                "--nocapture",
+            ])
+            .env("ZERQON_RUNTIME_TEST_ROOT", directory.path())
+            .env("LOCALAPPDATA", directory.path().join("profile"))
+            .env("PATH", empty_path)
+            .current_dir(runtime.join("bin"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!runtime.join("executed").exists());
+    }
+
+    #[tokio::test]
+    async fn default_java_does_not_execute_an_application_directory_candidate() {
+        if let Some(root) = resolver_child_root() {
+            let names: &[&str] = if cfg!(windows) {
+                &["java", "Java", "JAVA.EXE"]
+            } else {
+                &["java"]
+            };
+            for name in names {
+                let _ = resolve_java(Path::new(name), &root.join("requested-cache"), false).await;
+                assert!(
+                    !root.join("executed").exists(),
+                    "default Java lookup {name} executed an application-directory binary"
+                );
+            }
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = cached_probe_fixture(&directory.path().join("fixture"), "valid");
+        let application = directory.path().join("application");
+        let empty_path = directory.path().join("empty-path");
+        fs::create_dir(&application).unwrap();
+        fs::create_dir(&empty_path).unwrap();
+        let harness = application.join(if cfg!(windows) {
+            "harness.exe"
+        } else {
+            "harness"
+        });
+        fs::copy(std::env::current_exe().unwrap(), &harness).unwrap();
+        let executable = current_asset().unwrap().platform.executable();
+        fs::copy(
+            runtime.join("bin").join(executable),
+            application.join(executable),
+        )
+        .unwrap();
+        fs::write(directory.path().join("probe-mode"), "valid").unwrap();
+        let output = std::process::Command::new(harness)
+            .args([
+                "--exact",
+                "tests::default_java_does_not_execute_an_application_directory_candidate",
+                "--nocapture",
+            ])
+            .env("ZERQON_RUNTIME_TEST_ROOT", directory.path())
+            .env("LOCALAPPDATA", directory.path().join("profile"))
+            .env("PATH", empty_path)
+            .current_dir(directory.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!directory.path().join("executed").exists());
+    }
+
+    #[tokio::test]
+    async fn managed_runtime_on_path_still_requires_integrity_before_execution() {
+        if let Some(root) = resolver_child_root() {
+            let runtime = root
+                .join("cache")
+                .join("25")
+                .join(current_asset().unwrap().platform.cache_name())
+                .join(ARCHIVE_ROOT);
+            assert!(
+                resolve_java(Path::new("java"), &root.join("cache"), false)
+                    .await
+                    .is_err()
+            );
+            assert!(!runtime.join("executed").exists());
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = cached_probe_fixture(&directory.path().join("cache"), "valid");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::managed_runtime_on_path_still_requires_integrity_before_execution",
+                "--nocapture",
+            ])
+            .env("ZERQON_RUNTIME_TEST_ROOT", directory.path())
+            .env("LOCALAPPDATA", directory.path().join("profile"))
+            .env("PATH", runtime.join("bin"))
+            .current_dir(directory.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!runtime.join("executed").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn default_path_lookup_skips_nonexecutable_files_before_installed_java() {
+        if let Some(root) = resolver_child_root() {
+            let resolved = resolve_java(Path::new("java"), &root.join("cache"), false)
+                .await
+                .unwrap();
+            assert!(resolved.starts_with(root.join("installed")));
+            assert!(!root.join("cache").exists());
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let installed = cached_probe_fixture(&directory.path().join("installed"), "valid");
+        let tools = directory.path().join("tools");
+        fs::create_dir(&tools).unwrap();
+        fs::write(tools.join("java"), b"not executable").unwrap();
+        fs::set_permissions(tools.join("java"), fs::Permissions::from_mode(0o644)).unwrap();
+        let path = std::env::join_paths([tools, installed.join("bin")]).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::default_path_lookup_skips_nonexecutable_files_before_installed_java",
+                "--nocapture",
+            ])
+            .env("ZERQON_RUNTIME_TEST_ROOT", directory.path())
+            .env("PATH", path)
+            .current_dir(directory.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(installed.join("executed").exists());
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires the pinned official Windows/Linux JRE archive fixture"]
+    async fn official_caches_are_reused_offline_with_platform_unicode_fallback() {
+        if let Some(root) = resolver_child_root() {
+            let asset = current_asset().unwrap();
+            let ascii_cache = root.join("profile/Zerqon/cache/java");
+            let unicode_cache = root.join("среда-中文");
+            let unicode_runtime = unicode_cache
+                .join("25")
+                .join(asset.platform.cache_name())
+                .join(ARCHIVE_ROOT);
+            validate_cached_files(&unicode_runtime, asset).unwrap();
+            let unicode_probe = probe_java(
+                &unicode_runtime
+                    .join("bin")
+                    .join(asset.platform.executable()),
+            )
+            .await;
+            let unicode_works = unicode_probe.is_ok();
+            let expected_unicode = match unicode_probe {
+                Ok(java) => java,
+                Err(JavaRuntimeError::ProbeExit(_)) if cfg!(windows) => ascii_cache
+                    .join("25")
+                    .join(asset.platform.cache_name())
+                    .join(ARCHIVE_ROOT)
+                    .join("bin")
+                    .join(asset.platform.executable()),
+                Err(error) => panic!("unexpected official Unicode runtime result: {error}"),
+            };
+            let resolved = resolve_java(Path::new("java"), &unicode_cache, false)
+                .await
+                .unwrap();
+            assert_eq!(
+                resolved.canonicalize().unwrap(),
+                expected_unicode.canonicalize().unwrap()
+            );
+            let ascii = resolve_java(Path::new("java"), &ascii_cache, false)
+                .await
+                .unwrap();
+            if std::env::var_os("ZERQON_RUNTIME_TEST_PATH").is_some() && unicode_works {
+                assert_eq!(
+                    ascii.canonicalize().unwrap(),
+                    expected_unicode.canonicalize().unwrap()
+                );
+            } else {
+                assert!(
+                    ascii
+                        .canonicalize()
+                        .unwrap()
+                        .starts_with(ascii_cache.canonicalize().unwrap())
+                );
+            }
+            validate_cached_files(&unicode_runtime, asset).unwrap();
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let ascii = official_fixture(&directory.path().join("profile/Zerqon/cache/java"));
+        let asset = current_asset().unwrap();
+        let unicode = directory
+            .path()
+            .join("среда-中文/25")
+            .join(asset.platform.cache_name())
+            .join(ARCHIVE_ROOT);
+        copy_official_tree(&ascii, &unicode);
+        let marker = fs::read(unicode.join("zerqon-runtime.json")).unwrap();
+        run_resolver_child(
+            "tests::official_caches_are_reused_offline_with_platform_unicode_fallback",
+            directory.path(),
+        );
+        let path_case = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::official_caches_are_reused_offline_with_platform_unicode_fallback",
+                "--include-ignored",
+                "--nocapture",
+            ])
+            .env("ZERQON_RUNTIME_TEST_ROOT", directory.path())
+            .env("LOCALAPPDATA", directory.path().join("profile"))
+            .env("PATH", unicode.join("bin"))
+            .env("ZERQON_RUNTIME_TEST_PATH", "1")
+            .current_dir(directory.path())
+            .output()
+            .unwrap();
+        assert!(
+            path_case.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&path_case.stdout),
+            String::from_utf8_lossy(&path_case.stderr)
+        );
+        assert_eq!(
+            fs::read(unicode.join("zerqon-runtime.json")).unwrap(),
+            marker
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires the pinned official Windows/Linux JRE archive fixture"]
+    async fn official_runtime_hashes_reject_tampering_missing_and_extra_files_before_execution() {
+        use std::io::{Seek, SeekFrom};
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = official_fixture(&directory.path().join("cache"));
+        let asset = current_asset().unwrap();
+        let started = std::time::Instant::now();
+        validate_cached_files(&runtime, asset).unwrap();
+        eprintln!(
+            "Official {:?} first integrity check after extraction: {:?}",
+            asset.platform,
+            started.elapsed()
+        );
+        let started = std::time::Instant::now();
+        validate_cached_files(&runtime, asset).unwrap();
+        eprintln!(
+            "Official {:?} repeated integrity check: {:?}",
+            asset.platform,
+            started.elapsed()
+        );
+        let paths = match asset.platform {
+            Platform::WindowsX64 => [
+                "bin/java.exe",
+                "bin/java.dll",
+                "bin/server/jvm.dll",
+                "lib/modules",
+                "conf/security/java.security",
+                "legal/java.base/LICENSE",
+            ],
+            Platform::LinuxX64 => [
+                "bin/java",
+                "lib/libjli.so",
+                "lib/server/libjvm.so",
+                "lib/modules",
+                "conf/security/java.security",
+                "legal/java.base/LICENSE",
+            ],
+        };
+        for relative in paths {
+            let path = runtime.join(relative);
+            let mut file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            let mut original = [0_u8; 1];
+            file.read_exact(&mut original).unwrap();
+            file.seek(SeekFrom::Start(0)).unwrap();
+            file.write_all(&[original[0] ^ 0x80]).unwrap();
+            file.sync_all().unwrap();
+            let error = validate_cached_files(&runtime, asset).unwrap_err();
+            assert!(
+                error.to_string().contains("contents differ"),
+                "{relative}: {error}"
+            );
+            file.seek(SeekFrom::Start(0)).unwrap();
+            file.write_all(&original).unwrap();
+            file.sync_all().unwrap();
+        }
+        let notice = runtime.join("NOTICE");
+        let saved_notice = fs::read(&notice).unwrap();
+        fs::remove_file(&notice).unwrap();
+        assert!(
+            validate_cached_files(&runtime, asset)
+                .unwrap_err()
+                .to_string()
+                .contains("missing pinned files")
+        );
+        fs::write(&notice, &saved_notice).unwrap();
+        let injected = runtime.join("lib/unrecognized-agent.jar");
+        fs::write(&injected, b"not an official runtime component").unwrap();
+        assert!(validate_cached_files(&runtime, asset).is_err());
+        assert_eq!(
+            fs::read(&injected).unwrap(),
+            b"not an official runtime component"
+        );
+        fs::remove_file(injected).unwrap();
+        validate_cached_files(&runtime, asset).unwrap();
+        let fake = cached_probe_fixture(&directory.path().join("fake"), "valid");
+        let binary = runtime.join("bin").join(asset.platform.executable());
+        fs::copy(fake.join("bin").join(asset.platform.executable()), &binary).unwrap();
+        assert!(validated_cached_runtime(&runtime, asset).await.is_err());
+        assert!(!runtime.join("executed").exists());
+        assert!(binary.is_file());
+    }
+
+    #[tokio::test]
+    async fn explicit_java_preserves_operator_selected_unicode_paths() {
         if let Some(root) = resolver_child_root() {
             assert!(probe_java(Path::new("java")).await.is_err());
             let cache = root.join("среда-中文");
-            let resolved = resolve_java(Path::new("java"), &cache, false)
+            let executable = cache
+                .join("25")
+                .join(current_asset().unwrap().platform.cache_name())
+                .join(ARCHIVE_ROOT)
+                .join("bin")
+                .join(current_asset().unwrap().platform.executable());
+            let resolved = resolve_java(&executable, &root.join("unused-cache"), false)
                 .await
                 .unwrap();
             assert!(
@@ -95,7 +550,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         cached_probe_fixture(&directory.path().join("среда-中文"), "valid");
         run_resolver_child(
-            "tests::offline_resolver_preserves_working_unicode_cache",
+            "tests::explicit_java_preserves_operator_selected_unicode_paths",
             directory.path(),
         );
     }
@@ -134,18 +589,13 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
-    async fn unicode_launcher_exit_uses_existing_fallback_without_download() {
+    async fn forged_unicode_runtime_is_rejected_without_executing_or_using_fallback() {
         if let Some(root) = resolver_child_root() {
             assert!(probe_java(Path::new("java")).await.is_err());
-            let resolved = resolve_java(Path::new("java"), &root.join("среда-中文"), false)
+            let error = resolve_java(Path::new("java"), &root.join("среда-中文"), false)
                 .await
-                .unwrap();
-            assert!(
-                resolved
-                    .canonicalize()
-                    .unwrap()
-                    .starts_with(root.join("profile").canonicalize().unwrap())
-            );
+                .unwrap_err();
+            assert!(matches!(error, JavaRuntimeError::Invalid(_)));
             return;
         }
         let directory = tempfile::tempdir().unwrap();
@@ -154,11 +604,11 @@ mod tests {
             cached_probe_fixture(&directory.path().join("profile/Zerqon/cache/java"), "valid");
         let identity = fs::read(local.join("zerqon-runtime.json")).unwrap();
         run_resolver_child(
-            "tests::unicode_launcher_exit_uses_existing_fallback_without_download",
+            "tests::forged_unicode_runtime_is_rejected_without_executing_or_using_fallback",
             directory.path(),
         );
-        assert!(local.join("executed").exists());
-        assert!(fallback.join("executed").exists());
+        assert!(!local.join("executed").exists());
+        assert!(!fallback.join("executed").exists());
         assert_eq!(
             fs::read(local.join("zerqon-runtime.json")).unwrap(),
             identity
@@ -166,10 +616,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unexpected_java_version_is_not_hidden_by_fallback() {
+    async fn explicit_unexpected_java_version_is_not_hidden_by_fallback() {
         if let Some(root) = resolver_child_root() {
             assert!(probe_java(Path::new("java")).await.is_err());
-            let error = resolve_java(Path::new("java"), &root.join("среда-中文"), false)
+            let asset = current_asset().unwrap();
+            let binary = root
+                .join("среда-中文")
+                .join("25")
+                .join(asset.platform.cache_name())
+                .join(ARCHIVE_ROOT)
+                .join("bin")
+                .join(asset.platform.executable());
+            let error = resolve_java(&binary, &root.join("unused-cache"), false)
                 .await
                 .unwrap_err();
             assert!(matches!(error, JavaRuntimeError::Invalid(_)));
@@ -180,7 +638,7 @@ mod tests {
         let fallback =
             cached_probe_fixture(&directory.path().join("profile/Zerqon/cache/java"), "valid");
         run_resolver_child(
-            "tests::unexpected_java_version_is_not_hidden_by_fallback",
+            "tests::explicit_unexpected_java_version_is_not_hidden_by_fallback",
             directory.path(),
         );
         assert!(local.join("executed").exists());
@@ -188,13 +646,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ascii_launcher_exit_remains_an_error() {
+    async fn explicit_launcher_exit_remains_an_error() {
         if let Some(root) = resolver_child_root() {
             assert!(probe_java(Path::new("java")).await.is_err());
-            let error = resolve_java(Path::new("java"), &root.join("ascii"), false)
+            let asset = current_asset().unwrap();
+            let binary = root
+                .join("ascii")
+                .join("25")
+                .join(asset.platform.cache_name())
+                .join(ARCHIVE_ROOT)
+                .join("bin")
+                .join(asset.platform.executable());
+            let error = resolve_java(&binary, &root.join("unused-cache"), false)
                 .await
                 .unwrap_err();
-            assert!(matches!(error, JavaRuntimeError::ProbeExit(_)));
+            assert!(matches!(error, JavaRuntimeError::Invalid(_)));
             return;
         }
         let directory = tempfile::tempdir().unwrap();
@@ -202,7 +668,7 @@ mod tests {
         let fallback =
             cached_probe_fixture(&directory.path().join("profile/Zerqon/cache/java"), "valid");
         run_resolver_child(
-            "tests::ascii_launcher_exit_remains_an_error",
+            "tests::explicit_launcher_exit_remains_an_error",
             directory.path(),
         );
         assert!(local.join("executed").exists());

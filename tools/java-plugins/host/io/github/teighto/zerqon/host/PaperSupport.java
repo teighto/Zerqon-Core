@@ -4,7 +4,9 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import io.github.teighto.zerqon.api.Action;
 import io.github.teighto.zerqon.api.Event;
+import io.github.teighto.zerqon.api.NativeQueries;
 import io.github.teighto.zerqon.paper.PaperBridge;
+import io.github.teighto.zerqon.paper.ReadOnlyServerView;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -18,11 +20,13 @@ import org.bukkit.plugin.java.JavaPlugin;
 
 final class PaperSupport implements AutoCloseable {
     private final PaperBridge bridge;
+    private final NativeTransport transport;
     private final Map<String, Entry> entries = new LinkedHashMap<>();
     private final Map<String, String> metadataNames = new LinkedHashMap<>();
     private boolean closed;
 
     PaperSupport(Path directory, NativeTransport transport) {
+        this.transport = transport;
         Path serverDirectory = directory;
         if (directory.getFileName().toString().equals("java-plugins") && directory.getParent() != null && directory.getParent().getFileName().toString().equals("plugins")) {
             serverDirectory = directory.getParent().getParent();
@@ -32,7 +36,23 @@ final class PaperSupport implements AutoCloseable {
             if (identity == null) throw new IllegalStateException("Paper callback has no host identity");
             var scope = transport.bind(identity);
             return scope::close;
+        }, new ReadOnlyServerView() {
+            @Override public List<PlayerData> onlinePlayers() { return NativeQueries.onlinePlayers().stream().map(PaperSupport::playerData).toList(); }
+            @Override public java.util.Optional<PlayerData> player(java.util.UUID uuid, Integer session) {
+                return (session == null ? NativeQueries.player(uuid) : NativeQueries.player(uuid, session)).map(PaperSupport::playerData);
+            }
+            @Override public List<WorldData> worlds() {
+                return NativeQueries.worlds().stream().map(world -> new WorldData(world.uuid(), world.name(), world.key(), world.dimension(), world.environment(), world.minHeight(), world.maxHeight(), position(world.spawn()))).toList();
+            }
+            @Override public PlayerData eventPlayer() { return transport.eventPlayer() == null ? null : playerData(transport.eventPlayer()); }
         });
+    }
+
+    private static ReadOnlyServerView.Position position(NativeQueries.Position position) {
+        return new ReadOnlyServerView.Position(position.x(), position.y(), position.z(), position.yaw(), position.pitch());
+    }
+    private static ReadOnlyServerView.PlayerData playerData(NativeQueries.PlayerSnapshot player) {
+        return new ReadOnlyServerView.PlayerData(player.uuid(), player.sessionId(), player.entityId(), player.name(), player.worldUuid(), position(player.position()), player.operator(), player.online());
     }
 
     JsonArray load(List<Path> paths, String version) {
@@ -99,6 +119,11 @@ final class PaperSupport implements AutoCloseable {
             if (target != null) { throw new IllegalArgumentException("Paper ticks must target the whole host"); }
             bridge.tick(tick.tick());
         }
+        if (transport.eventPlayer() != null && (event instanceof Event.PlayerJoin || event instanceof Event.PlayerQuit)) {
+            if (target != null) throw new IllegalArgumentException("Native player lifecycle events must target the whole host");
+            if (event instanceof Event.PlayerJoin) bridge.playerJoined(playerData(transport.eventPlayer()));
+            else bridge.playerQuit(playerData(transport.eventPlayer()));
+        }
         for (var entry : entries.entrySet()) {
             if (target != null && !target.equals(entry.getKey())) { continue; }
             Entry loaded = entry.getValue();
@@ -111,9 +136,9 @@ final class PaperSupport implements AutoCloseable {
                 if (event instanceof Event.Command command) {
                     if (target == null) { continue; }
                     for (String reply : bridge.executeFor(loaded.plugin, command.sender(), command.operator(), command.senderKind() == Event.SenderKind.CONSOLE, command.command(), command.args())) { actions.add(new Action.Reply(reply)); }
-                } else if (event instanceof Event.PlayerJoin && bridge.hasListeners(loaded.plugin, PlayerJoinEvent.class)) {
+                } else if (event instanceof Event.PlayerJoin && transport.eventPlayer() == null && bridge.hasListeners(loaded.plugin, PlayerJoinEvent.class)) {
                     throw new UnsupportedOperationException("Native Paper PlayerJoinEvent adapter is not implemented");
-                } else if (event instanceof Event.PlayerQuit && bridge.hasListeners(loaded.plugin, PlayerQuitEvent.class)) {
+                } else if (event instanceof Event.PlayerQuit && transport.eventPlayer() == null && bridge.hasListeners(loaded.plugin, PlayerQuitEvent.class)) {
                     throw new UnsupportedOperationException("Native Paper PlayerQuitEvent adapter is not implemented");
                 } else if (event instanceof Event.Disable) { bridge.disable(loaded.plugin); }
                 results.add(result(entry.getKey(), loaded.enabled(), Wire.actions(actions, event), null));

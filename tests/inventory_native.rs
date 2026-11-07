@@ -166,6 +166,10 @@ impl Client {
         let uuid = Uuid::from_slice(take(&mut view, 16).unwrap()).unwrap();
         assert_ne!(uuid, Uuid::from_bytes([0x55; 16]));
         write_frame(&mut socket, &[3], None).await.unwrap();
+        assert_eq!(
+            read_frame(&mut socket, 65_536, None).await.unwrap(),
+            b"\x01\x10horizon:mod_list\x00"
+        );
         let mut known = read_frame(&mut socket, 65_536, None).await.unwrap();
         assert_eq!(known[0], 15);
         known[0] = 7;

@@ -190,6 +190,7 @@ fn block_import_preserves_original_and_reports_unimported_world_data() {
     let metadata = store.metadata().unwrap();
     assert_eq!(metadata.spawn.position, [-1, -60, -513]);
     assert_eq!(Some(metadata.world_id), report.world_id);
+    assert_eq!(store.uuid().unwrap(), metadata.world_id);
     assert!(matches!(
         store.load(0, 0),
         Err(WorldError::MissingImportedChunk { x: 0, z: 0 })

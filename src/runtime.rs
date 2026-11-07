@@ -61,10 +61,11 @@ pub struct State {
     pub mobs: Option<Arc<Mobs>>,
     pub auth: Option<Authenticator>,
     pub players: Arc<Players>,
+    pub queries: Arc<crate::server_queries::ServerQueries>,
     pub slots: Arc<Semaphore>,
     pub plugins: Arc<Mutex<PluginManager>>,
     pub commands: Mutex<HashMap<String, (String, Option<String>)>>,
-    pub operators: Mutex<crate::operator_store::OperatorStore>,
+    pub operators: Arc<Mutex<crate::operator_store::OperatorStore>>,
     pub profiler: crate::profiling::ProfilerService,
     pub shutdown: watch::Sender<bool>,
     pub java: Option<JavaPlugins>,
@@ -398,6 +399,7 @@ impl State {
             count = operators.entries().len(),
             "Loaded UUID operator records"
         );
+        let operators = Arc::new(Mutex::new(operators));
         let entity_ids = Arc::new(EntityIds::default());
         let players = Players::new(
             properties.max_players,
@@ -438,8 +440,8 @@ impl State {
                 )
             })
             .transpose()?;
-        let mobs = match (&world, &data) {
-            (Some(world), Some(data)) => Some(
+        let mobs = match (&world, &data, &blocks) {
+            (Some(world), Some(data), Some(blocks)) => Some(
                 Mobs::open(
                     MobConfig {
                         path: directory.join(&properties.level_name).join("entities.zqe"),
@@ -450,6 +452,7 @@ impl State {
                     Arc::clone(world),
                     Arc::clone(&players),
                     Arc::clone(data),
+                    Arc::clone(blocks),
                     entity_ids,
                     Arc::clone(&gameplay),
                 )
@@ -458,6 +461,21 @@ impl State {
             _ => None,
         };
         let tick = Arc::new(AtomicU64::new(0));
+        let worlds: Arc<[crate::plugin_services::NativeWorld]> = world
+            .as_ref()
+            .map(|world| world.descriptor(&properties.level_name))
+            .transpose()?
+            .into_iter()
+            .collect::<Vec<_>>()
+            .into();
+        let queries = Arc::new(crate::server_queries::ServerQueries {
+            players: Arc::clone(&players),
+            tick: Arc::clone(&tick),
+            max_players: u32::try_from(properties.max_players)?,
+            shutdown: shutdown.subscribe(),
+            operators: Arc::clone(&operators),
+            worlds,
+        });
         let java_present = !status_only
             && std::fs::read_dir(directory.join("plugins/java-plugins"))?
                 .filter_map(std::result::Result::ok)
@@ -478,12 +496,7 @@ impl State {
                         startup_timeout: Duration::from_secs(20),
                         queue_capacity: 32,
                     },
-                    Arc::new(crate::server_queries::ServerQueries {
-                        players: Arc::clone(&players),
-                        tick: Arc::clone(&tick),
-                        max_players: u32::try_from(properties.max_players)?,
-                        shutdown: shutdown.subscribe(),
-                    }),
+                    queries.clone(),
                 )
                 .await?,
             )
@@ -512,9 +525,10 @@ impl State {
             mobs,
             auth,
             players,
+            queries,
             plugins: Arc::new(Mutex::new(plugins)),
             commands: Mutex::new(HashMap::new()),
-            operators: Mutex::new(operators),
+            operators,
             profiler: crate::profiling::ProfilerService::new(
                 directory.to_owned(),
                 zerqon_profiler::ProfileConfig::default(),
@@ -626,6 +640,86 @@ impl State {
     }
 
     pub async fn event(&self, event: Event) -> Result<()> {
+        self.event_with_context(event, None).await
+    }
+
+    async fn player_context(
+        &self,
+        uuid: Uuid,
+        session: Option<i32>,
+    ) -> Result<crate::plugin_services::NativeEventContext> {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
+        loop {
+            let attempt = match session {
+                Some(session) => self.queries.player_context(uuid, session),
+                None => match self.players.query_snapshot(uuid) {
+                    Ok(Some(player)) => self.queries.player_context(uuid, player.id),
+                    Ok(None) => Err(crate::plugin_services::NativeQueryError::new(
+                        crate::plugin_services::NativeErrorCode::StaleSession,
+                        "Player is not connected",
+                    )),
+                    Err(_) => Err(crate::plugin_services::NativeQueryError::new(
+                        crate::plugin_services::NativeErrorCode::Unavailable,
+                        "Player registry is busy",
+                    )),
+                },
+            };
+            match attempt {
+                Ok(context) => return Ok(context),
+                Err(error)
+                    if error.code == crate::plugin_services::NativeErrorCode::Unavailable
+                        && tokio::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
+    pub async fn player_event(
+        &self,
+        uuid: Uuid,
+        session: i32,
+        name: &str,
+        joining: bool,
+    ) -> Result<()> {
+        let event = if joining {
+            Event::PlayerJoin {
+                uuid: uuid.to_string(),
+                name: name.into(),
+            }
+        } else {
+            Event::PlayerQuit {
+                uuid: uuid.to_string(),
+                name: name.into(),
+            }
+        };
+        let context = if self.java.is_some() {
+            match self.player_context(uuid, Some(session)).await {
+                Ok(context) => Some(context),
+                Err(error) if !joining => {
+                    let java_error = format!("Java player quit context: {error}");
+                    return match self.dispatch_rust_event(event).await {
+                        Ok(()) => Err(java_error.into()),
+                        Err(rust_error) => {
+                            Err(format!("{java_error}; Rust player quit: {rust_error}").into())
+                        }
+                    };
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
+        self.event_with_context(event, context).await
+    }
+
+    async fn event_with_context(
+        &self,
+        event: Event,
+        context: Option<crate::plugin_services::NativeEventContext>,
+    ) -> Result<()> {
         if let Event::Tick { tick } = &event {
             self.tick.fetch_max(*tick, Ordering::Release);
         }
@@ -634,6 +728,9 @@ impl State {
         if let Some(java) = &self.java {
             let results = if disabling {
                 java.shutdown().await
+            } else if let Some(context) = context {
+                java.dispatch_with_context(event.clone(), None, context)
+                    .await
             } else {
                 java.dispatch(event.clone(), None).await
             };
@@ -657,6 +754,19 @@ impl State {
                 }
             }
         }
+        if let Err(error) = self.dispatch_rust_event(event).await {
+            failures.push(error.to_string());
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("; ").into())
+        }
+    }
+
+    async fn dispatch_rust_event(&self, event: Event) -> Result<()> {
+        let disabling = matches!(event, Event::Disable);
+        let mut failures = Vec::new();
         let permit = Arc::clone(&self.plugin_slots).acquire_owned().await?;
         let plugins = Arc::clone(&self.plugins);
         let dispatched = tokio::task::spawn_blocking(move || {
@@ -741,7 +851,10 @@ impl State {
                 if level<2{return Ok(vec!["Permission denied".into()]);}
                 if args.len()!=1&&args.len()!=4{return Ok(vec!["Usage: /summon pig|cow|zombie [x y z]".into()]);}
                 let kind=match args[0].strip_prefix("minecraft:").unwrap_or(&args[0]){"pig"=>zerqon_entities::MobKind::Pig,"cow"=>zerqon_entities::MobKind::Cow,"zombie"=>zerqon_entities::MobKind::Zombie,_=>return Ok(vec!["Supported mobs: pig, cow, zombie".into()])};
-                let position=if args.len()==4{[args[1].parse::<f64>()?,args[2].parse::<f64>()?,args[3].parse::<f64>()?]}else{self.players.snapshots()?.into_iter().find(|player|player.name==sender).map_or([0.5,64.0,0.5],|player|player.position.xyz)};
+                let position=if args.len()==4{[args[1].parse::<f64>()?,args[2].parse::<f64>()?,args[3].parse::<f64>()?]}else{match source {
+                    CommandSource::Player{uuid,..}=>self.players.query_snapshot(uuid)?.ok_or("Player is not connected")?.position.xyz,
+                    CommandSource::Console=>{let spawn=self.world.as_ref().ok_or("World unavailable")?.spawn();[f64::from(spawn.position[0])+0.5,f64::from(spawn.position[1]),f64::from(spawn.position[2])+0.5]},
+                }};
                 let mobs=self.mobs.as_ref().ok_or("mob simulation unavailable")?;
                 let id=mobs.summon(kind,position).await?;
                 Ok(vec![format!("Summoned {} (entity {id})",kind.identifier())])
@@ -750,8 +863,15 @@ impl State {
                 let registered=self.commands.lock().map_err(|_|"command lock poisoned")?.get(&name).cloned();
                 let Some((plugin,permission))=registered else{return Ok(vec!["Unknown command; use /help".into()]);};
                 if permission.is_some()&&!authorized&&!plugin.starts_with("java:"){return Ok(vec!["Permission denied".into()]);}
-                let event=Event::Command{sender:sender.into(),operator:authorized,sender_kind:if matches!(source,CommandSource::Console){SenderKind::Console}else{SenderKind::Player},command:name,args};
-                if let Some(name)=plugin.strip_prefix("java:"){let java=self.java.as_ref().ok_or("Java plugins unavailable")?;let results=java.dispatch(event,Some(name.into())).await?;let mut replies=Vec::new();for result in results{if let Some(error)=result.error{return Err(error.into());}replies.extend(self.apply_actions(&plugin,result.actions));}return Ok(replies);}
+                let mut event=Event::Command{sender:sender.into(),operator:authorized,sender_kind:if matches!(source,CommandSource::Console){SenderKind::Console}else{SenderKind::Player},command:name,args};
+                if let Some(name)=plugin.strip_prefix("java:"){let java=self.java.as_ref().ok_or("Java plugins unavailable")?;let results=match source {
+                    CommandSource::Player{uuid,..}=>{
+                        let context=self.player_context(uuid,None).await?;
+                        if let Event::Command {operator,..}=&mut event { *operator=context.player.operator; }
+                        java.dispatch_with_context(event,Some(name.into()),context).await?
+                    },
+                    CommandSource::Console=>java.dispatch(event,Some(name.into())).await?,
+                };let mut replies=Vec::new();for result in results{if let Some(error)=result.error{return Err(error.into());}replies.extend(self.apply_actions(&plugin,result.actions));}return Ok(replies);}
                 let permit=Arc::clone(&self.plugin_slots).acquire_owned().await?;
                 let plugins=Arc::clone(&self.plugins);let plugin_name=plugin.clone();
                 let actions=tokio::task::spawn_blocking(move||{let _permit=permit;plugins.lock().map_err(|_|"plugin lock poisoned")?.dispatch(&plugin_name,&event).map_err(|error|error.to_string())}).await?.map_err(|error|format!("plugin {plugin}: {error}"))?;
@@ -802,6 +922,30 @@ pub struct World {
     stripes: Arc<[Mutex<()>; 64]>,
 }
 impl World {
+    pub fn descriptor(&self, name: &str) -> Result<crate::plugin_services::NativeWorld> {
+        use crate::plugin_services::{NativeEnvironment, NativePosition, NativeWorld};
+        let spawn = self.spawn();
+        let descriptor = NativeWorld {
+            uuid: self.store.uuid()?,
+            name: name.into(),
+            key: spawn.dimension.clone(),
+            dimension: spawn.dimension,
+            environment: NativeEnvironment::Normal,
+            min_height: zerqon_world::MIN_Y,
+            max_height: zerqon_world::MIN_Y + zerqon_world::WORLD_HEIGHT as i32,
+            spawn: NativePosition {
+                x: f64::from(spawn.position[0]),
+                y: f64::from(spawn.position[1]),
+                z: f64::from(spawn.position[2]),
+                yaw: spawn.yaw,
+                pitch: spawn.pitch,
+            },
+        };
+        if !descriptor.valid() {
+            return Err("invalid native world descriptor".into());
+        }
+        Ok(descriptor)
+    }
     pub fn check_available(&self) -> Result<()> {
         if *self.shutdown.borrow() {
             return Err(zerqon_world::WorldError::StorageUnavailable.into());

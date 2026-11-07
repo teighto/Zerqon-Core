@@ -4,6 +4,8 @@ The normal source-checkout command is `cargo run --release`. For a packaged buil
 
 `cargo run --release -- --init` creates configuration and exits. `cargo run --release -- --check-config` validates it without opening the listener. Port, bind address and thread counts are configured only in the files below. Changes require a restart.
 
+Linux release archives use the static `x86_64-unknown-linux-musl` target. Building them with `python scripts/package-release.py` requires `musl-gcc` from `musl-tools` and `rustup target add x86_64-unknown-linux-musl`. Ordinary `cargo run --release` still builds for the host. The packaged Rust executable does not require glibc; the currently managed Linux Java runtime does, so automatic Java preparation on Alpine is not yet supported.
+
 ## Runtime directory
 
 ```text
@@ -27,6 +29,8 @@ server/
 `--directory PATH` selects the server directory. Relative `data_directory` paths resolve from it. Game data is prepared automatically inside `.cache/vanilla/26.3`. Keep the Java plugin libraries from the distribution in that server directory's `libraries/` folder.
 
 Managed Java normally lives in `.cache/java/`. An existing working local runtime is reused, including when downloads are disabled. For a new download on Windows, a non-ASCII server path selects `%LOCALAPPDATA%\Zerqon\cache\java` instead: Java 25's launcher cannot reliably start from paths outside the system code page. This cache is shared by Zerqon servers in the same Windows account. Both locations reject links and reparse points. If the user-cache path also contains non-ASCII characters, set `java_executable` to an installed Java 25 in an ASCII path. An explicit executable is never replaced; the system Java installation and PATH are unchanged.
+
+Before running managed Java, Zerqon checks the JRE files against the sizes and SHA-256 hashes embedded for the pinned release. Missing, changed or extra files stop startup; existing cache files are preserved. The default `java` setting looks for installed Java only in absolute directory entries in PATH. An explicit `java_executable` path is the administrator's choice and is not checked against the managed JRE inventory.
 
 ## server.properties
 
@@ -60,6 +64,8 @@ This file uses TOML. Missing keys use defaults; unknown keys are errors.
 | `plugin_fuel` | `1000000` | 1,000–100,000,000 WASM fuel units per event |
 | `plugin_memory_mib` | `16` | 1–256 MiB WASM linear memory per plugin |
 | `java_plugins` | `true` | Enable the optional host when Java JAR plugins are present |
+| `allow_java_clients` | `true` | Allow clients using the standard Java Edition connection profile |
+| `allow_horizon_clients` | `true` | Allow clients that answer the Horizon compatibility exchange |
 | `java_executable` | `java` | Java 25 executable path |
 | `auto_download_runtime` | `true` | Download a private Java 25 runtime when needed; custom paths are never replaced |
 | `max_entities` | `128` | Maximum mobs, from 1 to 10,000 |
@@ -70,6 +76,14 @@ This file uses TOML. Missing keys use defaults; unknown keys are errors.
 Set the bind address and port in `server.properties`, and thread counts in `server.settings`. These values have no command-line overrides. WASM memory limits cover linear memory, and the chunk byte bound covers the cache; neither is a process-wide RAM cap. The optional Java plugin host has a separate 128 MiB heap limit.
 
 The update checker runs in the background, starting with one check at startup. It uses no GitHub token, skips drafts and prereleases, and downloads no software. New-version notices appear once in the console and once per operator session and version, in English, with the GitHub release link. Failed checks back off; status-only mode never starts the checker. Set `update_check = false` to disable all update-check requests.
+
+## Client connections
+
+Both client settings are enabled by default. Set `allow_java_clients = false` to require the Horizon connection profile, or `allow_horizon_clients = false` to refuse that profile. Setting both to `false` closes player admission; server-list status remains available.
+
+Horizon initially reports the same brand as vanilla, so Zerqon checks its supported configuration exchange before allowing entry. This identifies a connection profile, not the language or authenticity of the client. A modified client can imitate or hide the response. These settings do not grant permissions or replace `online-mode` account authentication. Zerqon's server brand stays unchanged.
+
+The exchange does not install or load mods. A Horizon response containing shared content mods is rejected because Zerqon does not support their additional registries. Server plugins stay in the existing Java and Rust plugin directories. Standard clients proceed at the usual configuration response, without an additional timeout wait.
 
 ## Command line
 
@@ -99,7 +113,15 @@ Players currently use Creative mode. Ordinary blocks, logs, dry slabs and stairs
 
 ## Русский
 
+`allow_java_clients` и `allow_horizon_clients` по умолчанию включены. Первый разрешает обычный профиль подключения Java Edition, второй — профиль Horizon. Если выключить оба, вход игроков будет закрыт, но сервер останется виден в списке серверов.
+
+Horizon сначала сообщает тот же бренд, что и vanilla, поэтому сервер проверяет его ответ при подключении. Это проверка совместимого профиля: язык программы и подлинность клиента она не доказывает. Изменённый клиент может скрыть или повторить такой ответ. Права игроков и проверка аккаунта через `online-mode` от этих настроек не зависят; бренд Zerqon не меняется.
+
+Моды при этом не загружаются. Если Horizon сообщает о модах с общим игровым содержимым, подключение отклоняется: их дополнительные реестры пока не поддерживаются. Серверные плагины по-прежнему находятся в папках Java- и Rust-плагинов. Для обычного клиента дополнительного ожидания при входе нет.
+
 Обычный запуск из исходников — `cargo run --release`, без флагов. Нативная сборка запускается через `./zerqon` или `.\zerqon.exe`. Первый запуск создаёт недостающие конфиги; перед запуском сервера нужно принять Minecraft EULA.
+
+Linux-дистрибутив собирается для `x86_64-unknown-linux-musl`. Для `python scripts/package-release.py` нужны `musl-gcc` из пакета `musl-tools` и цель Rust, добавленная командой `rustup target add x86_64-unknown-linux-musl`. Обычный `cargo run --release` использует платформу сборщика. Готовому Rust-файлу glibc не нужна, но автоматически загружаемой Java она пока нужна; автоматическая подготовка Java на Alpine ещё не поддерживается.
 
 Команда `/give ИГРОК minecraft:ПРЕДМЕТ [КОЛИЧЕСТВО]` выдаёт предметы подключённому игроку; нужен второй уровень оператора. По умолчанию выдаётся один предмет, максимум — 4 096. Если места не хватает на всё количество, команда ничего не добавляет. Инвентарь сохраняется по UUID в `world/playerdata/`. Выбрасывание предметов, крафт и работа специальных контейнеров ещё дорабатываются.
 
@@ -110,6 +132,8 @@ Players currently use Creative mode. Ordinary blocks, logs, dry slabs and stairs
 Для папки `run` используйте `--directory run`. Игровые данные подготовятся автоматически в `run/.cache/vanilla/26.3`; Java-библиотеки из дистрибутива должны находиться в `run/libraries/`. Плагины устанавливаются в `plugins/rust-plugins/` и `plugins/java-plugins/` внутри выбранной папки.
 
 Java обычно скачивается в `.cache/java/`. Уже установленная рабочая копия используется повторно, даже при отключённой загрузке. Для новой загрузки на Windows, если путь содержит символы вне ASCII, используется `%LOCALAPPDATA%\Zerqon\cache\java`: запускатор Java 25 не всегда умеет работать с такими путями. Этот кеш общий для серверов Zerqon одного пользователя. Если и путь профиля содержит такие символы, укажите в `java_executable` установленную Java 25 с путём из ASCII-символов. Системная Java и PATH не меняются.
+
+Перед запуском управляемой Java Zerqon сверяет размеры и SHA-256 файлов JRE со встроенным списком для закреплённой версии. Изменённый, отсутствующий или лишний файл останавливает запуск; существующие файлы кеша сохраняются. Для системной Java значение `java` использует только абсолютные каталоги PATH. Явно указанный путь `java_executable` выбирает администратор; хеши такой Java по списку управляемого кеша не проверяются.
 
 Адрес и порт задаются только в `server.properties`, количество потоков — только в `server.settings`. Переопределений этих настроек через командную строку нет. Для служебных флагов Cargo нужен разделитель `--`: например, `cargo run --release -- --directory run`.
 

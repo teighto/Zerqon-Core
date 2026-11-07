@@ -1,15 +1,14 @@
 package io.github.teighto.zerqon.api;
 
 import java.util.Objects;
-import java.util.function.Supplier;
 
 public final class NativeQueryBinding {
     private NativeQueryBinding() {}
 
-    public static Scope bind(Supplier<NativeQueries.ServerSnapshot> query) {
+    public static Scope bind(NativeQueries.Access query) {
         Objects.requireNonNull(query, "query");
         Thread owner = Thread.currentThread();
-        Supplier<NativeQueries.ServerSnapshot> previous = NativeQueries.CURRENT.get();
+        NativeQueries.Access previous = NativeQueries.CURRENT.get();
         NativeQueries.CURRENT.set(query);
         return () -> {
             if (Thread.currentThread() != owner || NativeQueries.CURRENT.get() != query) throw new IllegalStateException("Native callback scopes must close on their owner in reverse order");

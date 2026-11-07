@@ -83,11 +83,13 @@ public final class PluginHost implements AutoCloseable {
                     yield loadDirectory(Path.of(Wire.string(request, "directory", 4096)), Wire.string(request, "server_version", 128));
                 }
                 case "event" -> {
-                    Wire.fields(request, "id", "op", "plugin", "event");
+                    Wire.fields(request, "id", "op", "plugin", "event", "context");
                     JsonElement event = request.get("event");
                     if (event == null || !event.isJsonObject()) throw new IllegalArgumentException("event must be an object");
                     String target = request.has("plugin") ? Wire.string(request, "plugin", 64) : null;
-                    yield dispatch(target, Wire.event(event.getAsJsonObject()));
+                    Event decoded = Wire.event(event.getAsJsonObject());
+                    nativeTransport.context(decoded, request);
+                    yield dispatch(target, decoded);
                 }
                 case "list" -> {
                     Wire.fields(request, "id", "op");

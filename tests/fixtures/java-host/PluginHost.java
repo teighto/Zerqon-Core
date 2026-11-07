@@ -26,7 +26,7 @@ public final class PluginHost {
                     System.out.println("{\"id\":" + id + ",\"ok\":true,\"results\":[],\"protocol\":" + protocol + ",\"capabilities\":[\"" + capability + "\"]}");
                 }
             } else if (line.contains("\"op\":\"load\"")) {
-                for (String candidate : new String[]{"timeout", "oversize", "wrong_id", "bad_json", "eof", "stderr", "bad_action", "startup_timeout", "pid", "charset", "native", "native_wrong_parent", "native_wrong_id", "native_unknown_plugin", "native_unknown_query", "native_unknown_field", "native_duplicate_field", "native_oversize", "native_duplicate", "native_limit", "native_error", "native_two", "native_stall", "native_list", "native_disabled"}) {
+                for (String candidate : new String[]{"timeout", "oversize", "wrong_id", "bad_json", "eof", "stderr", "bad_action", "startup_timeout", "pid", "charset", "native", "native_wrong_parent", "native_wrong_id", "native_unknown_plugin", "native_unknown_query", "native_unknown_field", "native_duplicate_field", "native_oversize", "native_duplicate", "native_limit", "native_error", "native_two", "native_stall", "native_list", "native_disabled", "native_players"}) {
                     if (line.contains("java-fixture-" + candidate + "\"")) mode = candidate;
                 }
                 if (mode.equals("startup_timeout")) Thread.sleep(60_000);
@@ -43,18 +43,19 @@ public final class PluginHost {
                 respond(id, !mode.equals("native_disabled"), "[]");
             } else {
                 switch (mode) {
-                    case "native", "native_error", "native_two", "native_stall", "native_disabled" -> {
+                    case "native", "native_error", "native_two", "native_stall", "native_disabled", "native_players" -> {
                         int count = mode.equals("native_two") ? 2 : 1;
                         for (int call = 1; call <= count; call++) {
-                            System.out.println(nativeCall(id, call, "fixture", "server_snapshot"));
+                            System.out.println(nativeCall(id, call, "fixture", mode.equals("native_players") ? "online_players" : "server_snapshot"));
                             System.out.flush();
                             String response = reader.readLine();
-                            if (mode.equals("native_error")) {
+                            if (mode.equals("native_error") || mode.equals("native_players")) {
                                 if (response == null || !response.contains("\"ok\":false") || !response.contains("\"code\":")) throw new IllegalStateException("missing native error");
+                                if (mode.equals("native_players") && !response.contains("\"code\":\"capacity\"")) throw new IllegalStateException("missing capacity error");
                             } else if (response == null || !response.contains("\"tick\":123") || !response.contains("\"online_players\":2")) throw new IllegalStateException("bad native result");
                         }
                         if (mode.equals("native_stall")) Thread.sleep(60_000);
-                        respond(id, !mode.equals("native_disabled"), "[{\"action\":\"reply\",\"message\":\"" + (mode.equals("native_error") ? "native-error" : "snapshot:123:2") + "\"}]");
+                        respond(id, !mode.equals("native_disabled"), "[{\"action\":\"reply\",\"message\":\"" + (mode.equals("native_error") || mode.equals("native_players") ? "native-error" : "snapshot:123:2") + "\"}]");
                     }
                     case "native_wrong_parent", "native_wrong_id", "native_unknown_plugin", "native_unknown_query", "native_unknown_field", "native_duplicate_field", "native_oversize", "native_duplicate", "native_limit" -> {
                         int count = mode.equals("native_limit") ? 129 : mode.equals("native_duplicate") ? 2 : 1;

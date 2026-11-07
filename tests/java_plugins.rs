@@ -9,6 +9,7 @@ include!("../src/java_plugins.rs");
 mod tests {
     use super::*;
     use crate::java_launch::classpath_manifest;
+    use crate::plugin_services::ServerSnapshot;
     use std::sync::OnceLock;
     use tokio::io::BufReader;
 
@@ -37,7 +38,8 @@ mod tests {
                     max_players: 64,
                     online_players: 2,
                     tick: 123,
-                })
+                }
+                .into())
             })
         }
     }
@@ -95,7 +97,7 @@ mod tests {
             Box::pin(async move {
                 let _guard = guard;
                 tokio::time::sleep(self.delay).await;
-                self.result.clone()
+                self.result.clone().map(NativeQueryValue::from)
             })
         }
     }
@@ -105,6 +107,116 @@ mod tests {
         std::fs::create_dir_all(&settings.directory).unwrap();
         std::fs::copy(&settings.host_jar, settings.directory.join("fixture.jar")).unwrap();
         settings
+    }
+
+    #[tokio::test]
+    async fn oversized_valid_player_query_returns_capacity_without_killing_the_host() {
+        use crate::plugin_services::{MAX_QUERY_PLAYERS, NativePlayer, NativePosition};
+        struct LargePlayers;
+        impl NativeQueryService for LargePlayers {
+            fn query(
+                &self,
+                _: NativeCallContext,
+                _: NativeQuery,
+            ) -> plugin_services::NativeQueryFuture<'_> {
+                Box::pin(async {
+                    Ok(NativeQueryValue::OnlinePlayers {
+                        players: (1..=MAX_QUERY_PLAYERS)
+                            .map(|index| NativePlayer {
+                                uuid: uuid::Uuid::from_u128(index as u128),
+                                session_id: index as i32,
+                                entity_id: index as i32,
+                                name: format!("Player{index:010}"),
+                                world_uuid: uuid::Uuid::from_u128(99999),
+                                position: NativePosition {
+                                    x: 29999999.125,
+                                    y: 9999.875,
+                                    z: -29999999.625,
+                                    yaw: 89.125,
+                                    pitch: -81.875,
+                                },
+                                operator: false,
+                                online: true,
+                            })
+                            .collect(),
+                    })
+                })
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let plugins = JavaPlugins::spawn_with_services(
+            native_config("native_players", directory.path()),
+            Arc::new(LargePlayers),
+        )
+        .await
+        .unwrap();
+        let reply = plugins
+            .dispatch(Event::Tick { tick: 1 }, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            reply[0].actions,
+            [Action::Reply {
+                message: "native-error".into()
+            }]
+        );
+        assert!(plugins.list().await.unwrap()[0].enabled);
+        plugins.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_player_event_context_is_rejected_before_host_dispatch() {
+        use crate::plugin_services::{NativePlayer, NativePosition};
+        let directory = tempfile::tempdir().unwrap();
+        let plugins = JavaPlugins::spawn_with_services(
+            native_config("echo", directory.path()),
+            Arc::new(SnapshotService),
+        )
+        .await
+        .unwrap();
+        let context = NativeEventContext {
+            player: NativePlayer {
+                uuid: uuid::Uuid::from_u128(1),
+                session_id: 7,
+                entity_id: 7,
+                name: "CONSOLE".into(),
+                world_uuid: uuid::Uuid::from_u128(2),
+                position: NativePosition {
+                    x: 0.5,
+                    y: 64.0,
+                    z: 0.5,
+                    yaw: 0.0,
+                    pitch: 0.0,
+                },
+                operator: false,
+                online: true,
+            },
+        };
+        assert!(matches!(
+            plugins
+                .dispatch_with_context(native_command("read"), None, context.clone())
+                .await,
+            Err(JavaPluginError::Configuration(_))
+        ));
+        let command = Event::Command {
+            sender: "CONSOLE".into(),
+            sender_kind: zerqon_plugin_api::SenderKind::Player,
+            operator: false,
+            command: "read".into(),
+            args: Vec::new(),
+        };
+        assert_eq!(
+            plugins
+                .dispatch_with_context(command, None, context)
+                .await
+                .unwrap()[0]
+                .actions,
+            [Action::Reply {
+                message: "received".into()
+            }]
+        );
+        assert!(plugins.list().await.unwrap()[0].enabled);
+        plugins.shutdown().await.unwrap();
     }
 
     #[tokio::test]

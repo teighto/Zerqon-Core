@@ -1,8 +1,8 @@
 use crate::java_launch::{JavaLaunchError, JavaLaunchPath};
 use crate::plugin_services::{
     MAX_NATIVE_CALL_BYTES, MAX_NATIVE_CALLS, MAX_NATIVE_RESULT_BYTES, MAX_NATIVE_TOTAL_BYTES,
-    NativeCallContext, NativeErrorCode, NativeQuery, NativeQueryError, NativeQueryService,
-    ServerSnapshot,
+    NativeCallContext, NativeErrorCode, NativeEventContext, NativeQuery, NativeQueryError,
+    NativeQueryService, NativeQueryValue,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -89,6 +89,8 @@ enum Operation {
         event: Event,
         #[serde(skip_serializing_if = "Option::is_none")]
         plugin: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        context: Option<NativeEventContext>,
     },
     List,
     Shutdown,
@@ -186,7 +188,7 @@ struct NativeResult {
 #[derive(Serialize)]
 #[serde(untagged)]
 enum NativeResultValue {
-    Success { ok: bool, value: ServerSnapshot },
+    Success { ok: bool, value: NativeQueryValue },
     Error { ok: bool, error: NativeQueryError },
 }
 
@@ -334,8 +336,39 @@ impl JavaPlugins {
         if plugin.as_ref().is_some_and(|name| !valid_plugin_name(name)) {
             return Err(JavaPluginError::Configuration("invalid plugin name"));
         }
-        self.request(Operation::Event { event, plugin }, self.request_timeout)
-            .await
+        self.request(
+            Operation::Event {
+                event,
+                plugin,
+                context: None,
+            },
+            self.request_timeout,
+        )
+        .await
+    }
+
+    pub async fn dispatch_with_context(
+        &self,
+        event: Event,
+        plugin: Option<String>,
+        context: NativeEventContext,
+    ) -> Result<Vec<JavaPluginResult>, JavaPluginError> {
+        if !context.matches_event(&event)
+            || plugin.as_ref().is_some_and(|name| !valid_plugin_name(name))
+        {
+            return Err(JavaPluginError::Configuration(
+                "invalid native event context",
+            ));
+        }
+        self.request(
+            Operation::Event {
+                event,
+                plugin,
+                context: Some(context),
+            },
+            self.request_timeout,
+        )
+        .await
     }
     pub async fn list(&self) -> Result<Vec<JavaPluginResult>, JavaPluginError> {
         self.request(Operation::List, self.request_timeout).await
@@ -566,17 +599,24 @@ async fn run_host(
                             call_id: call.call_id,
                             deadline,
                         };
-                        let queried =
-                            timeout_at(deadline, native.service.query(context, call.operation))
+                        let query = call.operation;
+                        let queried = if query.valid() {
+                            timeout_at(deadline, native.service.query(context, query.clone()))
                                 .await
                                 .unwrap_or_else(|_| {
                                     Err(NativeQueryError::new(
                                         NativeErrorCode::DeadlineExceeded,
                                         "Native query deadline exceeded",
                                     ))
-                                });
+                                })
+                        } else {
+                            Err(NativeQueryError::new(
+                                NativeErrorCode::InvalidArgument,
+                                "Invalid native query arguments",
+                            ))
+                        };
                         let result = match queried {
-                            Ok(value) if value.valid() => {
+                            Ok(value) if value.valid_for(&query) => {
                                 NativeResultValue::Success { ok: true, value }
                             }
                             Err(error) if error.valid() => {
@@ -594,7 +634,7 @@ async fn run_host(
                             bytes: Vec::new(),
                             limit: MAX_NATIVE_RESULT_BYTES,
                         };
-                        serde_json::to_writer(
+                        let encoded = serde_json::to_writer(
                             &mut writer,
                             &NativeResult {
                                 kind: "native_result",
@@ -602,10 +642,28 @@ async fn run_host(
                                 call_id: call.call_id,
                                 result,
                             },
-                        )
-                        .map_err(|_| {
-                            JavaPluginError::Protocol("native query result exceeds limit")
-                        })?;
+                        );
+                        if encoded.is_err() {
+                            writer.bytes.clear();
+                            serde_json::to_writer(
+                                &mut writer,
+                                &NativeResult {
+                                    kind: "native_result",
+                                    parent_id: request.id,
+                                    call_id: call.call_id,
+                                    result: NativeResultValue::Error {
+                                        ok: false,
+                                        error: NativeQueryError::new(
+                                            NativeErrorCode::Capacity,
+                                            "Native query result exceeds its byte limit",
+                                        ),
+                                    },
+                                },
+                            )
+                            .map_err(|_| {
+                                JavaPluginError::Protocol("native query error exceeds limit")
+                            })?;
+                        }
                         response_bytes += writer.bytes.len();
                         if response_bytes > MAX_NATIVE_TOTAL_BYTES {
                             return Err(JavaPluginError::Protocol("native query budget exceeded"));

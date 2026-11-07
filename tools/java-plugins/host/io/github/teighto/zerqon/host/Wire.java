@@ -106,6 +106,21 @@ final class Wire {
         return value.getAsJsonObject();
     }
 
+    static JsonArray array(JsonObject object, String field, int maximum) {
+        JsonElement value = object.get(field);
+        if (value == null || !value.isJsonArray() || value.getAsJsonArray().size() > maximum) throw new IllegalArgumentException("Invalid bounded array: " + field);
+        return value.getAsJsonArray();
+    }
+
+    static int signedInteger(JsonObject object, String field, int minimum, int maximum) {
+        JsonElement value = object.get(field);
+        if (value == null || !value.isJsonPrimitive() || !value.getAsJsonPrimitive().isNumber()
+                || !value.getAsString().matches("-?(0|[1-9][0-9]{0,9})")) throw new IllegalArgumentException("Invalid signed integer: " + field);
+        int result = value.getAsBigDecimal().intValueExact();
+        if (result < minimum || result > maximum) throw new IllegalArgumentException("Signed integer outside range: " + field);
+        return result;
+    }
+
     static boolean bool(JsonObject object, String field) {
         JsonElement value = object.get(field);
         if (value == null || !value.isJsonPrimitive() || !value.getAsJsonPrimitive().isBoolean()) throw new IllegalArgumentException("missing boolean: " + field);

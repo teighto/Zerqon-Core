@@ -3,10 +3,13 @@ use bytes::Bytes;
 use std::collections::BTreeMap;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicI32, Ordering},
+    atomic::{AtomicBool, AtomicI32, Ordering},
 };
 use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
+
+#[cfg(test)]
+mod tracking_review;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InventoryRevision {
@@ -125,9 +128,26 @@ struct Player {
     outbound: mpsc::Sender<PacketBatch>,
     disconnect: watch::Sender<bool>,
     equipment: Option<Bytes>,
+    profile: Bytes,
+    latency: i32,
+}
+#[derive(Clone)]
+struct ReplicatedPlayer {
+    id: i32,
+    position: Position,
+    equipment: Option<Bytes>,
+    profile: Bytes,
+    latency: i32,
+}
+struct TrackingPackets {
+    spawn: PacketBatch,
+    movement: [Bytes; 2],
+    latency: Bytes,
 }
 pub struct Players {
     inner: Mutex<BTreeMap<Uuid, Player>>,
+    replicated: Mutex<BTreeMap<Uuid, ReplicatedPlayer>>,
+    tracking_dirty: AtomicBool,
     capacity: usize,
     radius: f64,
     player_type: i32,
@@ -137,6 +157,15 @@ pub struct PlayerHandle {
     players: Arc<Players>,
     uuid: Uuid,
     id: i32,
+}
+
+fn player_snapshot(player: &Player) -> PlayerSnapshot {
+    PlayerSnapshot {
+        uuid: player.identity.uuid,
+        id: player.id,
+        name: player.identity.name.clone(),
+        position: player.position,
+    }
 }
 
 impl Players {
@@ -155,19 +184,132 @@ impl Players {
         if player.equipment.as_ref() == Some(&packet) {
             return Ok(());
         }
-        player.equipment = Some(packet.clone());
-        let position = player.position;
-        if !player.active {
+        player.equipment = Some(packet);
+        self.tracking_dirty.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
+    pub fn tracking_tick(&self) -> Result<(), PlayerError> {
+        let inner = self.inner.lock().map_err(|_| PlayerError::Unavailable)?;
+        if !self.tracking_dirty.load(Ordering::Relaxed) {
             return Ok(());
         }
-        for other in inner
+        let mut previous = self
+            .replicated
+            .lock()
+            .map_err(|_| PlayerError::Unavailable)?;
+        let current: BTreeMap<_, _> = inner
             .values()
-            .filter(|other| other.active && other.identity.uuid != uuid)
-        {
-            if self.visible(position, other.position) {
-                enqueue(other, vec![packet.clone()]);
+            .filter(|player| player.active)
+            .map(|player| {
+                (
+                    player.identity.uuid,
+                    ReplicatedPlayer {
+                        id: player.id,
+                        position: player.position,
+                        equipment: player.equipment.clone(),
+                        profile: player.profile.clone(),
+                        latency: player.latency,
+                    },
+                )
+            })
+            .collect();
+        let packets: BTreeMap<_, _> = current
+            .iter()
+            .map(|(&uuid, player)| {
+                let mut latency = vec![71, 0x10, 1];
+                latency.extend_from_slice(uuid.as_bytes());
+                zerqon_protocol::codec::put_varint(player.latency, &mut latency);
+                (
+                    uuid,
+                    TrackingPackets {
+                        spawn: spawn_packets(uuid, player, self.player_type),
+                        movement: [
+                            entity_packets::position_sync(
+                                player.id,
+                                player.position.xyz,
+                                player.position.yaw,
+                                player.position.pitch,
+                                player.position.on_ground,
+                            )
+                            .into(),
+                            entity_packets::head_rotation(player.id, player.position.yaw).into(),
+                        ],
+                        latency: latency.into(),
+                    },
+                )
+            })
+            .collect();
+        for (&observer_uuid, observer) in &current {
+            let destination = &inner[&observer_uuid];
+            if *destination.disconnect.borrow() {
+                continue;
+            }
+            let old_observer = previous
+                .get(&observer_uuid)
+                .filter(|old| old.id == observer.id);
+            let mut batch = Vec::new();
+            if let Some(old_observer) = old_observer {
+                let mut removed_entities = Vec::new();
+                let mut removed_profiles = Vec::new();
+                for (&uuid, old) in previous.iter() {
+                    let next = current.get(&uuid).filter(|next| next.id == old.id);
+                    let was_visible =
+                        uuid != observer_uuid && self.visible(old.position, old_observer.position);
+                    if was_visible
+                        && next.is_none_or(|next| !self.visible(next.position, observer.position))
+                    {
+                        removed_entities.push(old.id);
+                    }
+                    if next.is_none() {
+                        removed_profiles.push(uuid);
+                    }
+                }
+                if !removed_entities.is_empty() {
+                    batch.push(entity_packets::remove_entities(&removed_entities).into());
+                }
+                if !removed_profiles.is_empty() {
+                    batch.push(entity_packets::player_info_remove(&removed_profiles).into());
+                }
+            }
+            for (&uuid, player) in &current {
+                let old = old_observer
+                    .and_then(|_| previous.get(&uuid))
+                    .filter(|old| old.id == player.id);
+                let encoded = &packets[&uuid];
+                if old.is_none() {
+                    batch.push(player.profile.clone());
+                }
+                if player.latency != old.map_or(0, |old| old.latency) {
+                    batch.push(encoded.latency.clone());
+                }
+                if uuid == observer_uuid || !self.visible(player.position, observer.position) {
+                    continue;
+                }
+                let was_visible = old
+                    .zip(old_observer)
+                    .is_some_and(|(old, observer)| self.visible(old.position, observer.position));
+                if !was_visible {
+                    batch.extend(encoded.spawn.iter().cloned());
+                } else if let Some(old) = old {
+                    if player.position != old.position {
+                        batch.extend(encoded.movement.iter().cloned());
+                    }
+                    if player.equipment != old.equipment
+                        && let Some(equipment) = &player.equipment
+                    {
+                        batch.push(equipment.clone());
+                    }
+                }
+            }
+            if !batch.is_empty() {
+                enqueue(destination, batch);
             }
         }
+        // Failed enqueues permanently disconnect their observer. Every remaining
+        // observer has the same last-enqueued baseline, in its reliable FIFO.
+        *previous = current;
+        self.tracking_dirty.store(false, Ordering::Relaxed);
         Ok(())
     }
     pub fn snapshots(&self) -> Result<Vec<PlayerSnapshot>, PlayerError> {
@@ -175,12 +317,39 @@ impl Players {
         Ok(inner
             .values()
             .filter(|player| player.active)
-            .map(|player| PlayerSnapshot {
-                uuid: player.identity.uuid,
-                id: player.id,
-                name: player.identity.name.clone(),
-                position: player.position,
-            })
+            .map(player_snapshot)
+            .collect())
+    }
+
+    pub fn query_snapshot(&self, uuid: Uuid) -> Result<Option<PlayerSnapshot>, PlayerError> {
+        let inner = self
+            .inner
+            .try_lock()
+            .map_err(|_| PlayerError::Unavailable)?;
+        Ok(inner
+            .get(&uuid)
+            .filter(|player| player.active)
+            .map(player_snapshot))
+    }
+
+    pub fn snapshots_bounded(&self, limit: usize) -> Result<Vec<PlayerSnapshot>, PlayerError> {
+        let inner = self
+            .inner
+            .try_lock()
+            .map_err(|_| PlayerError::Unavailable)?;
+        if inner
+            .values()
+            .filter(|player| player.active)
+            .take(limit.saturating_add(1))
+            .count()
+            > limit
+        {
+            return Err(PlayerError::Capacity);
+        }
+        Ok(inner
+            .values()
+            .filter(|player| player.active)
+            .map(player_snapshot)
             .collect())
     }
     pub fn dispatch_batches<B: Into<PacketBatch>>(
@@ -205,6 +374,8 @@ impl Players {
     pub fn new(capacity: usize, radius: f64, player_type: i32, ids: Arc<EntityIds>) -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(BTreeMap::new()),
+            replicated: Mutex::new(BTreeMap::new()),
+            tracking_dirty: AtomicBool::new(false),
             capacity,
             radius,
             player_type,
@@ -241,6 +412,7 @@ impl Players {
         }
         let id = self.ids.next()?;
         let uuid = identity.uuid;
+        let profile = profile_packet(&identity);
         inner.insert(
             uuid,
             Player {
@@ -251,6 +423,8 @@ impl Players {
                 outbound,
                 disconnect,
                 equipment: None,
+                profile,
+                latency: 0,
             },
         );
         Ok(PlayerHandle {
@@ -260,11 +434,13 @@ impl Players {
         })
     }
     pub fn count(&self) -> usize {
-        self.try_count().unwrap_or(0)
+        self.inner.lock().map_or(0, |inner| {
+            inner.values().filter(|player| player.active).count()
+        })
     }
     pub fn try_count(&self) -> Result<usize, PlayerError> {
         self.inner
-            .lock()
+            .try_lock()
             .map(|inner| inner.values().filter(|player| player.active).count())
             .map_err(|_| PlayerError::Unavailable)
     }
@@ -302,27 +478,15 @@ impl PlayerHandle {
             .inner
             .lock()
             .map_err(|_| PlayerError::Unavailable)?;
-        let player = inner.get_mut(&self.uuid).ok_or(PlayerError::Unavailable)?;
+        let player = inner
+            .get_mut(&self.uuid)
+            .filter(|player| player.id == self.id)
+            .ok_or(PlayerError::Unavailable)?;
         if player.active {
             return Ok(());
         }
         player.active = true;
-        let player = inner.get(&self.uuid).ok_or(PlayerError::Unavailable)?;
-        let profile = profile_packet(&player.identity);
-        let mut own = vec![profile.clone()];
-        for other in inner
-            .values()
-            .filter(|other| other.active && other.identity.uuid != self.uuid)
-        {
-            let mut remote = vec![profile.clone()];
-            own.push(profile_packet(&other.identity));
-            if self.players.visible(player.position, other.position) {
-                remote.extend(spawn_packets(player, self.players.player_type));
-                own.extend(spawn_packets(other, self.players.player_type));
-            }
-            enqueue(other, remote);
-        }
-        enqueue(player, own);
+        self.players.tracking_dirty.store(true, Ordering::Relaxed);
         Ok(())
     }
     pub fn move_to(&self, position: Position) -> Result<(), PlayerError> {
@@ -340,64 +504,31 @@ impl PlayerHandle {
             .inner
             .lock()
             .map_err(|_| PlayerError::Unavailable)?;
-        let player = inner.get_mut(&self.uuid).ok_or(PlayerError::Unavailable)?;
-        let previous = player.position;
-        player.position = position;
-        if !player.active {
+        let player = inner
+            .get_mut(&self.uuid)
+            .filter(|player| player.id == self.id)
+            .ok_or(PlayerError::Unavailable)?;
+        if player.position == position {
             return Ok(());
         }
-        let player = inner.get(&self.uuid).ok_or(PlayerError::Unavailable)?;
-        let movement = Bytes::from(entity_packets::position_sync(
-            player.id,
-            position.xyz,
-            position.yaw,
-            position.pitch,
-            position.on_ground,
-        ));
-        let rotation = Bytes::from(entity_packets::head_rotation(player.id, position.yaw));
-        let mut own = Vec::new();
-        for other in inner
-            .values()
-            .filter(|other| other.active && other.identity.uuid != self.uuid)
-        {
-            let was_visible = self.players.visible(previous, other.position);
-            let visible = self.players.visible(position, other.position);
-            match (was_visible, visible) {
-                (false, true) => {
-                    enqueue(other, spawn_packets(player, self.players.player_type));
-                    own.extend(spawn_packets(other, self.players.player_type));
-                }
-                (true, false) => {
-                    enqueue(
-                        other,
-                        vec![entity_packets::remove_entities(&[player.id]).into()],
-                    );
-                    own.push(entity_packets::remove_entities(&[other.id]).into());
-                }
-                (true, true) => enqueue(other, vec![movement.clone(), rotation.clone()]),
-                (false, false) => {}
-            }
-        }
-        if !own.is_empty() {
-            enqueue(player, own);
-        }
+        player.position = position;
+        self.players.tracking_dirty.store(true, Ordering::Relaxed);
         Ok(())
     }
     pub fn latency(&self, milliseconds: i32) -> Result<(), PlayerError> {
-        let inner = self
+        let mut inner = self
             .players
             .inner
             .lock()
             .map_err(|_| PlayerError::Unavailable)?;
-        if !inner.get(&self.uuid).is_some_and(|player| player.active) {
-            return Err(PlayerError::Unavailable);
-        }
-        let mut packet = vec![71, 0x10, 1];
-        packet.extend_from_slice(self.uuid.as_bytes());
-        zerqon_protocol::codec::put_varint(milliseconds.max(0), &mut packet);
-        let packet = Bytes::from(packet);
-        for player in inner.values().filter(|player| player.active) {
-            enqueue(player, vec![packet.clone()]);
+        let player = inner
+            .get_mut(&self.uuid)
+            .filter(|player| player.active && player.id == self.id)
+            .ok_or(PlayerError::Unavailable)?;
+        let milliseconds = milliseconds.max(0);
+        if player.latency != milliseconds {
+            player.latency = milliseconds;
+            self.players.tracking_dirty.store(true, Ordering::Relaxed);
         }
         Ok(())
     }
@@ -406,23 +537,21 @@ impl PlayerHandle {
 impl Drop for PlayerHandle {
     fn drop(&mut self) {
         if let Ok(mut inner) = self.players.inner.lock()
-            && let Some(player) = inner.remove(&self.uuid).filter(|player| player.active)
+            && inner
+                .get(&self.uuid)
+                .is_some_and(|player| player.id == self.id)
         {
-            let tab = Bytes::from(entity_packets::player_info_remove(&[self.uuid]));
-            let removed = Bytes::from(entity_packets::remove_entities(&[player.id]));
-            for other in inner.values().filter(|other| other.active) {
-                let mut batch = vec![tab.clone()];
-                if self.players.visible(player.position, other.position) {
-                    batch.push(removed.clone());
-                }
-                enqueue(other, batch);
-            }
+            inner.remove(&self.uuid);
+            self.players.tracking_dirty.store(true, Ordering::Relaxed);
         }
     }
 }
 fn enqueue(player: &Player, batch: impl Into<PacketBatch>) {
+    if *player.disconnect.borrow() {
+        return;
+    }
     if player.outbound.try_send(batch.into()).is_err() {
-        let _ = player.disconnect.send(true);
+        player.disconnect.send_replace(true);
     }
 }
 fn profile_packet(identity: &Identity) -> Bytes {
@@ -437,11 +566,11 @@ fn profile_packet(identity: &Identity) -> Bytes {
     entity_packets::player_info_add_properties(identity.uuid, &identity.name, true, &properties)
         .into()
 }
-fn spawn_packets(player: &Player, kind: i32) -> PacketBatch {
+fn spawn_packets(uuid: Uuid, player: &ReplicatedPlayer, kind: i32) -> PacketBatch {
     let mut packets = vec![
         entity_packets::add_entity(
             player.id,
-            player.identity.uuid,
+            uuid,
             kind,
             player.position.xyz,
             player.position.yaw,
@@ -490,6 +619,493 @@ mod tests {
     }
 
     #[test]
+    fn movement_burst_does_not_fill_an_observers_queue() {
+        let players = Players::new(2, 64.0, 159, Arc::new(EntityIds::default()));
+        let (one, mut rx, closed) = connect(&players, 1, "One");
+        let (two, mut rx2, _) = connect(&players, 2, "Two");
+        one.activate().unwrap();
+        two.activate().unwrap();
+        players.tracking_tick().unwrap();
+        drain(&mut rx);
+        drain(&mut rx2);
+        for index in 0..1000 {
+            two.move_to(Position {
+                xyz: [2.0 + f64::from(index) / 1000.0, 64.0, 3.0],
+                ..Position::default()
+            })
+            .unwrap();
+        }
+        assert!(
+            !*closed.borrow(),
+            "one sender overflowed an ordinary observer"
+        );
+        assert!(rx.is_empty(), "movement must wait for the tracking tick");
+        assert_eq!(
+            players
+                .query_snapshot(Uuid::from_u128(2))
+                .unwrap()
+                .unwrap()
+                .position
+                .xyz,
+            [2.999, 64.0, 3.0]
+        );
+        players.tracking_tick().unwrap();
+        assert_eq!(rx.len(), 1);
+        assert_eq!(
+            drain(&mut rx),
+            [
+                Bytes::from(entity_packets::position_sync(
+                    two.id(),
+                    [2.999, 64.0, 3.0],
+                    0.0,
+                    0.0,
+                    true
+                )),
+                Bytes::from(entity_packets::head_rotation(two.id(), 0.0))
+            ]
+        );
+        players.tracking_tick().unwrap();
+        assert!(rx.is_empty());
+    }
+
+    #[test]
+    fn latency_burst_does_not_fill_an_observers_queue() {
+        let players = Players::new(2, 64.0, 159, Arc::new(EntityIds::default()));
+        let (one, mut rx, closed) = connect(&players, 1, "One");
+        one.activate().unwrap();
+        players.tracking_tick().unwrap();
+        drain(&mut rx);
+        for latency in 0..1000 {
+            one.latency(latency).unwrap();
+        }
+        assert!(!*closed.borrow());
+        assert!(rx.is_empty());
+        players.tracking_tick().unwrap();
+        let packets = drain(&mut rx);
+        assert_eq!(packets.len(), 1);
+        assert_eq!(&packets[0][..3], &[71, 0x10, 1]);
+        assert_eq!(get_varint(&mut &packets[0][19..]).unwrap(), 999);
+    }
+
+    #[test]
+    fn simultaneous_movement_uses_both_old_and_current_observer_positions() {
+        let players = Players::new(2, 16.0, 159, Arc::new(EntityIds::default()));
+        let (one, mut rx, _) = connect(&players, 1, "One");
+        let (two, mut rx2, _) = connect(&players, 2, "Two");
+        one.activate().unwrap();
+        two.activate().unwrap();
+        players.tracking_tick().unwrap();
+        drain(&mut rx);
+        drain(&mut rx2);
+        for player in [&one, &two] {
+            player
+                .move_to(Position {
+                    xyz: [100.0, 64.0, 0.0],
+                    ..Position::default()
+                })
+                .unwrap();
+        }
+        players.tracking_tick().unwrap();
+        for (receiver, expected) in [(&mut rx, two.id()), (&mut rx2, one.id())] {
+            let packets = drain(receiver);
+            assert_eq!(
+                packets.iter().map(|packet| packet[0]).collect::<Vec<_>>(),
+                [35, 85]
+            );
+            assert_eq!(get_varint(&mut &packets[0][1..]).unwrap(), expected);
+        }
+        two.move_to(Position::default()).unwrap();
+        two.move_to(Position {
+            xyz: [100.0, 64.0, 0.0],
+            ..Position::default()
+        })
+        .unwrap();
+        players.tracking_tick().unwrap();
+        assert!(
+            rx.is_empty() && rx2.is_empty(),
+            "intermediate visibility must not flicker"
+        );
+    }
+
+    #[test]
+    fn activation_movement_and_leave_before_a_tick_do_not_publish_ghost_entities() {
+        let players = Players::new(3, 16.0, 159, Arc::new(EntityIds::default()));
+        let (one, mut rx, _) = connect(&players, 1, "One");
+        one.activate().unwrap();
+        players.tracking_tick().unwrap();
+        drain(&mut rx);
+        let (short, _rx2, _) = connect(&players, 2, "Short");
+        short.activate().unwrap();
+        drop(short);
+        let (new, mut rx3, _) = connect(&players, 3, "New");
+        let position = Position {
+            xyz: [-8.5, -60.0, 3.5],
+            yaw: 90.0,
+            ..Position::default()
+        };
+        new.move_to(position).unwrap();
+        new.activate().unwrap();
+        one.move_to(Position {
+            xyz: [-8.5, -60.0, 4.5],
+            ..Position::default()
+        })
+        .unwrap();
+        players.tracking_tick().unwrap();
+        let packets = drain(&mut rx);
+        assert_eq!(
+            packets.iter().map(|packet| packet[0]).collect::<Vec<_>>(),
+            [71, 1, 101]
+        );
+        assert_eq!(
+            packets[1],
+            entity_packets::add_entity(new.id(), Uuid::from_u128(3), 159, position.xyz, 90.0, 0.0)
+        );
+        let own = drain(&mut rx3);
+        assert_eq!(own.iter().filter(|p| p[0] == 1).count(), 1);
+        assert!(!own.iter().any(|p| matches!(p[0], 35 | 70 | 78)));
+    }
+
+    #[test]
+    fn reconnect_removes_the_old_generation_before_publishing_the_new_one() {
+        let players = Players::new(2, 16.0, 159, Arc::new(EntityIds::default()));
+        let (one, mut rx, _) = connect(&players, 1, "One");
+        let (two, mut rx2, _) = connect(&players, 2, "Two");
+        one.activate().unwrap();
+        two.activate().unwrap();
+        players.tracking_tick().unwrap();
+        drain(&mut rx);
+        drain(&mut rx2);
+        let stale = PlayerHandle {
+            players: Arc::clone(&players),
+            uuid: Uuid::from_u128(2),
+            id: two.id(),
+        };
+        let old_id = two.id();
+        drop(two);
+        let (new, mut new_rx, _) = connect(&players, 2, "Two");
+        new.activate().unwrap();
+        let equipment = Bytes::from(vec![104, new.id() as u8, 0x80, 0, 1, 0]);
+        players
+            .set_equipment(Uuid::from_u128(2), new.id(), equipment.clone())
+            .unwrap();
+        assert_eq!(stale.activate(), Err(PlayerError::Unavailable));
+        assert_eq!(stale.latency(500), Err(PlayerError::Unavailable));
+        assert_eq!(
+            stale.move_to(Position::default()),
+            Err(PlayerError::Unavailable)
+        );
+        drop(stale);
+        assert_eq!(
+            players
+                .query_snapshot(Uuid::from_u128(2))
+                .unwrap()
+                .unwrap()
+                .id,
+            new.id()
+        );
+        players.tracking_tick().unwrap();
+        let packets = drain(&mut rx);
+        assert_eq!(
+            packets.iter().map(|p| p[0]).collect::<Vec<_>>(),
+            [78, 70, 71, 1, 101, 104]
+        );
+        assert_eq!(packets[0], entity_packets::remove_entities(&[old_id]));
+        assert_eq!(
+            packets[1],
+            entity_packets::player_info_remove(&[Uuid::from_u128(2)])
+        );
+        assert_eq!(get_varint(&mut &packets[3][1..]).unwrap(), new.id());
+        assert_eq!(packets[5], equipment);
+        assert!(!drain(&mut new_rx).iter().any(|p| matches!(p[0], 70 | 78)));
+    }
+
+    #[test]
+    fn undelivered_tracking_batches_keep_reconnect_transitions_in_fifo_order() {
+        let players = Players::new(2, 16.0, 159, Arc::new(EntityIds::default()));
+        let (one, mut rx, closed) = connect(&players, 1, "One");
+        let (two, _rx2, _) = connect(&players, 2, "Two");
+        one.activate().unwrap();
+        two.activate().unwrap();
+        players.tracking_tick().unwrap();
+        let old_id = two.id();
+        drop(two);
+        let (new, _rx3, _) = connect(&players, 2, "Two");
+        new.activate().unwrap();
+        players.tracking_tick().unwrap();
+        assert_eq!(rx.len(), 2);
+        assert!(!*closed.borrow());
+        let initial = rx.try_recv().unwrap();
+        let update = rx.try_recv().unwrap();
+        assert!(initial.inventory_revision().is_none() && update.inventory_revision().is_none());
+        let initial_spawn = initial.iter().find(|p| p[0] == 1).unwrap();
+        assert_eq!(get_varint(&mut &initial_spawn[1..]).unwrap(), old_id);
+        assert_eq!(update[0], entity_packets::remove_entities(&[old_id]));
+        let next_spawn = update.iter().find(|p| p[0] == 1).unwrap();
+        assert_eq!(get_varint(&mut &next_spawn[1..]).unwrap(), new.id());
+    }
+
+    #[test]
+    fn hidden_equipment_updates_coalesce_and_reentry_keeps_tab_membership() {
+        let players = Players::new(2, 16.0, 159, Arc::new(EntityIds::default()));
+        let (one, mut rx, _) = connect(&players, 1, "One");
+        let (two, mut rx2, _) = connect(&players, 2, "Two");
+        one.activate().unwrap();
+        two.activate().unwrap();
+        players.tracking_tick().unwrap();
+        drain(&mut rx);
+        drain(&mut rx2);
+        two.move_to(Position {
+            xyz: [100.0, 64.0, 0.0],
+            ..Position::default()
+        })
+        .unwrap();
+        players.tracking_tick().unwrap();
+        assert_eq!(
+            drain(&mut rx),
+            [Bytes::from(entity_packets::remove_entities(&[two.id()]))]
+        );
+        drain(&mut rx2);
+        let mut latest = Bytes::new();
+        for count in 1..=64 {
+            latest = vec![104, two.id() as u8, 0x80, count, 1, 0, 0].into();
+            players
+                .set_equipment(Uuid::from_u128(2), two.id(), latest.clone())
+                .unwrap();
+        }
+        players.tracking_tick().unwrap();
+        assert!(rx.is_empty());
+        two.move_to(Position::default()).unwrap();
+        players.tracking_tick().unwrap();
+        let packets = drain(&mut rx);
+        assert_eq!(
+            packets.iter().map(|p| p[0]).collect::<Vec<_>>(),
+            [1, 101, 104]
+        );
+        assert_eq!(packets[2], latest);
+    }
+
+    #[test]
+    fn tracking_preserves_reliable_inventory_and_block_batches_in_fifo_order() {
+        let players = Players::new(2, 64.0, 159, Arc::new(EntityIds::default()));
+        let (one, mut rx, _) = connect(&players, 1, "One");
+        let (two, mut rx2, _) = connect(&players, 2, "Two");
+        one.activate().unwrap();
+        two.activate().unwrap();
+        players.tracking_tick().unwrap();
+        drain(&mut rx);
+        drain(&mut rx2);
+        let revision = InventoryRevision {
+            uuid: Uuid::from_u128(1),
+            entity_id: one.id(),
+            generation: 11,
+        };
+        let inventory =
+            PacketBatch::from(vec![Bytes::from_static(&[18, 0])]).with_inventory_revision(revision);
+        let acknowledgement = PacketBatch::from(vec![Bytes::from_static(&[4, 17])]);
+        players
+            .dispatch_batches(vec![(revision.uuid, one.id(), inventory.clone())])
+            .unwrap();
+        for index in 0..1000 {
+            two.move_to(Position {
+                xyz: [2.0 + f64::from(index) / 1000.0, 64.0, 3.0],
+                ..Position::default()
+            })
+            .unwrap();
+        }
+        players
+            .dispatch_batches(vec![(revision.uuid, one.id(), acknowledgement.clone())])
+            .unwrap();
+        players.tracking_tick().unwrap();
+        assert_eq!(rx.try_recv().unwrap(), inventory);
+        assert_eq!(rx.try_recv().unwrap(), acknowledgement);
+        let tracking = rx.try_recv().unwrap();
+        assert!(tracking.inventory_revision().is_none());
+        assert_eq!(tracking.iter().map(|p| p[0]).collect::<Vec<_>>(), [35, 85]);
+        assert!(rx.is_empty());
+    }
+
+    #[test]
+    fn a_genuinely_slow_observer_still_disconnects_without_affecting_other_observers() {
+        let players = Players::new(3, 64.0, 159, Arc::new(EntityIds::default()));
+        let (one, mut rx, slow_closed) = connect(&players, 1, "Slow");
+        let (two, mut rx2, fast_closed) = connect(&players, 2, "Fast");
+        let (three, mut rx3, _) = connect(&players, 3, "Mover");
+        for player in [&one, &two, &three] {
+            player.activate().unwrap();
+        }
+        players.tracking_tick().unwrap();
+        drain(&mut rx);
+        drain(&mut rx2);
+        drain(&mut rx3);
+        for index in 0..17 {
+            three
+                .move_to(Position {
+                    xyz: [2.0 + f64::from(index) / 100.0, 64.0, 3.0],
+                    ..Position::default()
+                })
+                .unwrap();
+            players.tracking_tick().unwrap();
+            assert_eq!(rx2.len(), 1);
+            drain(&mut rx2);
+            drain(&mut rx3);
+        }
+        assert!(*slow_closed.borrow());
+        assert!(!*fast_closed.borrow());
+        assert_eq!(rx.len(), 16);
+        assert_eq!(
+            players.count(),
+            3,
+            "disconnect notification is separate from player lifetime"
+        );
+        drain(&mut rx);
+        three.move_to(Position::default()).unwrap();
+        players.tracking_tick().unwrap();
+        assert!(
+            rx.is_empty(),
+            "a failed observer cannot reuse the global baseline"
+        );
+        assert!(!rx2.is_empty());
+    }
+
+    #[test]
+    fn joining_sixty_four_players_waits_for_one_tracking_batch() {
+        let players = Players::new(64, 64.0, 159, Arc::new(EntityIds::default()));
+        let mut peers: Vec<_> = (1..=64)
+            .map(|id| {
+                let peer = connect(&players, id, &format!("P{id}"));
+                peer.0.activate().unwrap();
+                peer
+            })
+            .collect();
+        assert!(peers.iter().all(|(_, _, closed)| !*closed.borrow()));
+        assert!(peers.iter().all(|(_, receiver, _)| receiver.is_empty()));
+        players.tracking_tick().unwrap();
+        for (_, receiver, closed) in &mut peers {
+            assert!(!*closed.borrow());
+            assert_eq!(receiver.len(), 1);
+            let packets = drain(receiver);
+            assert_eq!(packets.iter().filter(|p| p[0] == 71).count(), 64);
+            assert_eq!(packets.iter().filter(|p| p[0] == 1).count(), 63);
+        }
+    }
+
+    #[test]
+    #[ignore = "manual optimized-profile tracking resource measurement"]
+    fn measure_sixty_four_player_tracking_resource_cost() {
+        let players = Players::new(64, 64.0, 159, Arc::new(EntityIds::default()));
+        let mut peers: Vec<_> = (1..=64)
+            .map(|id| {
+                let peer = connect(&players, id, &format!("P{id}"));
+                peer.0.activate().unwrap();
+                peer
+            })
+            .collect();
+        players.tracking_tick().unwrap();
+        for (_, receiver, _) in &mut peers {
+            drain(receiver);
+        }
+        let mut times = Vec::new();
+        let mut payload_bytes = 0;
+        let mut references = 0;
+        let mut shared_payloads = 0;
+        for tick in 0..220 {
+            for (index, (handle, _, _)) in peers.iter().enumerate() {
+                handle
+                    .move_to(Position {
+                        xyz: [
+                            (index % 8) as f64 * 4.0 + f64::from(tick % 2) / 10.0,
+                            64.0,
+                            (index / 8) as f64 * 4.0,
+                        ],
+                        ..Position::default()
+                    })
+                    .unwrap();
+            }
+            let start = std::time::Instant::now();
+            players.tracking_tick().unwrap();
+            if tick >= 20 {
+                times.push(start.elapsed().as_secs_f64() * 1000.0);
+            }
+            let mut batches = Vec::new();
+            for (_, receiver, closed) in &mut peers {
+                assert!(!*closed.borrow());
+                assert_eq!(receiver.len(), 1);
+                batches.push(receiver.try_recv().unwrap());
+            }
+            if tick == 219 {
+                payload_bytes = batches
+                    .iter()
+                    .flat_map(|batch| batch.iter())
+                    .map(Bytes::len)
+                    .sum::<usize>();
+                references = batches.iter().map(|batch| batch.len()).sum::<usize>();
+                shared_payloads = batches
+                    .iter()
+                    .flat_map(|batch| batch.iter())
+                    .map(|packet| (packet.as_ptr(), packet.len()))
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len();
+            }
+        }
+        times.sort_by(f64::total_cmp);
+        assert_eq!(players.replicated.lock().unwrap().len(), 64);
+        assert_eq!(references, 64 * 63 * 2);
+        assert_eq!(shared_payloads, 128);
+        println!(
+            "players=64 measured_ticks=200 tracking_median_ms={:.6} tracking_p95_ms={:.6} retained_snapshot_entries=64 retained_record_bytes={} queued_batches_per_tick=64 packet_references={} unique_payloads={} payload_bytes_per_tick={}",
+            times[100],
+            times[189],
+            std::mem::size_of::<ReplicatedPlayer>(),
+            references,
+            shared_payloads,
+            payload_bytes
+        );
+    }
+
+    #[test]
+    fn bounded_queries_exclude_inactive_sessions_and_track_reconnect_identity() {
+        let players = Players::new(4, 64.0, 159, Arc::new(EntityIds::default()));
+        let uuid = Uuid::from_u128(1);
+        let (first, _rx, _) = connect(&players, 1, "One");
+        assert!(players.query_snapshot(uuid).unwrap().is_none());
+        assert!(players.snapshots_bounded(0).unwrap().is_empty());
+        first.activate().unwrap();
+        let first_id = first.id();
+        assert_eq!(players.query_snapshot(uuid).unwrap().unwrap().id, first_id);
+        assert!(matches!(
+            players.snapshots_bounded(0),
+            Err(PlayerError::Capacity)
+        ));
+        assert_eq!(players.snapshots_bounded(1).unwrap().len(), 1);
+        drop(first);
+        assert!(players.query_snapshot(uuid).unwrap().is_none());
+        let (second, _rx, _) = connect(&players, 1, "One");
+        second.activate().unwrap();
+        assert_ne!(second.id(), first_id);
+        assert_eq!(
+            players.query_snapshot(uuid).unwrap().unwrap().id,
+            second.id()
+        );
+    }
+
+    #[test]
+    fn native_registry_reads_report_busy_instead_of_waiting_on_a_mutex() {
+        let players = Players::new(4, 64.0, 159, Arc::new(EntityIds::default()));
+        let held = players.inner.lock().unwrap();
+        assert!(matches!(players.try_count(), Err(PlayerError::Unavailable)));
+        assert!(matches!(
+            players.query_snapshot(Uuid::from_u128(1)),
+            Err(PlayerError::Unavailable)
+        ));
+        assert!(matches!(
+            players.snapshots_bounded(4),
+            Err(PlayerError::Unavailable)
+        ));
+        drop(held);
+        assert_eq!(players.try_count().unwrap(), 0);
+    }
+
+    #[test]
     fn equipment_cache_is_applied_before_activation_and_on_visibility_reentry() {
         let players = Players::new(20, 32.0, 159, Arc::new(EntityIds::default()));
         let (first, mut first_rx, _) = connect(&players, 1, "One");
@@ -498,9 +1114,11 @@ mod tests {
             .set_equipment(Uuid::from_u128(1), first.id(), equipment.clone())
             .unwrap();
         first.activate().unwrap();
+        players.tracking_tick().unwrap();
         drain(&mut first_rx);
         let (second, mut second_rx, _) = connect(&players, 2, "Two");
         second.activate().unwrap();
+        players.tracking_tick().unwrap();
         assert!(drain(&mut second_rx).contains(&equipment));
         second
             .move_to(Position {
@@ -508,8 +1126,10 @@ mod tests {
                 ..Position::default()
             })
             .unwrap();
+        players.tracking_tick().unwrap();
         drain(&mut second_rx);
         second.move_to(Position::default()).unwrap();
+        players.tracking_tick().unwrap();
         assert!(drain(&mut second_rx).contains(&equipment));
         let wrong = Bytes::from_static(&[104, 0]);
         players
@@ -525,6 +1145,7 @@ mod tests {
         let players = Players::new(20, 64.0, 159, ids);
         let (first, mut rx, _) = connect(&players, 1, "One");
         first.activate().unwrap();
+        players.tracking_tick().unwrap();
         drain(&mut rx);
         assert_eq!(first.id(), 101);
         let snapshot = players.snapshots().unwrap();
@@ -555,9 +1176,11 @@ mod tests {
         let players = Players::new(20, 64.0, 159, Arc::new(EntityIds::default()));
         let (first, mut first_rx, _) = connect(&players, 1, "One");
         first.activate().unwrap();
+        players.tracking_tick().unwrap();
         drain(&mut first_rx);
         let (second, mut second_rx, _) = connect(&players, 2, "Two");
         second.activate().unwrap();
+        players.tracking_tick().unwrap();
         assert_ne!(first.id(), second.id());
         assert_eq!(players.count(), 2);
         let first_packets = drain(&mut first_rx);
@@ -585,6 +1208,7 @@ mod tests {
         first.activate().unwrap();
         let (second, mut second_rx, _) = connect(&players, 2, "Two");
         second.activate().unwrap();
+        players.tracking_tick().unwrap();
         drain(&mut first_rx);
         drain(&mut second_rx);
         second
@@ -594,8 +1218,10 @@ mod tests {
                 ..Position::default()
             })
             .unwrap();
+        players.tracking_tick().unwrap();
         assert!(drain(&mut first_rx).iter().any(|p| p[0] == 35));
         drop(second);
+        players.tracking_tick().unwrap();
         let packets = drain(&mut first_rx);
         assert!(packets.iter().any(|p| p[0] == 70));
         assert!(packets.iter().any(|p| p[0] == 78));
@@ -608,6 +1234,7 @@ mod tests {
         one.activate().unwrap();
         let (two, mut rx2, _) = connect(&players, 2, "Two");
         two.activate().unwrap();
+        players.tracking_tick().unwrap();
         drain(&mut rx);
         drain(&mut rx2);
         two.move_to(Position {
@@ -615,11 +1242,13 @@ mod tests {
             ..Position::default()
         })
         .unwrap();
+        players.tracking_tick().unwrap();
         let packets = drain(&mut rx);
         assert!(packets.iter().any(|p| p[0] == 78));
         assert!(!packets.iter().any(|p| p[0] == 70));
         drain(&mut rx2);
         two.move_to(Position::default()).unwrap();
+        players.tracking_tick().unwrap();
         assert!(drain(&mut rx).iter().any(|p| p[0] == 1));
         assert!(drain(&mut rx2).iter().any(|p| p[0] == 1));
     }

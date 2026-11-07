@@ -51,6 +51,9 @@ public final class PaperBridge implements AutoCloseable {
     private final Thread owner = Thread.currentThread();
     private final Path directory;
     private final CallbackContext callbackContext;
+    private final ReadOnlyServerView nativeView;
+    private final BridgeReadModel readModel;
+    private PlayerReplies playerReplies;
     private final Logger logger = Logger.getLogger("Zerqon-Paper");
     private final Map<String, BridgeClassLoader> plugins = new LinkedHashMap<>();
     private final Map<String, PluginCommand> commands = new LinkedHashMap<>();
@@ -66,9 +69,15 @@ public final class PaperBridge implements AutoCloseable {
     }
 
     public PaperBridge(Path directory, CallbackContext callbackContext) {
+        this(directory, callbackContext, null);
+    }
+
+    public PaperBridge(Path directory, CallbackContext callbackContext, ReadOnlyServerView nativeView) {
         if (instance != null || Bukkit.getServer() != null) { throw new IllegalStateException("Only one Paper bridge may be installed in a JVM"); }
         this.directory = directory.toAbsolutePath().normalize();
         this.callbackContext = java.util.Objects.requireNonNull(callbackContext, "callbackContext");
+        this.nativeView = nativeView;
+        this.readModel = nativeView == null ? null : new BridgeReadModel(this, nativeView);
         instance = this;
         Bukkit.setServer(server);
     }
@@ -77,6 +86,21 @@ public final class PaperBridge implements AutoCloseable {
     public interface CallbackContext { CallbackScope enter(Plugin plugin); }
     @FunctionalInterface
     public interface CallbackScope extends AutoCloseable { @Override void close(); }
+
+    Server server() { return server; }
+
+    public void playerJoined(ReadOnlyServerView.PlayerData player) {
+        checkThread();
+        if (readModel == null) throw new UnsupportedOperationException("Native Paper PlayerJoinEvent adapter requires a native view");
+        fire(new org.bukkit.event.player.PlayerJoinEvent(readModel.player(player), (Component) null));
+    }
+
+    public void playerQuit(ReadOnlyServerView.PlayerData player) {
+        checkThread();
+        if (readModel == null) throw new UnsupportedOperationException("Native Paper PlayerQuitEvent adapter requires a native view");
+        try { fire(new org.bukkit.event.player.PlayerQuitEvent(readModel.player(player), (Component) null, org.bukkit.event.player.PlayerQuitEvent.QuitReason.DISCONNECTED)); }
+        finally { readModel.quit(player); }
+    }
 
     static PaperBridge current() {
         if (instance == null) { throw new IllegalStateException("Paper bridge is not installed"); }
@@ -238,7 +262,11 @@ public final class PaperBridge implements AutoCloseable {
         PluginCommand command = commands.get(label.toLowerCase(Locale.ROOT));
         if (command == null || command.getPlugin() != plugin) { throw new IllegalArgumentException("Command does not belong to plugin: " + label); }
         List<String> replies = new ArrayList<>();
-        context(plugin, () -> command.execute(sender(name, operator, console, replies), label, args.toArray(String[]::new)));
+        PlayerReplies previous = playerReplies;
+        ReadOnlyServerView.PlayerData player = nativeView == null ? null : nativeView.eventPlayer();
+        playerReplies = !console && player != null ? new PlayerReplies(player.uuid(), player.sessionId(), replies) : null;
+        try { context(plugin, () -> command.execute(sender(name, operator, console, replies), label, args.toArray(String[]::new))); }
+        finally { playerReplies = previous; }
         return List.copyOf(replies);
     }
 
@@ -255,6 +283,8 @@ public final class PaperBridge implements AutoCloseable {
     }
 
     private CommandSender sender(String name, boolean operator, boolean console, List<String> replies) {
+        ReadOnlyServerView.PlayerData player = nativeView == null ? null : nativeView.eventPlayer();
+        if (!console && player != null && readModel != null) return readModel.player(player);
         InvocationHandler implementation = (object, method, args) -> {
             checkThread();
             return switch (method.getName()) {
@@ -282,9 +312,22 @@ public final class PaperBridge implements AutoCloseable {
         replies.add(text);
     }
 
-    private boolean hasPermission(String name, boolean operator) {
+    boolean hasPermission(String name, boolean operator) {
         Permission permission = permissions.get(name.toLowerCase(Locale.ROOT));
         return (permission == null ? PermissionDefault.OP : permission.getDefault()).getValue(operator);
+    }
+
+    boolean permissionSet(String name) { return permissions.containsKey(name.toLowerCase(Locale.ROOT)); }
+
+    private record PlayerReplies(java.util.UUID uuid, int session, List<String> replies) {}
+
+    void playerReply(java.util.UUID uuid, int session, Method method, Object[] args) {
+        if (playerReplies == null || !playerReplies.uuid().equals(uuid) || playerReplies.session() != session) throw unsupported(method);
+        Object message = args[args.length - 1];
+        if (message instanceof String text) addReply(playerReplies.replies(), text);
+        else if (message instanceof String[] messages) { for (String text : messages) addReply(playerReplies.replies(), text); }
+        else if (message instanceof Component component) addReply(playerReplies.replies(), PlainTextComponentSerializer.plainText().serialize(component));
+        else throw unsupported(method);
     }
 
     public void fire(Event event) {
@@ -365,6 +408,11 @@ public final class PaperBridge implements AutoCloseable {
             case "getPluginManager" -> manager;
             case "getScheduler" -> scheduler.api();
             case "getPluginCommand" -> commands.get(((String) args[0]).toLowerCase(Locale.ROOT));
+            case "getOnlinePlayers" -> { if (readModel == null) throw unsupported(method); yield readModel.onlinePlayers(); }
+            case "getPlayer" -> { if (readModel == null) throw unsupported(method); yield args[0] instanceof java.util.UUID uuid ? readModel.player(uuid) : readModel.player((String) args[0], false); }
+            case "getPlayerExact" -> { if (readModel == null) throw unsupported(method); yield readModel.player((String) args[0], true); }
+            case "getWorlds" -> { if (readModel == null) throw unsupported(method); yield readModel.worlds(); }
+            case "getWorld" -> { if (readModel == null) throw unsupported(method); yield readModel.world(args[0]); }
             case "getPluginsFolder" -> directory.resolve("plugins/java-plugins").toFile();
             case "getCurrentTick" -> Math.toIntExact(scheduler.currentTick());
             case "permissionMessage" -> Component.text("Permission denied");

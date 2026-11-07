@@ -769,6 +769,7 @@ mod tests {
         let _other_handle = service.open(other_uuid, other.id()).await.unwrap();
         player.activate().unwrap();
         other.activate().unwrap();
+        players.tracking_tick().unwrap();
         while rx.try_recv().is_ok() {}
         while other_rx.try_recv().is_ok() {}
         service
@@ -791,6 +792,7 @@ mod tests {
             .give(other_uuid, other.id(), "minecraft:stone", 2)
             .await
             .unwrap();
+        players.tracking_tick().unwrap();
         let equipment = rx.recv().await.unwrap();
         assert_eq!(equipment[0][0], 104);
         assert!(handle.allow_outbound(&equipment));

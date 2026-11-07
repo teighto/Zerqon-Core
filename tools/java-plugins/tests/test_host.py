@@ -9,6 +9,7 @@ import tempfile
 import threading
 import unittest
 import zipfile
+import uuid
 
 ROOT = Path(__file__).resolve().parents[3]
 JAVA = None
@@ -131,6 +132,186 @@ class HostTests(unittest.TestCase):
             for file in (ROOT / "target/paper-bridge/fixtures").rglob("NativePaperProbe*.class"):
                 jar.write(file, file.relative_to(ROOT / "target/paper-bridge/fixtures").as_posix())
             jar.writestr("plugin.yml", f"name: {metadata}\nversion: 1\nmain: io.github.teighto.zerqon.fixtures.NativePaperProbe\napi-version: '26.3'\ncommands:\n  nativepaper: {{}}\n")
+
+    def add_paper_readonly(self, filename, metadata):
+        with zipfile.ZipFile(self.plugins / f"{filename}.jar", "w") as jar:
+            for file in (ROOT / "target/paper-bridge/fixtures").rglob("ReadOnlyPaperProbe*.class"):
+                jar.write(file, file.relative_to(ROOT / "target/paper-bridge/fixtures").as_posix())
+            permissions = "permissions:\n  native.public:\n    default: true\n  native.operator:\n    default: op\n" if metadata.endswith("0") else ""
+            jar.writestr("plugin.yml", f"name: {metadata}\nversion: 1\nmain: io.github.teighto.zerqon.fixtures.ReadOnlyPaperProbe\napi-version: '26.3'\ncommands:\n  read: {{}}\n{permissions}")
+
+    @staticmethod
+    def player_snapshot(session=7, online=True):
+        return {"uuid": "11111111-1111-4111-8111-111111111111", "session_id": session, "entity_id": session, "name": "CONSOLE", "world_uuid": "22222222-2222-4222-8222-222222222222", "position": {"x": 1.5, "y": 70.0, "z": -2.5, "yaw": 90.0, "pitch": 12.0}, "operator": False, "online": online}
+
+    @staticmethod
+    def world_snapshot():
+        return {"uuid": "22222222-2222-4222-8222-222222222222", "name": "world", "key": "minecraft:overworld", "dimension": "minecraft:overworld", "environment": "normal", "min_height": -64, "max_height": 320, "spawn": {"x": 0.5, "y": 64.0, "z": 0.5, "yaw": 0.0, "pitch": 0.0}}
+
+    def readonly_ready(self, count=1):
+        self.host.close()
+        self.host = Host(paper=True)
+        self.addCleanup(self.host.close)
+        for index in range(count): self.add_paper_readonly(f"reader-{index}", f"ReadProbe{index}")
+        self.assertTrue(self.host.request(id=1, op="hello", min_protocol=2, max_protocol=2)["ok"])
+        loaded = self.host.request(id=2, op="load", directory=str(self.plugins), server_version="0.0.1")
+        self.assertTrue(all(result["enabled"] for result in loaded["results"]), loaded)
+
+    def readonly_result(self, call, current=None):
+        current = self.player_snapshot() if current is None else current
+        operation = call["operation"]
+        if operation["query"] == "online_players": value = {"players": [current] if current["online"] else []}
+        elif operation["query"] == "worlds": value = {"worlds": [self.world_snapshot()]}
+        elif operation["query"] == "player": value = {"player": current if operation["uuid"] == current["uuid"] and operation.get("session_id", current["session_id"]) == current["session_id"] and current["online"] else None}
+        else: return self.native_result(call)
+        return self.native_result(call, value=value)
+
+    def test_paper_native_player_world_queries_and_location_copies(self):
+        self.readonly_ready()
+        response = self.host.request(native=self.readonly_result, id=3, op="event", plugin="reader-0", context={"player": self.player_snapshot()}, event={"event": "command", "sender": "CONSOLE", "sender_kind": "player", "operator": False, "command": "read", "args": []})
+        self.assertTrue(response["ok"], response)
+        self.assertTrue(response["results"][0]["enabled"], response)
+        self.assertEqual(response["results"][0]["actions"], [{"action": "reply", "message": "11111111-1111-4111-8111-111111111111:7:CONSOLE:true:false:true:false:world:-64:320:1.5"}])
+
+    def test_native_join_quit_fire_once_for_each_plugin_and_reconnect_keeps_old_session(self):
+        self.readonly_ready(2)
+        player = self.player_snapshot()
+        for identifier, kind in [(3, "player_join"), (4, "player_quit")]:
+            response = self.host.request(native=self.readonly_result, id=identifier, op="event", context={"player": player}, event={"event": kind, "uuid": player["uuid"], "name": player["name"]})
+            self.assertTrue(response["ok"], response)
+            self.assertTrue(all(result["enabled"] for result in response["results"]), response)
+        for index in range(2):
+            response = self.host.request(id=5 + index, op="event", plugin=f"reader-{index}", event={"event": "command", "sender": "CONSOLE", "sender_kind": "console", "command": f"readprobe{index}:read", "args": ["counts"]})
+            self.assertEqual(response["results"][0]["actions"], [{"action": "reply", "message": "1:1"}])
+        reconnected = self.player_snapshot(8)
+        joined = self.host.request(native=lambda call: self.readonly_result(call, reconnected), id=7, op="event", context={"player": reconnected}, event={"event": "player_join", "uuid": reconnected["uuid"], "name": reconnected["name"]})
+        self.assertTrue(joined["ok"], joined)
+        response = self.host.request(native=lambda call: self.readonly_result(call, reconnected), id=8, op="event", plugin="reader-0", context={"player": reconnected}, event={"event": "command", "sender": "CONSOLE", "sender_kind": "player", "command": "read", "args": ["previous"]})
+        self.assertEqual(response["results"][0]["actions"], [{"action": "reply", "message": "true:false:true:false:7"}])
+
+    def test_native_context_rejects_spoofed_identity_and_does_not_disable_plugin(self):
+        self.readonly_ready()
+        for index, change in enumerate([{"name": "other"}, {"operator": True}, {"online": False}, {"session_id": 0}, {"uuid": "bad"}]):
+            player = self.player_snapshot()
+            player.update(change)
+            response = self.host.request(id=10 + index, op="event", plugin="reader-0", context={"player": player}, event={"event": "command", "sender": "CONSOLE", "sender_kind": "player", "operator": False, "command": "read", "args": []})
+            self.assertFalse(response["ok"], change)
+        listing = self.host.request(id=20, op="list")
+        self.assertTrue(all(result["enabled"] for result in listing["results"]))
+
+    def test_readonly_queries_are_cached_per_parent_not_across_events(self):
+        self.readonly_ready()
+        for identifier, x in [(3, 1.5), (4, 20.5)]:
+            player = self.player_snapshot()
+            player["position"]["x"] = x
+            calls = []
+            def respond(call):
+                calls.append(call["operation"]["query"])
+                return self.readonly_result(call, player)
+            response = self.host.request(native=respond, id=identifier, op="event", plugin="reader-0", context={"player": player}, event={"event": "command", "sender": "CONSOLE", "sender_kind": "player", "command": "read", "args": []})
+            self.assertTrue(response["results"][0]["enabled"], response)
+            self.assertTrue(response["results"][0]["actions"][0]["message"].endswith(":" + str(x)))
+            self.assertEqual(calls.count("worlds"), 1)
+            self.assertEqual(calls.count("online_players"), 1)
+
+    def test_retained_online_player_collection_reflects_later_parent_requests(self):
+        self.readonly_ready()
+        for identifier, command, present in [(3, "save-view", True), (4, "view", False), (5, "view", True)]:
+            player = self.player_snapshot(8 if identifier == 5 else 7, present)
+            result = self.host.request(native=lambda call: self.readonly_result(call, player), id=identifier, op="event", plugin="reader-0", event={"event": "command", "sender": "CONSOLE", "sender_kind": "console", "command": "read", "args": [command]})
+            self.assertEqual(result["results"][0]["actions"], [{"action": "reply", "message": "1" if present else "0"}])
+
+    def test_online_snapshot_seeds_player_getters_without_exhausting_native_call_budget(self):
+        self.readonly_ready()
+        players = []
+        for index in range(130):
+            player = self.player_snapshot(index + 1)
+            player.update(uuid=str(uuid.UUID(int=index + 1)), name=f"Player{index}")
+            players.append(player)
+        by_uuid = {player["uuid"]: player for player in players}
+        calls = []
+        def respond(call):
+            query = call["operation"]["query"]
+            calls.append(query)
+            if query == "online_players": return self.native_result(call, value={"players": players})
+            if query == "player": return self.native_result(call, value={"player": by_uuid.get(call["operation"]["uuid"])})
+            return self.readonly_result(call)
+        result = self.host.request(native=respond, id=3, op="event", plugin="reader-0", event={"event": "command", "sender": "CONSOLE", "sender_kind": "console", "command": "read", "args": ["scan"]})
+        self.assertTrue(result["results"][0]["enabled"], result)
+        self.assertEqual(result["results"][0]["actions"], [{"action": "reply", "message": "scanned 130"}])
+        self.assertEqual(calls, ["online_players", "worlds"])
+
+    def test_online_snapshot_does_not_overwrite_prior_reads_or_reuse_previous_parent(self):
+        self.readonly_ready()
+        for identifier, x in [(3, 5.5), (4, 8.5)]:
+            prior = self.player_snapshot()
+            prior["position"]["x"] = x
+            calls = []
+            def respond(call):
+                calls.append(call["operation"]["query"])
+                if call["operation"]["query"] == "player": return self.native_result(call, value={"player": prior})
+                return self.readonly_result(call)
+            result = self.host.request(native=respond, id=identifier, op="event", plugin="reader-0", event={"event": "command", "sender": "CONSOLE", "sender_kind": "console", "command": "read", "args": ["seed-prior", prior["uuid"]]})
+            self.assertEqual(result["results"][0]["actions"], [{"action": "reply", "message": "preserved " + str(x)}])
+            self.assertEqual(calls, ["player", "player", "worlds", "online_players"])
+
+    def test_player_messages_cannot_be_misrouted_to_another_command_sender(self):
+        self.readonly_ready()
+        other = self.player_snapshot(9)
+        other.update(uuid="33333333-3333-4333-8333-333333333333", name="Other")
+        def respond(call):
+            if call["operation"]["query"] == "player" and call["operation"]["uuid"] == other["uuid"]:
+                return self.native_result(call, value={"player": other})
+            return self.readonly_result(call)
+        response = self.host.request(native=respond, id=3, op="event", plugin="reader-0", context={"player": self.player_snapshot()}, event={"event": "command", "sender": "CONSOLE", "sender_kind": "player", "command": "read", "args": ["other-message", other["uuid"]]})
+        self.assertEqual(response["results"][0]["actions"], [{"action": "reply", "message": "other message rejected"}])
+
+    def test_null_player_location_does_not_require_world_lookup(self):
+        self.readonly_ready()
+        response = self.host.request(id=3, op="event", plugin="reader-0", context={"player": self.player_snapshot()}, event={"event": "command", "sender": "CONSOLE", "sender_kind": "player", "command": "read", "args": ["null-location"]})
+        self.assertEqual(response["results"][0]["actions"], [{"action": "reply", "message": "null"}])
+
+    def test_partial_player_lookup_follows_paper_exact_then_shortest_prefix(self):
+        self.readonly_ready()
+        players = []
+        for index, name in enumerate(["Teightooo", "Teighto", "Tei"]):
+            player = self.player_snapshot(10 + index)
+            player.update(uuid=f"33333333-3333-4333-8333-33333333333{index}", name=name)
+            players.append(player)
+        def respond(call):
+            if call["operation"]["query"] == "online_players": return self.native_result(call, value={"players": players})
+            return self.readonly_result(call)
+        for identifier, (prefix, expected) in enumerate([("tEiGhTo", "Teighto"), ("TE", "Tei"), ("missing", "missing")], 3):
+            result = self.host.request(native=respond, id=identifier, op="event", plugin="reader-0", context={"player": self.player_snapshot()}, event={"event": "command", "sender": "CONSOLE", "sender_kind": "player", "command": "read", "args": ["lookup", prefix]})
+            self.assertEqual(result["results"][0]["actions"], [{"action": "reply", "message": expected}])
+
+    def test_malformed_player_and_world_results_poison_native_transport(self):
+        for mode in ["duplicate_player", "duplicate_session", "duplicate_entity", "offline_player", "duplicate_world", "bad_height", "bad_world_uuid", "wrong_player"]:
+            with self.subTest(mode=mode):
+                self.readonly_ready()
+                def respond(call):
+                    query = call["operation"]["query"]
+                    if query == "worlds":
+                        worlds = [self.world_snapshot()]
+                        if mode == "duplicate_world": worlds.append(self.world_snapshot())
+                        if mode == "bad_height": worlds[0]["max_height"] = -64
+                        if mode == "bad_world_uuid": worlds[0]["uuid"] = "00000000-0000-0000-0000-000000000000"
+                        return self.native_result(call, value={"worlds": worlds})
+                    if query == "online_players":
+                        players = [self.player_snapshot()]
+                        if mode in ["duplicate_player", "duplicate_session", "duplicate_entity"]:
+                            second = self.player_snapshot()
+                            if mode != "duplicate_player": second["uuid"] = "33333333-3333-4333-8333-333333333333"
+                            if mode == "duplicate_entity": second["session_id"] = 9
+                            players.append(second)
+                        if mode == "offline_player": players[0]["online"] = False
+                        return self.native_result(call, value={"players": players})
+                    if query == "player" and mode == "wrong_player": return self.native_result(call, value={"player": self.player_snapshot()})
+                    return self.readonly_result(call)
+                args = ["other-message", "33333333-3333-4333-8333-333333333333"] if mode == "wrong_player" else []
+                with self.assertRaises(AssertionError):
+                    self.host.request(native=respond, id=3, op="event", plugin="reader-0", context={"player": self.player_snapshot()}, event={"event": "command", "sender": "CONSOLE", "sender_kind": "player", "command": "read", "args": args})
+                self.assertNotEqual(self.host.process.wait(timeout=10), 0)
 
     @staticmethod
     def native_result(call, value=None, error=None):

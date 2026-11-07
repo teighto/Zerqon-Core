@@ -20,6 +20,15 @@ pub struct WorldStore {
 }
 
 impl WorldStore {
+    pub fn uuid(&self) -> Result<uuid::Uuid, WorldError> {
+        self.transactions
+            .as_ref()
+            .map(crate::transaction::Transactions::uuid)
+            .ok_or(WorldError::Corrupt(
+                "world identity is unavailable during import",
+            ))
+    }
+
     pub fn open(root: impl AsRef<Path>) -> Result<Self, WorldError> {
         Self::open_inner(root.as_ref(), false)
     }

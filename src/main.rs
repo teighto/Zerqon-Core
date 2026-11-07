@@ -1,5 +1,6 @@
 mod auth;
 mod bootstrap;
+mod client_policy;
 mod config;
 mod connection;
 mod entity_packets;

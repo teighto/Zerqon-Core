@@ -38,6 +38,12 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
           python-version: "3.13"
+      - name: Linux release toolchain
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y musl-tools
+          rustup target add x86_64-unknown-linux-musl
       - name: Rust formatting
         run: cargo fmt --all --check
       - name: Rust lint
@@ -60,27 +66,35 @@ jobs:
         run: python scripts/test-inventory-codec.py --export .cache/inventory-oracle/official.json --export-default-items
       - name: Inventory oracle self-checks
         run: python tests/inventory_oracle/test_oracle.py
-      - name: Prepare official Linux runtime archive fixture
+      - name: Original entity collision and step checks
+        run: python scripts/test-entity-physics.py
+      - name: Prepare pinned Java runtime fixtures
         shell: python
         run: |
           import hashlib
           import urllib.request
           from pathlib import Path
-          path = Path(".local/adoptium-linux25.tar.gz")
-          expected = "6fac98f0c8202efc3135a9e9e42aa61963ec42d1c5cbb40caf231e7b14a24ef6"
-          size = 61736206
-          if path.exists():
-              data = path.read_bytes()
-          else:
-              url = "https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.5%2B8/OpenJDK25U-jre_x64_linux_hotspot_25.0.5_8.tar.gz"
-              with urllib.request.urlopen(url, timeout=60) as response:
-                  data = response.read(size + 1)
-          if len(data) != size or hashlib.sha256(data).hexdigest() != expected:
-              raise SystemExit("Official Linux JRE fixture checksum mismatch")
-          if not path.exists():
-              path.parent.mkdir(parents=True, exist_ok=True)
-              with path.open("xb") as output:
-                  output.write(data)
+          assets = [
+              ("adoptium-linux25.tar.gz", 61736206, "6fac98f0c8202efc3135a9e9e42aa61963ec42d1c5cbb40caf231e7b14a24ef6", "OpenJDK25U-jre_x64_linux_hotspot_25.0.5_8.tar.gz"),
+              ("adoptium-windows25.zip", 58589419, "da78d54a2fcdbba1e92d5e3f07dd30236f96297891c4a21a781c3f38f5c0beae", "OpenJDK25U-jre_x64_windows_hotspot_25.0.5_8.zip"),
+          ]
+          for filename, size, expected, asset in assets:
+              path = Path(".local") / filename
+              if path.exists():
+                  with path.open("rb") as source:
+                      data = source.read(size + 1)
+              else:
+                  url = "https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.5%2B8/" + asset
+                  with urllib.request.urlopen(url, timeout=60) as response:
+                      data = response.read(size + 1)
+              if len(data) != size or hashlib.sha256(data).hexdigest() != expected:
+                  raise SystemExit("Official JRE fixture checksum mismatch: " + filename)
+              if not path.exists():
+                  path.parent.mkdir(parents=True, exist_ok=True)
+                  with path.open("xb") as output:
+                      output.write(data)
+      - name: Verify managed runtime file inventories
+        run: python scripts/java-runtime-integrity.py --windows-archive .local/adoptium-windows25.zip --linux-archive .local/adoptium-linux25.tar.gz --check
       - name: Generate isolated vanilla world fixture
         run: python scripts/generate-test-world.py --server-jar .cache/vanilla/26.3/server.jar --directory .local/vanilla-world-filled --accept-eula
       - name: Data and plugin integration tests
@@ -114,8 +128,45 @@ jobs:
         run: python scripts/test-inventory-codec.py --fixtures .cache/inventory-rust-fixtures.json
       - name: Check live inventory packets with Minecraft
         run: python scripts/test-inventory-codec.py --fixtures .cache/native-inventory-fixtures.json
-      - name: Build native release
+      - name: Build native Windows release
+        if: runner.os == 'Windows'
         run: cargo build -p zerqon --release --locked
+      - name: Build portable Linux release
+        if: runner.os == 'Linux'
+        run: cargo build -p zerqon --release --locked --target x86_64-unknown-linux-musl
+      - name: Verify standalone Linux runtime
+        if: runner.os == 'Linux'
+        run: python scripts/package-release.py --check-linux-binary target/x86_64-unknown-linux-musl/release/zerqon
+      - name: Linux release process and inventory checks
+        if: runner.os == 'Linux'
+        run: cargo test -p zerqon --release --locked --target x86_64-unknown-linux-musl --test server_smoke --test play_smoke --test inventory_native -- --include-ignored
+      - name: Linux release first launch over HTTPS
+        if: runner.os == 'Linux'
+        run: cargo test -p zerqon --release --locked --target x86_64-unknown-linux-musl --test first_run accepted_fresh_launch_prepares_data_starts_and_stops_without_python -- --ignored --exact
+      - name: Linux release storage recovery
+        if: runner.os == 'Linux'
+        run: cargo test -p zerqon-world --release --locked --target x86_64-unknown-linux-musl --test transaction_recovery
+      - name: Linux release CPU sampler
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          cargo test -p zerqon --bin zerqon --release --target x86_64-unknown-linux-musl --no-run --locked --message-format=json > target/musl-profiler-test-build.jsonl
+          test_binary=$(python3 - <<'PY'
+          import json
+          from pathlib import Path
+          paths = []
+          for line in Path("target/musl-profiler-test-build.jsonl").read_text().splitlines():
+              entry = json.loads(line)
+              if entry.get("reason") == "compiler-artifact" and entry.get("target", {}).get("name") == "zerqon" and entry.get("profile", {}).get("test") and entry.get("executable"):
+                  paths.append(entry["executable"])
+          if len(paths) != 1:
+              raise SystemExit("Expected one musl profiler test executable")
+          print(paths[0])
+          PY
+          )
+          sudo setcap cap_perfmon=ep "$test_binary"
+          trap 'sudo setcap -r "$test_binary"' EXIT
+          "$test_binary" --exact profiling::tests::real_cpu_capture_survives_cancelled_request_autosaves_stops_and_shuts_down --ignored --nocapture
       - name: Verify standalone Windows runtime
         if: runner.os == 'Windows'
         shell: pwsh

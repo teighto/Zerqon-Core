@@ -13,7 +13,9 @@ use std::{
     time::{Duration, Instant},
 };
 use uuid::Uuid;
-use zerqon_entities::{EntityChange, EntityWorld, Mob, MobKind, PlayerTarget, WorldQuery};
+use zerqon_entities::{
+    BlockCollision, EntityChange, EntityWorld, Mob, MobKind, PlayerTarget, WorldQuery,
+};
 use zerqon_world::{Chunk, MIN_Y, WORLD_HEIGHT};
 
 pub struct MobConfig {
@@ -28,6 +30,7 @@ pub struct Mobs {
     world: Arc<World>,
     players: Arc<Players>,
     data: Arc<GameData>,
+    blocks: Arc<zerqon_blocks::Catalog>,
     ids: Arc<EntityIds>,
     live: Arc<Mutex<LiveMobs>>,
     serial: tokio::sync::Mutex<()>,
@@ -47,20 +50,7 @@ impl Mobs {
         let live = self.live.lock().map_err(|_| "mob state lock poisoned")?;
         let mut blockers = Vec::new();
         for mob in live.engine.entities().filter(|mob| mob.health > 0.0) {
-            let [width, height] = mob.kind.dimensions();
-            let half = width / 2.0;
-            let bounds = zerqon_blocks::Aabb {
-                min: [
-                    mob.position[0] - half,
-                    mob.position[1],
-                    mob.position[2] - half,
-                ],
-                max: [
-                    mob.position[0] + half,
-                    mob.position[1] + height,
-                    mob.position[2] + half,
-                ],
-            };
+            let bounds = zerqon_entities::body_bounds(mob.position, mob.kind);
             if (0..3).all(|axis| {
                 bounds.max[axis] >= position[axis] - 3.0 && bounds.min[axis] <= position[axis] + 4.0
             }) {
@@ -77,6 +67,7 @@ impl Mobs {
         world: Arc<World>,
         players: Arc<Players>,
         data: Arc<GameData>,
+        blocks: Arc<zerqon_blocks::Catalog>,
         ids: Arc<EntityIds>,
         gameplay: Arc<tokio::sync::RwLock<()>>,
     ) -> Result<Arc<Self>> {
@@ -100,6 +91,7 @@ impl Mobs {
             world,
             players,
             data,
+            blocks,
             ids,
             live: Arc::new(Mutex::new(LiveMobs {
                 engine,
@@ -134,6 +126,7 @@ impl Mobs {
         }
         let live = Arc::clone(&self.live);
         let data = Arc::clone(&self.data);
+        let blocks = Arc::clone(&self.blocks);
         let world = Arc::clone(&self.world);
         let ids = Arc::clone(&self.ids);
         let radius = self.config.visibility_radius;
@@ -143,7 +136,7 @@ impl Mobs {
             .world
             .execute(move || {
                 let _gameplay = gameplay;
-                let view = ChunkView::new(world.cached_chunks()?, Arc::clone(&data));
+                let view = ChunkView::new(world.cached_chunks()?, blocks);
                 let targets: Vec<_> = observers
                     .iter()
                     .map(|player| PlayerTarget {
@@ -154,6 +147,11 @@ impl Mobs {
                     .collect();
                 let mut live = live.lock().map_err(|_| "mob state lock poisoned")?;
                 let mut changes = live.engine.tick(&view, &targets);
+                for change in &changes {
+                    if let EntityChange::PhysicsBlocked { id, reason } = change {
+                        tracing::debug!(id,%reason,"Mob physics paused");
+                    }
+                }
                 let mut spawned = false;
                 if natural && live.engine.len() < capacity {
                     let id = ids.next()?;
@@ -226,13 +224,18 @@ impl Mobs {
         let mut chunks = self.world.cached_chunks()?;
         for x in cx - 1..=cx + 1 {
             for z in cz - 1..=cz + 1 {
-                chunks.push(self.world.chunk(x, z).await?);
+                match self.world.chunk(x, z).await {
+                    Ok(chunk) => chunks.push(chunk),
+                    Err(error) if World::missing_imported_chunk(error.as_ref()) => {}
+                    Err(error) => return Err(error),
+                }
             }
         }
         let observers = self.players.snapshots()?;
         let live = Arc::clone(&self.live);
         let data = Arc::clone(&self.data);
         let id = self.ids.next()?;
+        let blocks = Arc::clone(&self.blocks);
         let path = self.config.path.clone();
         let capacity = self.config.capacity;
         let radius = self.config.visibility_radius;
@@ -240,7 +243,7 @@ impl Mobs {
             .world
             .execute(move || {
                 let _gameplay = gameplay;
-                let view = ChunkView::new(chunks, Arc::clone(&data));
+                let view = ChunkView::new(chunks, blocks);
                 let mut live = live.lock().map_err(|_| "mob state lock poisoned")?;
                 let before = live.engine.snapshot();
                 let change = live
@@ -266,6 +269,7 @@ impl Mobs {
             .xyz;
         let live = Arc::clone(&self.live);
         let data = Arc::clone(&self.data);
+        let blocks = Arc::clone(&self.blocks);
         let world = Arc::clone(&self.world);
         let path = self.config.path.clone();
         let capacity = self.config.capacity;
@@ -274,7 +278,7 @@ impl Mobs {
             .world
             .execute(move || {
                 let _gameplay = gameplay;
-                let view = ChunkView::new(world.cached_chunks()?, Arc::clone(&data));
+                let view = ChunkView::new(world.cached_chunks()?, blocks);
                 let mut live = live.lock().map_err(|_| "mob state lock poisoned")?;
                 let observer = (uuid, player_id);
                 if live
@@ -444,16 +448,16 @@ fn spawn_packets(mob: &Mob, data: &GameData) -> Result<PacketBatch> {
 
 struct ChunkView {
     chunks: HashMap<(i32, i32), Arc<Chunk>>,
-    data: Arc<GameData>,
+    blocks: Arc<zerqon_blocks::Catalog>,
 }
 impl ChunkView {
-    fn new(chunks: Vec<Arc<Chunk>>, data: Arc<GameData>) -> Self {
+    fn new(chunks: Vec<Arc<Chunk>>, blocks: Arc<zerqon_blocks::Catalog>) -> Self {
         Self {
             chunks: chunks
                 .into_iter()
                 .map(|chunk| ((chunk.x, chunk.z), chunk))
                 .collect(),
-            data,
+            blocks,
         }
     }
 }
@@ -463,31 +467,262 @@ impl WorldQuery for ChunkView {
             .contains_key(&(x.div_euclid(16), z.div_euclid(16)))
     }
     fn block_solid(&self, x: i32, y: i32, z: i32) -> bool {
-        let Some(chunk) = self.chunks.get(&(x.div_euclid(16), z.div_euclid(16))) else {
-            return true;
-        };
-        if !(MIN_Y..MIN_Y + WORLD_HEIGHT as i32).contains(&y) {
-            return false;
+        match self.block_collision(x, y, z) {
+            BlockCollision::Empty => false,
+            BlockCollision::Static(boxes) => !boxes.is_empty(),
+            _ => true,
         }
-        let Some(state) = chunk.get_block(x.rem_euclid(16) as u8, y, z.rem_euclid(16) as u8) else {
-            return true;
+    }
+    fn block_collision(&self, x: i32, y: i32, z: i32) -> BlockCollision<'_> {
+        if !(MIN_Y..MIN_Y + WORLD_HEIGHT as i32).contains(&y) {
+            return BlockCollision::Empty;
+        }
+        let Some(chunk) = self.chunks.get(&(x.div_euclid(16), z.div_euclid(16))) else {
+            return BlockCollision::Unavailable;
         };
-        !self.data.is_air(state) && !self.data.is_fluid_block(state)
+        let Some(state) = chunk.get_block(x.rem_euclid(16) as u8, y, z.rem_euclid(16) as u8) else {
+            return BlockCollision::Unavailable;
+        };
+        let Ok(state) = self.blocks.state(zerqon_blocks::StateId(state)) else {
+            return BlockCollision::Unsupported;
+        };
+        if state.has_fluid() {
+            return BlockCollision::Unsupported;
+        }
+        match state.collision() {
+            Ok([]) => BlockCollision::Empty,
+            Ok(boxes) => BlockCollision::Static(boxes),
+            Err(_) => BlockCollision::Unsupported,
+        }
     }
     fn surface_y(&self, x: i32, z: i32) -> Option<i32> {
+        self.surface_height(x, z).map(|height| height.ceil() as i32)
+    }
+    fn surface_height(&self, x: i32, z: i32) -> Option<f64> {
         if !self.loaded_at(x, z) {
             return None;
         }
-        (MIN_Y..MIN_Y + WORLD_HEIGHT as i32)
-            .rev()
-            .find(|y| self.block_solid(x, *y, z))
-            .map(|y| y + 1)
+        for y in (MIN_Y..MIN_Y + WORLD_HEIGHT as i32).rev() {
+            match self.block_collision(x, y, z) {
+                BlockCollision::Empty => {}
+                BlockCollision::Full => return Some(f64::from(y) + 1.0),
+                BlockCollision::Static(boxes) => {
+                    if let Some(top) = boxes
+                        .iter()
+                        .filter(|bounds| {
+                            bounds.min[0] <= 0.5
+                                && bounds.max[0] >= 0.5
+                                && bounds.min[2] <= 0.5
+                                && bounds.max[2] >= 0.5
+                        })
+                        .map(|bounds| bounds.max[1])
+                        .max_by(f64::total_cmp)
+                    {
+                        return Some(f64::from(y) + top);
+                    }
+                }
+                BlockCollision::Unavailable | BlockCollision::Unsupported => return None,
+            }
+        }
+        None
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn shape_view(state: &str, properties: &[(&str, &str)]) -> ChunkView {
+        static BLOCKS: std::sync::OnceLock<Arc<zerqon_blocks::Catalog>> =
+            std::sync::OnceLock::new();
+        let blocks = Arc::clone(
+            BLOCKS.get_or_init(|| Arc::new(zerqon_blocks::Catalog::embedded().unwrap())),
+        );
+        let id = |name: &str| blocks.resolve(name, &BTreeMap::new()).unwrap().0;
+        let palette = zerqon_world::FlatPalette {
+            air: id("minecraft:air"),
+            bedrock: id("minecraft:bedrock"),
+            stone: id("minecraft:stone"),
+            dirt: id("minecraft:dirt"),
+            grass: id("minecraft:grass_block"),
+        };
+        let mut chunks = Vec::new();
+        for x in -1..=1 {
+            for z in -1..=1 {
+                chunks.push(Arc::new(Chunk::flat(x, z, palette)));
+            }
+        }
+        let mut center = Chunk::flat(0, 0, palette);
+        let properties = properties
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect();
+        center
+            .set_block(1, 64, 1, blocks.resolve(state, &properties).unwrap().0)
+            .unwrap();
+        chunks.push(Arc::new(center));
+        ChunkView::new(chunks, blocks)
+    }
+
+    #[test]
+    fn chunk_view_uses_fractional_slab_surface_and_real_mob_collision() {
+        let view = shape_view("minecraft:oak_slab", &[]);
+        assert_eq!(view.surface_height(1, 1), Some(64.5));
+        let mut engine = EntityWorld::new(1, 8).unwrap();
+        engine
+            .spawn(1, Uuid::from_u128(1), MobKind::Pig, [1.5, 64.5, 1.5], &view)
+            .unwrap();
+        engine.tick(&view, &[]);
+        assert_eq!(engine.get(1).unwrap().position[1], 64.5);
+        assert!(engine.get(1).unwrap().on_ground);
+    }
+
+    #[test]
+    fn chunk_view_refuses_fluid_physics_and_reports_unavailable_chunks() {
+        let view = shape_view("minecraft:oak_fence", &[("waterlogged", "true")]);
+        assert!(matches!(
+            view.block_collision(1, 64, 1),
+            BlockCollision::Unsupported
+        ));
+        assert_eq!(view.surface_height(1, 1), None);
+        assert!(matches!(
+            view.block_collision(128, 64, 128),
+            BlockCollision::Unavailable
+        ));
+        assert!(matches!(
+            view.block_collision(128, -65, 128),
+            BlockCollision::Empty
+        ));
+    }
+    #[tokio::test]
+    #[ignore = "requires prepared official Minecraft 26.3 data"]
+    async fn summon_inside_imported_chunk_does_not_require_unrelated_neighbors() {
+        use crate::{
+            config::{self, Properties, Settings},
+            game_data::BlockResolver,
+            runtime::State,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        config::initialize(directory.path()).unwrap();
+        let source = directory.path().join("source");
+        std::fs::create_dir_all(source.join("dimensions/minecraft/overworld/region")).unwrap();
+        std::fs::create_dir_all(source.join("data/minecraft")).unwrap();
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("crates/zerqon-world/tests/fixtures");
+        for (from, to) in [
+            ("metadata-level.dat", "level.dat"),
+            (
+                "metadata-world-gen-settings.dat",
+                "data/minecraft/world_gen_settings.dat",
+            ),
+            ("metadata-game-rules.dat", "data/minecraft/game_rules.dat"),
+            (
+                "negative-3.mca",
+                "dimensions/minecraft/overworld/region/r.-1.-2.mca",
+            ),
+        ] {
+            std::fs::copy(fixtures.join(from), source.join(to)).unwrap();
+        }
+        let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".cache/vanilla/26.3");
+        let resolver = BlockResolver::load(&data).unwrap();
+        zerqon_world::anvil::import_world_blocks(
+            &source,
+            &directory.path().join("world"),
+            &|name, properties| resolver.resolve(name, properties),
+        )
+        .unwrap();
+        let settings = Settings {
+            data_directory: data.to_string_lossy().into_owned(),
+            java_plugins: false,
+            update_check: false,
+            spawn_mobs: false,
+            ..Settings::default()
+        };
+        let (shutdown, _) = tokio::sync::watch::channel(false);
+        let state = State::new(
+            directory.path(),
+            Properties::parse("online-mode=false\nview-distance=1\n").unwrap(),
+            settings,
+            false,
+            shutdown,
+            None,
+        )
+        .await
+        .unwrap();
+        let mobs = state.mobs.as_ref().unwrap();
+        let id = mobs
+            .summon(MobKind::Pig, [-8.5, 70.0, -520.5])
+            .await
+            .unwrap();
+        assert_eq!(
+            mobs.live.lock().unwrap().engine.get(id).unwrap().position,
+            [-8.5, 70.0, -520.5]
+        );
+        let world = state.world.as_ref().unwrap();
+        assert!(World::missing_imported_chunk(
+            world.chunk(-2, -34).await.unwrap_err().as_ref()
+        ));
+    }
+    #[tokio::test]
+    #[ignore = "requires prepared 26.3 data and owned real vanilla flat-world fixture"]
+    async fn console_summon_defaults_to_imported_world_spawn_height() {
+        use crate::{
+            config::{self, Properties, Settings},
+            game_data::BlockResolver,
+            runtime::{CommandSource, State},
+        };
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let data = root.join(".cache/vanilla/26.3");
+        let source = root.join(".local/vanilla-world-filled/world");
+        let directory = tempfile::tempdir().unwrap();
+        config::initialize(directory.path()).unwrap();
+        let resolver = BlockResolver::load(&data).unwrap();
+        zerqon_world::anvil::import_world_blocks(
+            &source,
+            &directory.path().join("world"),
+            &|name, properties| resolver.resolve(name, properties),
+        )
+        .unwrap();
+        let settings = Settings {
+            data_directory: data.to_string_lossy().into_owned(),
+            java_plugins: false,
+            update_check: false,
+            spawn_mobs: false,
+            ..Settings::default()
+        };
+        let (shutdown, _) = tokio::sync::watch::channel(false);
+        let state = State::new(
+            directory.path(),
+            Properties::parse("online-mode=false\nview-distance=1\n").unwrap(),
+            settings,
+            false,
+            shutdown,
+            None,
+        )
+        .await
+        .unwrap();
+        let spawn = state.world.as_ref().unwrap().spawn();
+        assert_eq!(spawn.position[1], -60);
+        let replies = state
+            .command(CommandSource::Console, "summon pig")
+            .await
+            .unwrap();
+        assert!(
+            replies
+                .iter()
+                .any(|reply| reply.contains("Summoned minecraft:pig")),
+            "{replies:?}"
+        );
+        let live = state.mobs.as_ref().unwrap().live.lock().unwrap();
+        let pig = live.engine.entities().next().unwrap();
+        assert_eq!(
+            pig.position,
+            [
+                f64::from(spawn.position[0]) + 0.5,
+                -60.0,
+                f64::from(spawn.position[2]) + 0.5
+            ]
+        );
+    }
     #[tokio::test]
     #[ignore = "requires prepared official Minecraft 26.3 data"]
     async fn failed_tick_save_still_removes_dead_mob_and_retries_dirty_snapshot() {

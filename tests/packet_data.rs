@@ -161,7 +161,7 @@ fn refuses_mismatched_data_and_missing_defaults() {
 }
 
 #[test]
-fn waterlogged_blocks_keep_collision_while_containing_fluid() {
+fn water_and_waterlogged_blocks_both_contribute_to_section_fluid_counts() {
     let dir = tempfile::tempdir().unwrap();
     fixture(dir.path());
     let path = dir.path().join("generated/reports/blocks.json");
@@ -171,9 +171,29 @@ fn waterlogged_blocks_keep_collision_while_containing_fluid() {
         json!({"states":[{"id":264,"default":true,"properties":{"waterlogged":"true"}}]});
     fs::write(path, serde_json::to_vec(&blocks).unwrap()).unwrap();
     let data = GameData::load(dir.path()).unwrap();
-    assert!(data.is_fluid_block(263));
     assert!(data.has_fluid(263) && data.has_fluid(264));
-    assert!(!data.is_fluid_block(264));
+    let mut chunk = zerqon_world::Chunk::flat(0, 0, data.flat);
+    chunk.set_block(0, -64, 0, 263).unwrap();
+    chunk.set_block(1, -64, 0, 264).unwrap();
+    let encoded = packets::chunk(&chunk, &data).unwrap();
+    let mut body = encoded.as_slice();
+    assert_eq!(get_varint(&mut body).unwrap(), 46);
+    take(&mut body, 8).unwrap();
+    for _ in 0..get_varint(&mut body).unwrap() {
+        get_varint(&mut body).unwrap();
+        let words = get_varint(&mut body).unwrap() as usize;
+        take(&mut body, words * 8).unwrap();
+    }
+    let length = get_varint(&mut body).unwrap() as usize;
+    let mut sections = take(&mut body, length).unwrap();
+    assert_eq!(
+        u16::from_be_bytes(take(&mut sections, 2).unwrap().try_into().unwrap()),
+        4096
+    );
+    assert_eq!(
+        u16::from_be_bytes(take(&mut sections, 2).unwrap().try_into().unwrap()),
+        2
+    );
 }
 
 #[test]

@@ -38,6 +38,80 @@ impl Drop for Process {
     }
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn unix_termination_signals_stop_the_process_cleanly_after_readiness() {
+    for signal in ["-TERM", "-INT"] {
+        let directory = tempfile::tempdir().unwrap();
+        let binary = env!("CARGO_BIN_EXE_zerqon");
+        assert!(
+            Command::new(binary)
+                .args(["--init", "--directory"])
+                .arg(directory.path())
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        std::fs::write(directory.path().join("eula.txt"), "eula=true\n").unwrap();
+        std::fs::write(
+            directory.path().join("server.properties"),
+            "server-ip=127.0.0.1\nserver-port=0\n",
+        )
+        .unwrap();
+        let mut child = Process(
+            Command::new(binary)
+                .args(["--status-only", "--no-console", "--no-color", "--directory"])
+                .arg(directory.path())
+                .env("RUST_LOG", "info")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap(),
+        );
+        let output = child.0.stdout.take().unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let observer = std::thread::spawn(move || {
+            let mut stopped = false;
+            for line in BufReader::new(output).lines().map_while(Result::ok) {
+                if line.contains("Listening on ") {
+                    let _ = ready_tx.send(());
+                }
+                stopped |= line.contains("Stopped cleanly");
+            }
+            stopped
+        });
+        ready_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("server readiness");
+        assert!(
+            Command::new("kill")
+                .args([signal, &child.0.id().to_string()])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let status = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(status) = child.0.try_wait().unwrap() {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("signal did not stop server");
+        assert!(
+            status.success(),
+            "{signal} bypassed graceful shutdown: {status}"
+        );
+        assert!(
+            observer.join().unwrap(),
+            "shutdown cleanup was not reported"
+        );
+    }
+}
+
 #[tokio::test]
 async fn status_diagnostics_do_not_start_plugin_runtimes() {
     let directory = tempfile::tempdir().unwrap();

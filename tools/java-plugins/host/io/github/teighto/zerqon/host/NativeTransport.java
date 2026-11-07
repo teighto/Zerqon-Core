@@ -12,6 +12,15 @@ import java.nio.ByteBuffer;
 import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.util.Locale;
+import java.util.List;
+import java.util.Optional;
+import java.util.UUID;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.function.Function;
+import io.github.teighto.zerqon.api.Event;
 
 final class NativeTransport {
     private static final int MAX_CALLS = 128;
@@ -28,6 +37,10 @@ final class NativeTransport {
     private long parent;
     private long calls;
     private int resultBytes;
+    private NativeQueries.PlayerSnapshot eventPlayer;
+    private List<NativeQueries.PlayerSnapshot> onlinePlayers;
+    private List<NativeQueries.WorldSnapshot> worlds;
+    private final Map<String, Optional<NativeQueries.PlayerSnapshot>> players = new HashMap<>();
 
     NativeTransport(PrintStream output, InputStream input) { this.output = output; this.input = input; }
 
@@ -54,30 +67,84 @@ final class NativeTransport {
         if (Thread.currentThread() != owner || active) throw new IllegalStateException("Invalid native parent context");
         operationsStarted = true;
         if (negotiated) parent = Wire.integer(request, "id", 1, Long.MAX_VALUE);
+        eventPlayer = null;
+        onlinePlayers = null;
+        worlds = null;
+        players.clear();
         calls = 0;
         resultBytes = 0;
         active = operation.equals("load") || operation.equals("event") || operation.equals("shutdown");
     }
 
-    void end() { active = false; }
+    void end() { active = false; eventPlayer = null; onlinePlayers = null; worlds = null; players.clear(); }
+
+    NativeQueries.PlayerSnapshot eventPlayer() { return eventPlayer; }
+
+    void context(Event event, JsonObject request) {
+        if (!request.has("context")) return;
+        if (!negotiated) throw new IllegalArgumentException("Native context requires protocol 2");
+        JsonObject context = Wire.object(request, "context");
+        Wire.fields(context, "player");
+        NativeQueries.PlayerSnapshot player = player(Wire.object(context, "player"));
+        boolean matches = switch (event) {
+            case Event.Command command -> command.senderKind() == Event.SenderKind.PLAYER && command.sender().equals(player.name()) && command.operator() == player.operator();
+            case Event.PlayerJoin join -> join.uuid().equals(player.uuid().toString()) && join.name().equals(player.name());
+            case Event.PlayerQuit quit -> quit.uuid().equals(player.uuid().toString()) && quit.name().equals(player.name());
+            default -> false;
+        };
+        if (!matches || !player.online()) throw new IllegalArgumentException("Native context does not match event");
+        eventPlayer = player;
+    }
 
     NativeQueryBinding.Scope bind(String plugin) {
         if (!plugin.matches("[A-Za-z0-9_-]{1,64}")) throw new IllegalArgumentException("Invalid native plugin identity");
-        return NativeQueryBinding.bind(() -> query(plugin));
+        return NativeQueryBinding.bind(new NativeQueries.Access() {
+            @Override public NativeQueries.ServerSnapshot serverSnapshot() { return query(plugin, operation("server_snapshot"), NativeTransport::snapshot); }
+            @Override public List<NativeQueries.PlayerSnapshot> onlinePlayers() {
+                if (onlinePlayers == null) {
+                    onlinePlayers = query(plugin, operation("online_players"), NativeTransport::playerList);
+                    for (NativeQueries.PlayerSnapshot player : onlinePlayers) {
+                        Optional<NativeQueries.PlayerSnapshot> snapshot = Optional.of(player);
+                        players.putIfAbsent(player.uuid() + ":null", snapshot);
+                        players.putIfAbsent(player.uuid() + ":" + player.sessionId(), snapshot);
+                    }
+                }
+                return onlinePlayers;
+            }
+            @Override public Optional<NativeQueries.PlayerSnapshot> player(UUID uuid, Integer sessionId) {
+                if (eventPlayer != null && eventPlayer.uuid().equals(uuid) && (sessionId == null || sessionId == eventPlayer.sessionId())) return Optional.of(eventPlayer);
+                String key = uuid + ":" + sessionId;
+                return players.computeIfAbsent(key, ignored -> {
+                    JsonObject request = operation("player");
+                    request.addProperty("uuid", uuid.toString());
+                    if (sessionId != null) request.addProperty("session_id", sessionId);
+                    return query(plugin, request, value -> {
+                        Wire.fields(value, "player");
+                        if (!value.has("player")) throw new IllegalArgumentException("Missing native player result");
+                        if (value.get("player").isJsonNull()) return Optional.empty();
+                        NativeQueries.PlayerSnapshot result = NativeTransport.player(Wire.object(value, "player"));
+                        if (!result.uuid().equals(uuid) || sessionId != null && result.sessionId() != sessionId || !result.online()) throw new IllegalArgumentException("Native player result identity mismatch");
+                        return Optional.of(result);
+                    });
+                });
+            }
+            @Override public List<NativeQueries.WorldSnapshot> worlds() {
+                if (worlds == null) worlds = query(plugin, operation("worlds"), NativeTransport::worldList);
+                return worlds;
+            }
+        });
     }
 
     void checkHealthy() throws IOException {
         if (poisoned) throw new IOException("Native query protocol is no longer synchronized");
     }
 
-    private NativeQueries.ServerSnapshot query(String plugin) {
+    private <T> T query(String plugin, JsonObject operation, Function<JsonObject, T> decode) {
         if (Thread.currentThread() != owner || !active) throw new IllegalStateException("Native queries require the active host callback thread");
         if (!negotiated) throw new NativeQueries.NativeQueryException(NativeQueries.ErrorCode.UNSUPPORTED, "Native queries require host protocol 2");
         if (poisoned) throw failure("Native query protocol is no longer synchronized", null);
         if (calls == MAX_CALLS) throw failure("Native query limit exceeded", null);
         long call = ++calls;
-        JsonObject operation = new JsonObject();
-        operation.addProperty("query", "server_snapshot");
         JsonObject request = new JsonObject();
         request.addProperty("kind", "native_call");
         request.addProperty("parent_id", parent);
@@ -107,11 +174,7 @@ final class NativeTransport {
             result = Wire.object(response, "result");
             if (Wire.bool(result, "ok")) {
                 Wire.fields(result, "ok", "value");
-                JsonObject value = Wire.object(result, "value");
-                Wire.fields(value, "server_version", "minecraft_version", "protocol", "max_players", "online_players", "tick");
-                return new NativeQueries.ServerSnapshot(Wire.string(value, "server_version", 128), Wire.string(value, "minecraft_version", 128),
-                        (int) Wire.integer(value, "protocol", 0, Integer.MAX_VALUE), (int) Wire.integer(value, "max_players", 1, 1_000_000),
-                        (int) Wire.integer(value, "online_players", 0, 1_000_000), Wire.integer(value, "tick", 0, Long.MAX_VALUE));
+                return decode.apply(Wire.object(result, "value"));
             }
             Wire.fields(result, "ok", "error");
             JsonObject error = Wire.object(result, "error");
@@ -127,6 +190,79 @@ final class NativeTransport {
         } catch (IOException | RuntimeException exception) {
             throw failure("Invalid native query response", exception);
         }
+    }
+
+    private static JsonObject operation(String name) {
+        JsonObject operation = new JsonObject();
+        operation.addProperty("query", name);
+        return operation;
+    }
+
+    private static NativeQueries.ServerSnapshot snapshot(JsonObject value) {
+        Wire.fields(value, "server_version", "minecraft_version", "protocol", "max_players", "online_players", "tick");
+        return new NativeQueries.ServerSnapshot(Wire.string(value, "server_version", 128), Wire.string(value, "minecraft_version", 128),
+                (int) Wire.integer(value, "protocol", 0, Integer.MAX_VALUE), (int) Wire.integer(value, "max_players", 1, 1_000_000),
+                (int) Wire.integer(value, "online_players", 0, 1_000_000), Wire.integer(value, "tick", 0, Long.MAX_VALUE));
+    }
+
+    private static UUID uuid(JsonObject value, String field) {
+        String text = Wire.string(value, field, 36);
+        UUID uuid = UUID.fromString(text);
+        if (!uuid.toString().equals(text)) throw new IllegalArgumentException("Noncanonical native UUID");
+        return uuid;
+    }
+
+    private static double decimal(JsonObject value, String field) {
+        JsonElement number = value.get(field);
+        if (number == null || !number.isJsonPrimitive() || !number.getAsJsonPrimitive().isNumber()) throw new IllegalArgumentException("Missing number: " + field);
+        double result = number.getAsDouble();
+        if (!Double.isFinite(result)) throw new IllegalArgumentException("Invalid native number");
+        return result;
+    }
+
+    private static NativeQueries.Position position(JsonObject value) {
+        Wire.fields(value, "x", "y", "z", "yaw", "pitch");
+        return new NativeQueries.Position(decimal(value, "x"), decimal(value, "y"), decimal(value, "z"), (float) decimal(value, "yaw"), (float) decimal(value, "pitch"));
+    }
+
+    private static NativeQueries.PlayerSnapshot player(JsonObject value) {
+        Wire.fields(value, "uuid", "session_id", "entity_id", "name", "world_uuid", "position", "operator", "online");
+        return new NativeQueries.PlayerSnapshot(uuid(value, "uuid"), (int) Wire.integer(value, "session_id", 1, Integer.MAX_VALUE),
+                (int) Wire.integer(value, "entity_id", 1, Integer.MAX_VALUE), Wire.string(value, "name", 16), uuid(value, "world_uuid"),
+                position(Wire.object(value, "position")), Wire.bool(value, "operator"), Wire.bool(value, "online"));
+    }
+
+    private static List<NativeQueries.PlayerSnapshot> playerList(JsonObject value) {
+        Wire.fields(value, "players");
+        JsonArray array = Wire.array(value, "players", 1024);
+        List<NativeQueries.PlayerSnapshot> result = new ArrayList<>(array.size());
+        HashSet<UUID> identities = new HashSet<>();
+        HashSet<Integer> sessions = new HashSet<>();
+        HashSet<Integer> entities = new HashSet<>();
+        for (JsonElement element : array) {
+            NativeQueries.PlayerSnapshot player = player(element.getAsJsonObject());
+            if (!player.online() || !identities.add(player.uuid()) || !sessions.add(player.sessionId()) || !entities.add(player.entityId())) throw new IllegalArgumentException("Duplicate or offline native player");
+            result.add(player);
+        }
+        return List.copyOf(result);
+    }
+
+    private static List<NativeQueries.WorldSnapshot> worldList(JsonObject value) {
+        Wire.fields(value, "worlds");
+        JsonArray array = Wire.array(value, "worlds", 16);
+        List<NativeQueries.WorldSnapshot> result = new ArrayList<>(array.size());
+        HashSet<UUID> identities = new HashSet<>();
+        HashSet<String> keys = new HashSet<>();
+        for (JsonElement element : array) {
+            JsonObject world = element.getAsJsonObject();
+            Wire.fields(world, "uuid", "name", "key", "dimension", "environment", "min_height", "max_height", "spawn");
+            NativeQueries.WorldSnapshot snapshot = new NativeQueries.WorldSnapshot(uuid(world, "uuid"), Wire.string(world, "name", 128),
+                    Wire.string(world, "key", 256), Wire.string(world, "dimension", 256), Wire.string(world, "environment", 16),
+                    Wire.signedInteger(world, "min_height", -20_000_000, 20_000_000), Wire.signedInteger(world, "max_height", -20_000_000, 20_000_000), position(Wire.object(world, "spawn")));
+            if (!identities.add(snapshot.uuid()) || !keys.add(snapshot.key())) throw new IllegalArgumentException("Duplicate native world");
+            result.add(snapshot);
+        }
+        return List.copyOf(result);
     }
 
     private IllegalStateException failure(String message, Throwable cause) {

@@ -1,4 +1,5 @@
 use aws_lc_rs::digest::{Context, SHA256};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet},
@@ -98,15 +99,44 @@ pub async fn resolve_java(
     cache: &Path,
     allow_download: bool,
 ) -> Result<PathBuf, JavaRuntimeError> {
-    match probe_java(requested).await {
-        Ok(java) => return Ok(java),
-        Err(error) if !is_default_java(requested) => {
-            return Err(invalid(format!(
+    if !is_default_java(requested) {
+        return probe_java(requested).await.map_err(|error| {
+            invalid(format!(
                 "configured Java executable {} is unavailable or is not Java 25: {error}",
                 requested.display()
-            )));
+            ))
+        });
+    }
+    let mut failed_unicode_runtime = None;
+    for candidate in default_java_candidates() {
+        let managed = if let Some(runtime) = managed_runtime_for(&candidate, cache)? {
+            runtime
+        } else {
+            let java = match probe_java(&candidate).await {
+                Ok(java) => java,
+                Err(JavaRuntimeError::Io(error))
+                    if cfg!(unix) && error.kind() == io::ErrorKind::PermissionDenied =>
+                {
+                    continue;
+                }
+                Err(_) => break,
+            };
+            if let Some(runtime) = managed_runtime_for(&java, cache)? {
+                runtime
+            } else {
+                return Ok(java);
+            }
+        };
+        match validated_cached_runtime(&managed, current_asset()?).await {
+            Ok(java) => return Ok(java),
+            Err(JavaRuntimeError::ProbeExit(_))
+                if cfg!(windows) && !managed.as_os_str().as_encoded_bytes().is_ascii() =>
+            {
+                failed_unicode_runtime = Some(managed);
+                break;
+            }
+            Err(error) => return Err(error),
         }
-        Err(_) => {}
     }
     let asset = current_asset()?;
     let requested_cache = std::path::absolute(cache)?;
@@ -115,7 +145,9 @@ pub async fn resolve_java(
         .join(asset.platform.cache_name())
         .join(ARCHIVE_ROOT);
     reject_runtime_links(&requested_runtime)?;
-    if requested_runtime.try_exists()? {
+    if failed_unicode_runtime.as_ref() != Some(&requested_runtime)
+        && requested_runtime.try_exists()?
+    {
         match validated_cached_runtime(&requested_runtime, asset).await {
             Ok(java) => return Ok(java),
             Err(JavaRuntimeError::ProbeExit(_))
@@ -135,6 +167,68 @@ pub async fn resolve_java(
         ));
     }
     install_managed(&cache, asset).await
+}
+
+fn default_java_candidates() -> impl Iterator<Item = PathBuf> {
+    let directories = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let name = if cfg!(windows) { "java.exe" } else { "java" };
+    directories
+        .into_iter()
+        .filter(|directory| directory.is_absolute())
+        .map(move |directory| directory.join(name))
+        .filter(|candidate| {
+            let Ok(metadata) = candidate.metadata() else {
+                return false;
+            };
+            if !metadata.is_file() {
+                return false;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if metadata.permissions().mode() & 0o111 == 0 {
+                    return false;
+                }
+            }
+            true
+        })
+}
+
+fn managed_runtime_for(
+    candidate: &Path,
+    cache: &Path,
+) -> Result<Option<PathBuf>, JavaRuntimeError> {
+    let Ok(asset) = current_asset() else {
+        return Ok(None);
+    };
+    let requested = std::path::absolute(cache)?;
+    #[cfg(windows)]
+    let fallback = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .filter(|local| local.is_absolute())
+        .map(|local| local.join("Zerqon/cache/java"));
+    #[cfg(not(windows))]
+    let fallback = None;
+    let absolute = std::path::absolute(candidate)?;
+    let canonical = candidate.canonicalize().ok();
+    for cache in std::iter::once(requested).chain(fallback) {
+        let runtime = cache
+            .join("25")
+            .join(asset.platform.cache_name())
+            .join(ARCHIVE_ROOT);
+        if absolute.starts_with(&runtime)
+            || canonical.as_ref().is_some_and(|candidate| {
+                runtime
+                    .canonicalize()
+                    .is_ok_and(|runtime| candidate.starts_with(runtime))
+            })
+        {
+            return Ok(Some(runtime));
+        }
+    }
+    Ok(None)
 }
 
 fn managed_cache_location(cache: &Path) -> Result<PathBuf, JavaRuntimeError> {
@@ -177,7 +271,11 @@ fn windows_cache_location(
 fn is_default_java(path: &Path) -> bool {
     path.components().count() == 1
         && path.to_str().is_some_and(|value| {
-            value == "java" || (cfg!(windows) && value.eq_ignore_ascii_case("java.exe"))
+            if cfg!(windows) {
+                value.eq_ignore_ascii_case("java") || value.eq_ignore_ascii_case("java.exe")
+            } else {
+                value == "java"
+            }
         })
 }
 
@@ -185,20 +283,8 @@ async fn validated_cached_runtime(
     runtime: &Path,
     asset: Asset,
 ) -> Result<PathBuf, JavaRuntimeError> {
-    reject_runtime_links(runtime)?;
-    validate_runtime_tree(runtime)?;
-    let marker = runtime.join("zerqon-runtime.json");
-    let bytes = read_limited(&marker, 65536)?;
-    let identity: Value = serde_json::from_slice(&bytes)?;
-    if identity["release"] != RELEASE
-        || identity["sha256"] != asset.sha256
-        || identity["size"] != asset.size
-        || identity["platform"] != asset.platform.cache_name()
-    {
-        return Err(invalid(
-            "managed Java cache identity is invalid; existing files were preserved",
-        ));
-    }
+    let checked = runtime.to_owned();
+    tokio::task::spawn_blocking(move || validate_cached_files(&checked, asset)).await??;
     let binary = runtime.join("bin").join(asset.platform.executable());
     reject_runtime_links(&binary)?;
     let binary = binary.canonicalize()?;
@@ -215,6 +301,27 @@ async fn validated_cached_runtime(
         ));
     }
     Ok(resolved)
+}
+
+fn validate_cached_files(runtime: &Path, asset: Asset) -> Result<(), JavaRuntimeError> {
+    reject_runtime_links(runtime)?;
+    let marker = runtime.join("zerqon-runtime.json");
+    reject_runtime_links(&marker)?;
+    if !fs::symlink_metadata(&marker)?.is_file() {
+        return Err(invalid("managed runtime marker must be a regular file"));
+    }
+    let bytes = read_limited(&marker, 65536)?;
+    let identity: Value = serde_json::from_slice(&bytes)?;
+    if identity["release"] != RELEASE
+        || identity["sha256"] != asset.sha256
+        || identity["size"] != asset.size
+        || identity["platform"] != asset.platform.cache_name()
+    {
+        return Err(invalid(
+            "managed Java cache identity is invalid; existing files were preserved",
+        ));
+    }
+    validate_runtime_tree(runtime, asset, true)
 }
 
 async fn install_managed(cache: &Path, asset: Asset) -> Result<PathBuf, JavaRuntimeError> {
@@ -252,7 +359,8 @@ async fn install_managed(cache: &Path, asset: Asset) -> Result<PathBuf, JavaRunt
     let archive_path = archive.path().to_owned();
     let output_path = output.clone();
     tokio::task::spawn_blocking(move || {
-        extract_archive(&archive_path, &output_path, asset.platform)
+        extract_archive(&archive_path, &output_path, asset.platform)?;
+        validate_runtime_tree(&output_path, asset, false)
     })
     .await??;
     let executable = output.join("bin").join(asset.platform.executable());
@@ -361,14 +469,93 @@ fn checked_runtime_directory(path: &Path) -> Result<PathBuf, JavaRuntimeError> {
     Ok(absolute.canonicalize()?)
 }
 
-fn validate_runtime_tree(root: &Path) -> Result<(), JavaRuntimeError> {
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeInventory {
+    schema: u32,
+    release: String,
+    platform: String,
+    archive_root: String,
+    archive_name: String,
+    archive_size: u64,
+    archive_sha256: String,
+    files: Vec<RuntimeFile>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeFile {
+    path: PathBuf,
+    size: u64,
+    sha256: String,
+    executable: bool,
+}
+
+fn runtime_inventory(asset: Asset) -> Result<RuntimeInventory, JavaRuntimeError> {
+    let bytes = match asset.platform {
+        Platform::WindowsX64 => include_str!("assets/java-runtime-25.0.5-windows-x64.json"),
+        Platform::LinuxX64 => include_str!("assets/java-runtime-25.0.5-linux-x64.json"),
+    };
+    let inventory: RuntimeInventory = serde_json::from_str(bytes)?;
+    if inventory.schema != 1
+        || inventory.release != RELEASE
+        || inventory.platform != asset.platform.cache_name()
+        || inventory.archive_root != ARCHIVE_ROOT
+        || inventory.archive_name != asset.name
+        || inventory.archive_size != asset.size
+        || inventory.archive_sha256 != asset.sha256
+        || inventory.files.is_empty()
+        || inventory.files.len() > MAX_ENTRIES
+    {
+        return Err(invalid(
+            "embedded runtime inventory differs from the pinned release",
+        ));
+    }
+    Ok(inventory)
+}
+
+fn validate_runtime_tree(
+    root: &Path,
+    asset: Asset,
+    marker_allowed: bool,
+) -> Result<(), JavaRuntimeError> {
+    reject_runtime_links(root)?;
     if !root.is_dir() {
         return Err(invalid("managed runtime must be a directory"));
     }
-    let canonical = root.canonicalize()?;
+    let inventory = runtime_inventory(asset)?;
+    let mut files = HashMap::new();
+    let mut directories = HashSet::new();
+    let mut expected_total = 0_u64;
+    for file in &inventory.files {
+        if file.path.is_absolute()
+            || file
+                .path
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+            || file.size > MAX_FILE
+            || file.sha256.len() != 64
+            || !file
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || files.insert(file.path.clone(), file).is_some()
+        {
+            return Err(invalid("invalid embedded runtime file inventory"));
+        }
+        expected_total = expected_total
+            .checked_add(file.size)
+            .filter(|total| *total <= MAX_UNPACKED)
+            .ok_or_else(|| invalid("embedded runtime content exceeds its bound"))?;
+        let mut parent = file.path.parent();
+        while let Some(directory) = parent.filter(|path| !path.as_os_str().is_empty()) {
+            directories.insert(directory.to_owned());
+            parent = directory.parent();
+        }
+    }
     let mut pending = vec![root.to_owned()];
     let mut count = 0usize;
-    let mut bytes = 0u64;
+    let mut buffer = [0_u8; 65_536];
     while let Some(directory) = pending.pop() {
         for entry in fs::read_dir(directory)? {
             let entry = entry?;
@@ -377,23 +564,89 @@ fn validate_runtime_tree(root: &Path) -> Result<(), JavaRuntimeError> {
                 return Err(invalid("managed runtime contains too many entries"));
             }
             let metadata = fs::symlink_metadata(entry.path())?;
-            if is_runtime_link(&metadata) || !entry.path().canonicalize()?.starts_with(&canonical) {
+            if is_runtime_link(&metadata) {
                 return Err(invalid(
                     "managed runtime contains a link or an escaping library path",
                 ));
             }
+            let path = entry.path();
+            let relative = path
+                .strip_prefix(root)
+                .map_err(|_| invalid("runtime entry escaped root"))?;
             if metadata.is_dir() {
-                pending.push(entry.path());
-            } else if metadata.is_file() {
-                if metadata.len() > MAX_FILE || bytes > MAX_UNPACKED.saturating_sub(metadata.len())
-                {
-                    return Err(invalid("managed runtime exceeds content limits"));
+                if !directories.contains(relative) {
+                    return Err(invalid(
+                        "managed runtime contains an unrecognized directory; files were preserved",
+                    ));
                 }
-                bytes += metadata.len();
+                pending.push(path);
+            } else if metadata.is_file() {
+                if marker_allowed && relative == Path::new("zerqon-runtime.json") {
+                    if metadata.len() > 65_536 {
+                        return Err(invalid("runtime metadata exceeds its bound"));
+                    }
+                    continue;
+                }
+                let expected = files.remove(relative).ok_or_else(|| {
+                    invalid("managed runtime contains an unrecognized file; files were preserved")
+                })?;
+                let mut input = File::open(&path)?;
+                let opened = input.metadata()?;
+                if !opened.is_file()
+                    || metadata.len() != expected.size
+                    || opened.len() != expected.size
+                {
+                    return Err(invalid(format!(
+                        "managed runtime file size differs from pinned content: {}",
+                        expected.path.display()
+                    )));
+                }
+                #[cfg(unix)]
+                if asset.platform == Platform::LinuxX64 {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mode = opened.permissions().mode();
+                    if (mode & 0o111 != 0) != expected.executable || mode & 0o6000 != 0 {
+                        return Err(invalid(
+                            "managed runtime file execution permissions differ from pinned content",
+                        ));
+                    }
+                }
+                #[cfg(not(unix))]
+                let _ = expected.executable;
+                let mut digest = Context::new(&SHA256);
+                let mut read = 0_u64;
+                loop {
+                    let count = input.read(&mut buffer)?;
+                    if count == 0 {
+                        break;
+                    }
+                    read += count as u64;
+                    if read > expected.size {
+                        return Err(invalid("managed runtime file grew beyond pinned size"));
+                    }
+                    digest.update(&buffer[..count]);
+                }
+                let actual = digest
+                    .finish()
+                    .as_ref()
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>();
+                if read != expected.size || actual != expected.sha256 {
+                    return Err(invalid(format!(
+                        "managed runtime file contents differ from pinned content: {}",
+                        expected.path.display()
+                    )));
+                }
             } else {
                 return Err(invalid("managed runtime contains a special file"));
             }
         }
+    }
+    if !files.is_empty() {
+        return Err(invalid(
+            "managed runtime is missing pinned files; existing files were preserved",
+        ));
     }
     Ok(())
 }

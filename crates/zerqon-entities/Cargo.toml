@@ -12,6 +12,7 @@ repository.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
+zerqon-blocks = { path = "../zerqon-blocks" }
 
 [dev-dependencies]
 serde_json.workspace = true

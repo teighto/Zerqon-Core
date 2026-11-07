@@ -3,6 +3,7 @@
 
 import argparse
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -10,6 +11,7 @@ import platform as host_platform
 import re
 import shutil
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -17,6 +19,7 @@ import tomllib
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
+LINUX_TARGET = "x86_64-unknown-linux-musl"
 
 
 def run(*args):
@@ -52,7 +55,7 @@ def allowlist(version, platform, paper_files):
         raise ValueError("supported release platforms: windows-x86_64, linux-x86_64")
     native = "zerqon.exe" if platform.startswith("windows") else "zerqon"
     files = {
-        native: f"target/release/{native}",
+        native: f"target/{LINUX_TARGET}/release/{native}" if platform == "linux-x86_64" else f"target/release/{native}",
         "libraries/gson-2.13.2.jar": "libraries/gson-2.13.2.jar",
         f"libraries/zerqon-java-api-{version}.jar": f"libraries/zerqon-java-api-{version}.jar",
         f"libraries/zerqon-java-host-{version}.jar": f"libraries/zerqon-java-host-{version}.jar",
@@ -67,6 +70,56 @@ def allowlist(version, platform, paper_files):
     for path in ("README.md", "LICENSE", "docs/CONFIGURATION.md", "docs/RUST_PLUGINS.md", "docs/JAVA_PLUGINS.md", "docs/JAVA_COMPATIBILITY.md", "docs/PROFILING.md", "docs/WORLD_IMPORT.md", "docs/WORLD_STORAGE.md", "crates/zerqon-profiler/NOTICE.md", "tools/paper-bridge/dependencies.lock.json", "tools/paper-bridge/licenses.lock.json", "docs/ROADMAP.md", "docs/images/architecture.png", "docs/images/architecture.svg", "docs/images/performance.png", "docs/images/performance.svg", "docs/images/plugins.png", "docs/images/plugins.svg", "scripts/prepare-data.py"):
         files[path] = path
     return files
+
+
+def verify_linux_elf(source, size):
+    source.seek(0)
+    header = source.read(64)
+    if len(header) != 64:
+        raise ValueError("Linux release has a truncated ELF header")
+    ident, kind, machine, version, entry, offset, _, _, header_size, entry_size, count, _, _, _ = struct.unpack("<16sHHIQQQIHHHHHH", header)
+    if ident[:7] != b"\x7fELF\x02\x01\x01" or ident[7] not in (0, 3) or kind not in (2, 3) or machine != 62 or version != 1 or header_size != 64:
+        raise ValueError("Linux release must be an x86-64 little-endian ELF executable")
+    if entry_size != 56 or not 1 <= count <= 128 or offset < 64 or offset + count * entry_size > size:
+        raise ValueError("Linux release has an invalid program header table")
+    source.seek(offset)
+    table = source.read(count * entry_size)
+    if len(table) != count * entry_size:
+        raise ValueError("Linux release has truncated program headers")
+    executable_entry = False
+    dynamic_segments = []
+    for segment, flags, position, address, _, length, memory, _ in struct.iter_unpack("<IIQQQQQQ", table):
+        if position + length > size or (segment == 1 and length > memory):
+            raise ValueError("Linux release has an invalid segment range")
+        if segment == 3:
+            raise ValueError("Linux release requires an ELF interpreter; build the musl target")
+        if segment == 1 and flags & 1 and entry != 0 and address <= entry < address + memory:
+            executable_entry = True
+        if segment == 2:
+            if length == 0 or length % 16 or length > 4096 * 16:
+                raise ValueError("Linux release has an invalid dynamic segment")
+            dynamic_segments.append((position, length))
+    if not executable_entry:
+        raise ValueError("Linux release has no executable entry point")
+    for position, length in dynamic_segments:
+        source.seek(position)
+        data = source.read(length)
+        if len(data) != length:
+            raise ValueError("Linux release has a truncated dynamic segment")
+        for tag, value in struct.iter_unpack("<qQ", data):
+            if tag == 0:
+                break
+            if tag == 1:
+                raise ValueError("Linux release requires shared libraries; build the musl target")
+            if tag in (0x6ffffffe, 0x6fffffff) and value:
+                raise ValueError("Linux release requires versioned shared symbols such as GLIBC")
+        else:
+            raise ValueError("Linux release has an unterminated dynamic segment")
+
+
+def verify_linux_binary(path):
+    with path.open("rb") as source:
+        verify_linux_elf(source, os.fstat(source.fileno()).st_size)
 
 
 def project_file(root, relative):
@@ -106,6 +159,8 @@ def package(root: Path, output: Path, platform: str, notices: Path) -> Path:
         "source": "https://github.com/teighto/Zerqon-Core",
         "source_at_commit": f"https://github.com/teighto/Zerqon-Core/tree/{commit}" if commit and not dirty else None,
     }
+    if platform == "linux-x86_64":
+        build_info["native_target"] = LINUX_TARGET
     output.mkdir(parents=True, exist_ok=True)
     destination = output / f"zerqon-{version}-{platform}.zip"
     handle, temporary_name = tempfile.mkstemp(prefix=".zerqon-package-", suffix=".zip", dir=output)
@@ -116,6 +171,8 @@ def package(root: Path, output: Path, platform: str, notices: Path) -> Path:
         with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
             for name, path in sorted(files.items()):
                 data = path.read_bytes()
+                if platform == "linux-x86_64" and name == "zerqon":
+                    verify_linux_elf(io.BytesIO(data), len(data))
                 if name in pinned_files and hashlib.sha256(data).hexdigest() != pinned_files[name]:
                     raise ValueError("release dependency checksum mismatch: " + name)
                 archive_entry(archive, name, data, executable=name == "zerqon")
@@ -136,11 +193,14 @@ def package(root: Path, output: Path, platform: str, notices: Path) -> Path:
     return destination
 
 
-def build():
+def build(platform):
     run("cargo", "fmt", "--all", "--check")
     run("cargo", "clippy", "--workspace", "--all-targets", "--locked", "--", "-D", "warnings")
     run("cargo", "test", "--workspace", "--locked")
-    run("cargo", "build", "-p", "zerqon", "--release", "--locked")
+    native = ["cargo", "build", "-p", "zerqon", "--release", "--locked"]
+    if platform == "linux-x86_64":
+        native += ["--target", LINUX_TARGET]
+    run(*native)
     run("cargo", "build", "-p", "zerqon-hello-plugin", "--target", "wasm32-unknown-unknown", "--release", "--locked")
     run("cargo", "run", "-p", "zerqon-plugins", "--example", "verify-plugin", "--locked", "--", "target/wasm32-unknown-unknown/release/zerqon_hello_plugin.wasm")
     run(sys.executable, ROOT / "scripts/build-java-plugins.py")
@@ -186,18 +246,23 @@ def verify_distribution(archive_path):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, epilog="Linux release builds require musl-gcc (musl-tools) and rustup target add x86_64-unknown-linux-musl. Ordinary cargo run --release continues to use the host target.")
     parser.add_argument("--skip-build", action="store_true", help="Package already built and verified artifacts")
     parser.add_argument("--output", type=Path, default=ROOT / "dist/releases")
     parser.add_argument("--platform", choices=("windows-x86_64", "linux-x86_64"))
+    parser.add_argument("--check-linux-binary", type=Path, help="Check a standalone Linux ELF artifact and exit without packaging")
     args = parser.parse_args()
+    if args.check_linux_binary is not None:
+        verify_linux_binary(args.check_linux_binary)
+        print(f"Verified standalone Linux executable: {args.check_linux_binary}")
+        return
     if host_platform.machine().lower() not in ("amd64", "x86_64"):
         raise ValueError("release packaging currently supports x86-64 hosts only")
     current_platform = "windows-x86_64" if os.name == "nt" else "linux-x86_64" if sys.platform.startswith("linux") else None
     if current_platform is None or args.platform not in (None, current_platform):
         raise ValueError("build this release on its target Windows or Linux platform")
     if not args.skip_build:
-        build()
+        build(current_platform)
     notices = ROOT / "target/release-notices/THIRD-PARTY-NOTICES.txt"
     run(sys.executable, ROOT / "scripts/collect-licenses.py", "--output", notices)
     run(sys.executable, ROOT / "scripts/collect-paper-licenses.py")

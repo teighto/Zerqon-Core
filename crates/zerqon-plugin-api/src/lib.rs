@@ -10,7 +10,7 @@ pub enum SenderKind {
     Player,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "event", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Event {
     Enable {
@@ -36,6 +36,58 @@ pub enum Event {
         uuid: String,
         name: String,
     },
+}
+
+impl<'de> Deserialize<'de> for Event {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(tag = "event", rename_all = "snake_case", deny_unknown_fields)]
+        enum WireEvent {
+            Enable {
+                server_version: String,
+            },
+            Disable {},
+            Command {
+                sender: String,
+                sender_kind: SenderKind,
+                #[serde(default)]
+                operator: bool,
+                command: String,
+                args: Vec<String>,
+            },
+            Tick {
+                tick: u64,
+            },
+            PlayerJoin {
+                uuid: String,
+                name: String,
+            },
+            PlayerQuit {
+                uuid: String,
+                name: String,
+            },
+        }
+        Ok(match WireEvent::deserialize(deserializer)? {
+            WireEvent::Enable { server_version } => Self::Enable { server_version },
+            WireEvent::Disable {} => Self::Disable,
+            WireEvent::Command {
+                sender,
+                sender_kind,
+                operator,
+                command,
+                args,
+            } => Self::Command {
+                sender,
+                sender_kind,
+                operator,
+                command,
+                args,
+            },
+            WireEvent::Tick { tick } => Self::Tick { tick },
+            WireEvent::PlayerJoin { uuid, name } => Self::PlayerJoin { uuid, name },
+            WireEvent::PlayerQuit { uuid, name } => Self::PlayerQuit { uuid, name },
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,6 +139,20 @@ macro_rules! export_plugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disable_rejects_unknown_fields_without_changing_abi_one_wire_shape() {
+        assert_eq!(
+            serde_json::to_string(&Event::Disable).unwrap(),
+            r#"{"event":"disable"}"#
+        );
+        assert!(serde_json::from_str::<Event>(r#"{"event":"disable","operator":true}"#).is_err());
+        assert!(serde_json::from_str::<Event>(r#"{"event":"disable","event":"enable"}"#).is_err());
+        assert_eq!(
+            serde_json::from_str::<Event>(r#"{"event":"disable"}"#).unwrap(),
+            Event::Disable
+        );
+    }
 
     #[test]
     fn command_requires_explicit_sender_kind_and_keeps_player_console_distinct() {

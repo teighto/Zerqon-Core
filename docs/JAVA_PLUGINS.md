@@ -89,7 +89,7 @@ Command names are lowercase ASCII letters, digits, underscores or hyphens. For t
 
 `command.senderKind()` is `Event.SenderKind.CONSOLE` or `PLAYER`; `command.operator()` reports the server's authorization decision. Never infer privileges from `command.sender()`: it is a display name, and a player may be named `CONSOLE`. Missing `operator` in the wire protocol defaults to false.
 
-ABI 1 does not yet provide world, inventory, entity manipulation, a task scheduler or a persistent storage API. These capabilities are not represented by successful no-ops.
+World changes, inventory and entity management, task scheduling and persistent storage are not available through the custom Java API yet. Unsupported operations fail explicitly.
 
 Callbacks execute serially on the host thread. Constructor and callback thread context classloaders point to the plugin. Keep callbacks short and release resources during Disable. Do not retain thread-local data or spawn threads that outlive Disable. `System.out` is redirected to stderr, but return `Action.Log` for normal server logging.
 
@@ -104,7 +104,11 @@ NativeQueries.ServerSnapshot server = NativeQueries.serverSnapshot();
 String message = "Players " + server.onlinePlayers() + "/" + server.maxPlayers();
 ```
 
-The snapshot contains `serverVersion()`, `minecraftVersion()`, `protocol()`, `maxPlayers()`, `onlinePlayers()` and `tick()`. This API only reads server information; it does not expose world or inventory changes. `/jserver` in the example demonstrates the complete command path.
+The snapshot contains `serverVersion()`, `minecraftVersion()`, `protocol()`, `maxPlayers()`, `onlinePlayers()` and `tick()`. `/jserver` in the example demonstrates the complete command path.
+
+`NativeQueries.onlinePlayers()` returns immutable `PlayerSnapshot` records; `player(UUID)` selects the current session and `player(UUID, sessionId)` selects that exact session, returning an empty `Optional` when it no longer exists. Player data includes UUID, session/entity IDs, name, world UUID, position, operator status and online status. `NativeQueries.worlds()` returns immutable world identities, names/keys, dimensions, environments, height bounds and spawn positions. No mutation API is exposed.
+
+Player/world query results are cached for the current host request and refreshed for the next one. A player list is limited to 1,024 entries, a world list to 16, and both remain subject to the transport byte limits. Oversized results fail explicitly rather than silently truncating the server state. Only Rust supplies player command and lifecycle context; a display name is never used to construct a Player identity.
 
 Catch `NativeQueries.NativeQueryException` for a service error and inspect `code()`. `UNSUPPORTED` means native queries are unavailable on the legacy host protocol; `UNAVAILABLE` means the connected native service cannot currently answer. Other typed codes include `CAPACITY`, `CANCELLED` and `DEADLINE_EXCEEDED`. Errors do not become empty or invented snapshots. A malformed response terminates the Java host even if a plugin catches the resulting exception.
 
@@ -153,8 +157,10 @@ Direct diagnostic launch uses `java -Xms16M -Xmx128M -cp "libraries/zerqon-java-
 
 `NativeQueries.serverSnapshot()` возвращает неизменяемый снимок состояния Rust-ядра: версии сервера и Minecraft, номер протокола, число игроков, лимит игроков и номер тика. Метод доступен только внутри синхронного обработчика, включая Enable и Disable, после согласования протокола хоста 2. В манифесте остаётся `Zerqon-API: 1`. Конструктор и созданные плагином потоки не могут делать такие запросы. Пример `/jserver` показывает полный рабочий сценарий; при старом протоколе он сообщает о недоступности запросов.
 
+`NativeQueries.onlinePlayers()` возвращает неизменяемые данные игроков, `player(UUID)` — текущую сессию, `player(UUID, sessionId)` — строго указанную сессию или пустой `Optional`. В данных есть UUID, ID сессии и сущности, имя, UUID мира, положение, признак оператора и онлайн-статус. `worlds()` возвращает идентификаторы миров, имена/ключи, измерения, окружение, границы высоты и точки появления. Результаты чтения игроков и миров кэшируются на один вызов хоста; следующие вызовы получают актуальные данные. Максимумы — 1 024 игрока и 16 миров с сохранением ограничений размера сообщений. API не изменяет игровое состояние.
+
 Ошибка сервиса представлена `NativeQueries.NativeQueryException`: `code()` возвращает `UNSUPPORTED` для старого протокола, `UNAVAILABLE` для недоступного сервиса или другой конкретный код. Ошибки не подменяются пустыми снимками. Один запрос ограничен 250 мс и оставшимся временем исходного вызова Rust; новые запросы не продлевают общий дедлайн. На один вызов хоста, включая все обработчики плагинов, разрешено до 128 вложенных запросов; пределы сообщения запроса, ответа и суммы ответов — 64 КиБ, 256 КиБ и 1 МиБ. Повреждение протокола завершает Java-хост. Новый API только читает сведения о сервере.
 
-API мира, инвентарей, сущностей, планировщика и постоянного хранения пока отсутствуют. Обработчики последовательные; долгие операции блокируют Java-хост. При исключении отключается плагин, при зависании таймаут Rust-моста завершает весь Java-процесс. Java-плагины имеют права пользователя ОС и не изолированы как WASM; лимит JVM относится ко всем Java-плагинам вместе. Остановка процесса не отменяет уже выполненные внешние действия плагина.
+Собственный Java API пока не поддерживает изменение мира, управление инвентарями и сущностями, планировщик задач и постоянное хранилище. Обработчики последовательные; долгие операции блокируют Java-хост. При исключении отключается плагин, при зависании таймаут Rust-моста завершает весь Java-процесс. Java-плагины имеют права пользователя ОС и не изолированы как WASM; лимит JVM относится ко всем Java-плагинам вместе. Остановка процесса не отменяет уже выполненные внешние действия плагина.
 
 Проверенный пример и его манифест находятся в `examples/hello-java-plugin/`. SDK не требует Gson при компиляции плагинов.
