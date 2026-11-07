@@ -1,3 +1,5 @@
+use crate::lifecycle::{Lifecycle, StopToken, Stopped};
+use crate::managed_tasks::{self as tasks, OperationError, TaskError};
 use aws_lc_rs::digest::{Context, SHA1_FOR_LEGACY_USE_ONLY};
 use serde_json::{Value, json};
 use std::{
@@ -68,6 +70,22 @@ pub enum BootstrapError {
     JavaLaunch(#[from] crate::java_launch::JavaLaunchError),
     #[error(transparent)]
     Task(#[from] tokio::task::JoinError),
+    #[error("{0}")]
+    Managed(#[from] TaskError),
+    #[error("{0}")]
+    Stopped(#[from] Stopped),
+    #[error("{0}")]
+    Cleanup(#[from] tasks::CleanupError),
+}
+impl OperationError for BootstrapError {
+    fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Stopped(_))
+            || matches!(self, Self::Managed(error) if error.is_cancelled())
+    }
+    fn is_cleanup_failure(&self) -> bool {
+        matches!(self, Self::Cleanup(_) | Self::Task(_))
+            || matches!(self, Self::Managed(error) if error.is_cleanup_failure())
+    }
 }
 pub struct PreparedData {
     pub directory: PathBuf,
@@ -75,11 +93,42 @@ pub struct PreparedData {
 }
 pub struct Bootstrap;
 impl Bootstrap {
-    pub async fn is_prepared(directory: &Path) -> Result<bool, BootstrapError> {
+    pub async fn is_prepared_with_lifecycle(
+        directory: &Path,
+        lifecycle: &Lifecycle,
+        stop: &StopToken,
+    ) -> Result<bool, BootstrapError> {
         let directory = directory.to_owned();
-        tokio::task::spawn_blocking(move || cache_ready(&directory)).await?
+        tasks::blocking(lifecycle, stop, "check Minecraft data cache", move |stop| {
+            stop.check()?;
+            let ready = cache_ready(&directory)?;
+            stop.check()?;
+            Ok::<_, BootstrapError>(ready)
+        })
+        .await?
     }
-    pub async fn prepare(directory: &Path, java: &Path) -> Result<PreparedData, BootstrapError> {
+
+    pub async fn prepare_with_lifecycle(
+        directory: &Path,
+        java: &Path,
+        lifecycle: &Lifecycle,
+        stop: &StopToken,
+    ) -> Result<PreparedData, BootstrapError> {
+        let directory = directory.to_owned();
+        let java = java.to_owned();
+        let context = lifecycle.clone();
+        tasks::run(lifecycle, stop, "prepare Minecraft data", move |stop| async move {
+            Self::prepare_inner(&directory, &java, &context, &stop).await
+        }).await?
+    }
+
+    async fn prepare_inner(
+        directory: &Path,
+        java: &Path,
+        lifecycle: &Lifecycle,
+        stop: &StopToken,
+    ) -> Result<PreparedData, BootstrapError> {
+        stop.check()?;
         let directory = checked_cache_directory(directory)?;
         reject_cache_links(&directory.join("prepare.lock"))?;
         let lock = std::sync::Arc::new(
@@ -90,12 +139,22 @@ impl Bootstrap {
                 .truncate(false)
                 .open(directory.join("prepare.lock"))?,
         );
-        acquire_prepare_lock(&lock, Duration::from_secs(600)).await?;
+        acquire_prepare_lock_tracked(&lock, Duration::from_secs(600), stop).await?;
         let jar = directory.join("server.jar");
         let verify_path = jar.clone();
-        let verified = tokio::task::spawn_blocking(move || {
-            verify_file(&verify_path, SERVER_BYTES, SERVER_SHA1)
-        })
+        let verify_lock = std::sync::Arc::clone(&lock);
+        let verified = tasks::blocking(
+            lifecycle,
+            stop,
+            "verify Minecraft server archive",
+            move |stop| {
+                let _lock = verify_lock;
+                stop.check()?;
+                let verified = verify_file(&verify_path, SERVER_BYTES, SERVER_SHA1)?;
+                stop.check()?;
+                Ok::<_, BootstrapError>(verified)
+            },
+        )
         .await??;
         if !verified {
             if jar.exists() {
@@ -104,10 +163,24 @@ impl Bootstrap {
                 ));
             }
             tracing::info!("Downloading official Minecraft 26.3 server data (59.4 MiB)");
-            download(&jar, SERVER_URL, SERVER_BYTES, SERVER_SHA1).await?;
+            download_tracked(&jar, SERVER_URL, SERVER_BYTES, SERVER_SHA1, stop).await?;
         }
         let check_directory = directory.clone();
-        if tokio::task::spawn_blocking(move || cache_ready(&check_directory)).await?? {
+        let check_lock = std::sync::Arc::clone(&lock);
+        if tasks::blocking(
+            lifecycle,
+            stop,
+            "validate Minecraft data cache",
+            move |stop| {
+                let _lock = check_lock;
+                stop.check()?;
+                let ready = cache_ready(&check_directory)?;
+                stop.check()?;
+                Ok::<_, BootstrapError>(ready)
+            },
+        )
+        .await??
+        {
             tracing::info!("Minecraft 26.3 data cache verified");
             return Ok(PreparedData {
                 directory,
@@ -115,28 +188,43 @@ impl Bootstrap {
             });
         }
         tracing::info!("Preparing Minecraft 26.3 registries and protocol reports");
-        let java = java_runtime(java).await?;
+        let java = java_runtime_tracked(java, lifecycle, stop).await?;
         let stage = std::sync::Arc::new(
             tempfile::Builder::new()
                 .prefix("prepare-")
                 .tempdir_in(&directory)?,
         );
-        generate_reports(&java, &jar, std::sync::Arc::clone(&stage)).await?;
+        generate_reports_tracked(&java, &jar, std::sync::Arc::clone(&stage), lifecycle, stop)
+            .await?;
         let jar_path = jar.clone();
-        let prepared = preparation_task(
+        let prepared = preparation_task_tracked(
             std::sync::Arc::clone(&stage),
             std::sync::Arc::clone(&lock),
             move |stage| prepare_payloads(&jar_path, stage),
+            lifecycle,
+            stop,
         )
         .await?;
         let destination = directory.clone();
-        preparation_task(
+        preparation_task_tracked(
             std::sync::Arc::clone(&stage),
             std::sync::Arc::clone(&lock),
             move |stage| install_prepared(stage, &destination, &prepared),
+            lifecycle,
+            stop,
         )
         .await?;
-        if !cache_ready(&directory)? {
+        stop.check()?;
+        let checked = directory.clone();
+        if !preparation_task_tracked(
+            std::sync::Arc::clone(&stage),
+            std::sync::Arc::clone(&lock),
+            move |_| cache_ready(&checked),
+            lifecycle,
+            stop,
+        )
+        .await?
+        {
             return Err(invalid("prepared data failed final validation"));
         }
         tracing::info!("Minecraft 26.3 data preparation complete");
@@ -147,21 +235,36 @@ impl Bootstrap {
     }
 }
 
-async fn preparation_task<T: Send + 'static>(
+struct PreparationResources {
+    stage: std::sync::Arc<tempfile::TempDir>,
+    _lock: std::sync::Arc<File>,
+}
+
+async fn preparation_task_tracked<T: Send + 'static>(
     stage: std::sync::Arc<tempfile::TempDir>,
     lock: std::sync::Arc<File>,
     work: impl FnOnce(&Path) -> Result<T, BootstrapError> + Send + 'static,
+    lifecycle: &Lifecycle,
+    stop: &StopToken,
 ) -> Result<T, BootstrapError> {
-    tokio::task::spawn_blocking(move || {
-        let _lock = lock;
-        work(stage.path())
+    let resources = PreparationResources { stage, _lock: lock };
+    tasks::blocking(lifecycle, stop, "Minecraft data worker", move |stop| {
+        stop.check()?;
+        let result = work(resources.stage.path());
+        drop(resources);
+        result
     })
     .await?
 }
 
-async fn acquire_prepare_lock(lock: &File, timeout: Duration) -> Result<(), BootstrapError> {
+async fn acquire_prepare_lock_tracked(
+    lock: &File,
+    timeout: Duration,
+    stop: &StopToken,
+) -> Result<(), BootstrapError> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
+        stop.check()?;
         match lock.try_lock() {
             Ok(()) => return Ok(()),
             Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
@@ -171,7 +274,11 @@ async fn acquire_prepare_lock(lock: &File, timeout: Duration) -> Result<(), Boot
                         "timed out waiting for another process to finish preparing Minecraft data",
                     ));
                 }
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                tasks::cancellable(stop, async {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    Ok::<_, BootstrapError>(())
+                })
+                .await?;
             }
         }
     }
@@ -209,19 +316,24 @@ fn verify_file(path: &Path, size: u64, sha1: &str) -> Result<bool, BootstrapErro
     Ok(read == size && hex(digest.finish().as_ref()) == sha1)
 }
 
-async fn download(
+async fn download_tracked(
     destination: &Path,
     url: &str,
     size: u64,
     sha1: &str,
+    stop: &StopToken,
 ) -> Result<(), BootstrapError> {
+    stop.check()?;
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(20))
         .timeout(Duration::from_secs(300))
         .user_agent("Zerqon/0.0.1")
         .build()?;
-    let mut response = client.get(url).send().await?.error_for_status()?;
+    let mut response = tasks::cancellable(stop, async {
+        Ok::<_, BootstrapError>(client.get(url).send().await?.error_for_status()?)
+    })
+    .await?;
     if response
         .content_length()
         .is_some_and(|length| length != size)
@@ -235,7 +347,11 @@ async fn download(
     let mut file = tokio::fs::File::from_std(temporary.reopen()?);
     let mut length = 0u64;
     let mut digest = Context::new(&SHA1_FOR_LEGACY_USE_ONLY);
-    while let Some(bytes) = response.chunk().await? {
+    while let Some(bytes) = tasks::cancellable(stop, async {
+        Ok::<_, BootstrapError>(response.chunk().await?)
+    })
+    .await?
+    {
         length = length
             .checked_add(bytes.len() as u64)
             .ok_or_else(|| invalid("download size overflow"))?;
@@ -244,11 +360,14 @@ async fn download(
         }
         digest.update(&bytes);
         file.write_all(&bytes).await?;
+        file.flush().await?;
+        stop.check()?;
     }
     if length != size || hex(digest.finish().as_ref()) != sha1 {
         return Err(invalid("download failed pinned length/SHA-1 verification"));
     }
     file.sync_all().await?;
+    stop.check()?;
     drop(file);
     temporary
         .persist_noclobber(destination)
@@ -477,13 +596,29 @@ fn item_report_paths(directory: &Path) -> Result<Vec<PathBuf>, BootstrapError> {
         .collect()
 }
 
-async fn java_runtime(java: &Path) -> Result<PathBuf, BootstrapError> {
+async fn java_runtime_tracked(
+    java: &Path,
+    lifecycle: &Lifecycle,
+    stop: &StopToken,
+) -> Result<PathBuf, BootstrapError> {
+    let java = java.to_owned();
+    tasks::run(
+        lifecycle,
+        stop,
+        "Minecraft Java probe",
+        move |stop| async move { run_java_probe(&java, &stop).await },
+    )
+    .await?
+}
+
+async fn run_java_probe(java: &Path, stop: &StopToken) -> Result<PathBuf, BootstrapError> {
+    stop.check()?;
     let mut child=tokio::process::Command::new(java).args(["-Dfile.encoding=UTF-8","-Dsun.stdout.encoding=UTF-8","-Dsun.stderr.encoding=UTF-8","-XshowSettings:properties","-version"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).kill_on_drop(true).spawn().map_err(|error|invalid(format!("Java 25+ is required once to prepare official reports; set java_executable to its java binary ({error})")))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| invalid("missing Java runtime probe pipe"))?;
-    let result = tokio::time::timeout(Duration::from_secs(20), async {
+    let run = async {
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| invalid("missing Java runtime probe pipe"))?;
         let mut bytes = Vec::new();
         stderr.take(65537).read_to_end(&mut bytes).await?;
         if bytes.len() > 65536 {
@@ -514,15 +649,18 @@ async fn java_runtime(java: &Path) -> Result<PathBuf, BootstrapError> {
             return Err(invalid("reported Java executable does not exist"));
         }
         Ok(executable)
-    })
-    .await;
-    match result {
-        Ok(result) => result,
-        Err(_) => {
-            child.kill().await?;
-            Err(invalid("Java runtime probe timed out"))
-        }
-    }
+    };
+    let result = tokio::select! {
+        biased;
+        _ = stop.cancelled() => Err(Stopped.into()),
+        result = tokio::time::timeout(Duration::from_secs(20), tasks::catch_panic(run)) => match result {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => Err(error.into()),
+            Err(_) => Err(invalid("Java runtime probe timed out")),
+        },
+    };
+    tasks::terminate_child(&mut child).await?;
+    result
 }
 
 fn generator_main_class(jar: &Path) -> Result<String, BootstrapError> {
@@ -569,30 +707,49 @@ fn generator_main_class(jar: &Path) -> Result<String, BootstrapError> {
     main_class.ok_or_else(|| invalid("generator manifest has no Main-Class"))
 }
 
-struct ReportCancellation(Option<tokio::sync::oneshot::Sender<()>>);
-
-impl Drop for ReportCancellation {
-    fn drop(&mut self) {
-        if let Some(cancel) = self.0.take() {
-            let _ = cancel.send(());
-        }
-    }
-}
-
-async fn generate_reports(
+async fn generate_reports_tracked(
     java: &Path,
     jar: &Path,
     stage: std::sync::Arc<tempfile::TempDir>,
+    lifecycle: &Lifecycle,
+    stop: &StopToken,
 ) -> Result<(), BootstrapError> {
+    let java = java.to_owned();
+    let jar = jar.to_owned();
+    let context = lifecycle.clone();
+    tasks::run(
+        lifecycle,
+        stop,
+        "Minecraft report generator",
+        move |stop| async move { run_reports(&java, &jar, stage, &context, &stop).await },
+    )
+    .await?
+}
+
+async fn run_reports(
+    java: &Path,
+    jar: &Path,
+    stage: std::sync::Arc<tempfile::TempDir>,
+    lifecycle: &Lifecycle,
+    stop: &StopToken,
+) -> Result<(), BootstrapError> {
+    stop.check()?;
     let source_jar = jar.to_owned();
-    let launch = tokio::task::spawn_blocking(move || {
-        let main_class = generator_main_class(&source_jar)?;
-        Ok::<_, BootstrapError>(crate::java_launch::manifest_jar(
-            &[source_jar.canonicalize()?],
-            Some(&main_class),
-        )?)
-    })
+    let launch = tasks::blocking(
+        lifecycle,
+        stop,
+        "build Minecraft generator launch",
+        move |stop| {
+            stop.check()?;
+            let main_class = generator_main_class(&source_jar)?;
+            Ok::<_, BootstrapError>(crate::java_launch::manifest_jar(
+                &[source_jar.canonicalize()?],
+                Some(&main_class),
+            )?)
+        },
+    )
     .await??;
+    stop.check()?;
     let mut child = tokio::process::Command::new(java)
         .args([
             "-Dfile.encoding=UTF-8",
@@ -613,45 +770,41 @@ async fn generate_reports(
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| invalid("missing data generator stdout"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| invalid("missing data generator stderr"))?;
-    let (cancel, cancelled) = tokio::sync::oneshot::channel();
-    let _cancellation = ReportCancellation(Some(cancel));
-    tokio::spawn(async move {
-        let _stage = stage;
-        let _launch = launch;
-        let run = async {
-            let (out, err, status) =
-                tokio::join!(drain_output(stdout), drain_output(stderr), child.wait());
-            out?;
-            err?;
-            if !status?.success() {
-                return Err(invalid(
-                    "Mojang report generator failed; inspect preparation logs",
-                ));
-            }
-            Ok(())
-        };
-        let result = tokio::select! {
-            result = tokio::time::timeout(Duration::from_secs(180), run) => {
-                result.unwrap_or_else(|_| Err(invalid("Mojang report generation exceeded 180 seconds")))
-            }
-            _ = cancelled => Err(invalid("Mojang report generation cancelled")),
-        };
-        if child.try_wait()?.is_none() {
-            tokio::time::timeout(Duration::from_secs(2), child.kill())
-                .await
-                .map_err(|_| invalid("Mojang report generator termination timed out"))??;
+    let run = async {
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| invalid("missing data generator stdout"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| invalid("missing data generator stderr"))?;
+        let (out, err, status) =
+            tokio::join!(drain_output(stdout), drain_output(stderr), child.wait());
+        out?;
+        err?;
+        if !status?.success() {
+            return Err(invalid(
+                "Mojang report generator failed; inspect preparation logs",
+            ));
         }
-        result
-    })
-    .await?
+        Ok(())
+    };
+    let result = tokio::select! {
+        biased;
+        _ = stop.cancelled() => Err(Stopped.into()),
+        result = tokio::time::timeout(Duration::from_secs(180), tasks::catch_panic(run)) => {
+            match result {
+                Ok(Ok(result)) => result,
+                Ok(Err(error)) => Err(error.into()),
+                Err(_) => Err(invalid("Mojang report generation exceeded 180 seconds")),
+            }
+        }
+    };
+    tasks::terminate_child(&mut child).await?;
+    drop(launch);
+    drop(stage);
+    result
 }
 async fn drain_output(mut output: impl tokio::io::AsyncRead + Unpin) -> Result<(), BootstrapError> {
     let mut bytes = [0; 4096];

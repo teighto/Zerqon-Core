@@ -1,10 +1,122 @@
+#[path = "../src/lifecycle.rs"]
+#[allow(dead_code)]
+mod lifecycle;
+#[path = "../src/managed_tasks.rs"]
+#[allow(dead_code)]
+mod managed_tasks;
+
 include!("../src/java_runtime.rs");
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    pub async fn resolve_java(
+        requested: &Path,
+        cache: &Path,
+        allow_download: bool,
+    ) -> Result<PathBuf, JavaRuntimeError> {
+        let lifecycle = Lifecycle::new();
+        resolve_java_with_lifecycle(
+            requested,
+            cache,
+            allow_download,
+            &lifecycle,
+            &lifecycle.token(),
+        )
+        .await
+    }
+    async fn validated_cached_runtime(
+        runtime: &Path,
+        asset: Asset,
+    ) -> Result<PathBuf, JavaRuntimeError> {
+        let lifecycle = Lifecycle::new();
+        let (java, ()) =
+            validated_cached_runtime_tracked(runtime, asset, (), &lifecycle, &lifecycle.token())
+                .await?;
+        Ok(java)
+    }
+    async fn install_managed(cache: &Path, asset: Asset) -> Result<PathBuf, JavaRuntimeError> {
+        let lifecycle = Lifecycle::new();
+        let context = lifecycle.clone();
+        let cache = cache.to_owned();
+        tasks::run(
+            &lifecycle,
+            &lifecycle.token(),
+            "install Java runtime",
+            move |stop| async move { install_managed_tracked(&cache, asset, &context, &stop).await },
+        )
+        .await?
+    }
+    async fn finish_installation(
+        installation: Installation,
+        asset: Asset,
+        extract: impl FnOnce(&Path, &Path, Platform) -> Result<(), JavaRuntimeError> + Send + 'static,
+    ) -> Result<PathBuf, JavaRuntimeError> {
+        let lifecycle = Lifecycle::new();
+        let context = lifecycle.clone();
+        tasks::run(
+            &lifecycle,
+            &lifecycle.token(),
+            "finish Java installation",
+            move |stop| async move {
+                finish_installation_tracked(installation, asset, extract, &context, &stop).await
+            },
+        )
+        .await?
+    }
+    async fn acquire_install_lock(lock: &File, timeout: Duration) -> Result<(), JavaRuntimeError> {
+        acquire_install_lock_tracked(lock, timeout, &Lifecycle::new().token()).await
+    }
+    async fn download_archive(
+        client: &reqwest::Client,
+        url: &str,
+        size: u64,
+        sha256: &str,
+        target: &mut tempfile::NamedTempFile,
+    ) -> Result<(), JavaRuntimeError> {
+        download_archive_tracked(client, url, size, sha256, target, &Lifecycle::new().token()).await
+    }
+    async fn probe_java(executable: &Path) -> Result<PathBuf, JavaRuntimeError> {
+        let (java, ()) = probe_java_with_owner(executable, ()).await?;
+        Ok(java)
+    }
+    async fn probe_java_with_owner<T: Send + 'static>(
+        executable: &Path,
+        owner: T,
+    ) -> Result<(PathBuf, T), JavaRuntimeError> {
+        let lifecycle = Lifecycle::new();
+        probe_java_with_owner_tracked(executable, owner, &lifecycle, &lifecycle.token()).await
+    }
+
     use serde_json::json;
     use std::sync::OnceLock;
+
+    fn validate_cached_files(path: &Path, asset: Asset) -> Result<(), JavaRuntimeError> {
+        super::validate_cached_files(path, asset, &|| Ok(()))
+    }
+    fn extract_archive(
+        path: &Path,
+        output: &Path,
+        platform: Platform,
+    ) -> Result<(), JavaRuntimeError> {
+        super::extract_archive(path, output, platform, &|| Ok(()))
+    }
+    fn extract_zip(path: &Path, output: &Path) -> Result<(), JavaRuntimeError> {
+        super::extract_zip(path, output, &|| Ok(()))
+    }
+    fn extract_tar(path: &Path, output: &Path) -> Result<(), JavaRuntimeError> {
+        super::extract_tar(path, output, &|| Ok(()))
+    }
+    fn write_entry(
+        reader: &mut impl Read,
+        path: &Path,
+        size: u64,
+        total: &mut u64,
+        mode: u32,
+    ) -> Result<(), JavaRuntimeError> {
+        super::write_entry(reader, path, size, total, mode, &|| Ok(()))
+    }
 
     fn cached_probe_fixture(cache: &Path, mode: &str) -> PathBuf {
         static FIXTURE: OnceLock<tempfile::TempDir> = OnceLock::new();
@@ -1046,6 +1158,64 @@ mod tests {
         assert!(!path.exists());
     }
 
+    #[test]
+    fn extraction_cancellation_does_not_copy_more_than_one_64_kib_block() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("entry");
+        let mut input = std::io::Cursor::new(vec![7; 4 * 65_536]);
+        let check = || {
+            if path
+                .metadata()
+                .is_ok_and(|metadata| metadata.len() >= 65_536)
+            {
+                Err(JavaRuntimeError::Stopped(Stopped))
+            } else {
+                Ok(())
+            }
+        };
+        let result = super::write_entry(&mut input, &path, 4 * 65_536, &mut 0, 0o644, &check);
+        assert!(matches!(result, Err(JavaRuntimeError::Stopped(_))));
+        assert_eq!(input.position(), 65_536);
+        assert_eq!(path.metadata().unwrap().len(), 65_536);
+    }
+
+    #[test]
+    fn validation_cancellation_does_not_hash_more_than_one_64_kib_block() {
+        use std::cell::Cell;
+        struct ObservedRead<'a> {
+            input: std::io::Cursor<Vec<u8>>,
+            bytes: &'a Cell<u64>,
+        }
+        impl Read for ObservedRead<'_> {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                let count = Read::read(&mut self.input, buffer)?;
+                self.bytes.set(self.bytes.get() + count as u64);
+                Ok(count)
+            }
+        }
+        let bytes = Cell::new(0);
+        let mut input = ObservedRead {
+            input: std::io::Cursor::new(vec![7; 4 * 65_536]),
+            bytes: &bytes,
+        };
+        let expected = RuntimeFile {
+            path: "lib/modules".into(),
+            size: 4 * 65_536,
+            sha256: "0".repeat(64),
+            executable: false,
+        };
+        let check = || {
+            if bytes.get() >= 65_536 {
+                Err(JavaRuntimeError::Stopped(Stopped))
+            } else {
+                Ok(())
+            }
+        };
+        let result = validate_runtime_contents(&mut input, &expected, &mut [0; 65_536], &check);
+        assert!(matches!(result, Err(JavaRuntimeError::Stopped(_))));
+        assert_eq!(bytes.get(), 65_536);
+    }
+
     #[tokio::test]
     async fn concurrent_installers_wait_for_cache_owner_instead_of_failing_immediately() {
         let directory = tempfile::tempdir().unwrap();
@@ -1177,10 +1347,14 @@ mod tests {
                 .write(true)
                 .open(directory.path().join("install.lock"))
                 .unwrap();
-            let mut task = Box::pin(finish_installation(
+            let lifecycle = Lifecycle::new();
+            let stop = lifecycle.token();
+            let mut task = Box::pin(finish_installation_tracked(
                 installation,
                 current_asset().unwrap(),
                 extract_archive,
+                &lifecycle,
+                &stop,
             ));
             std::future::poll_fn(|cx| {
                 assert!(task.as_mut().poll(cx).is_pending());
@@ -1199,6 +1373,10 @@ mod tests {
             assert!(inputs_retained, "queued installation lost its input guards");
             assert!(!archive.exists() && !stage.exists());
             assert!(!directory.path().join(ARCHIVE_ROOT).exists());
+            lifecycle
+                .drain(tokio::time::Instant::now() + Duration::from_secs(5))
+                .await
+                .unwrap();
         });
     }
 
@@ -1337,7 +1515,14 @@ mod tests {
         });
         running.recv_timeout(Duration::from_secs(5)).unwrap();
         executor.block_on(async {
-            let mut task = Box::pin(install_managed(directory.path(), current_asset().unwrap()));
+            let lifecycle = Lifecycle::new();
+            let stop = lifecycle.token();
+            let mut task = Box::pin(install_managed_tracked(
+                directory.path(),
+                current_asset().unwrap(),
+                &lifecycle,
+                &stop,
+            ));
             std::future::poll_fn(|cx| {
                 assert!(task.as_mut().poll(cx).is_pending());
                 std::task::Poll::Ready(())
@@ -1359,6 +1544,10 @@ mod tests {
                 held,
                 "cancelled cache validation released its install lock while queued"
             );
+            lifecycle
+                .drain(tokio::time::Instant::now() + Duration::from_secs(5))
+                .await
+                .unwrap();
         });
         validate_cached_files(&cached, current_asset().unwrap()).unwrap();
     }
@@ -1366,11 +1555,12 @@ mod tests {
     #[tokio::test]
     async fn cancelled_probe_does_not_spawn_after_its_awaiter_is_gone() {
         let directory = tempfile::tempdir().unwrap();
-        let (cancel, cancelled) = tokio::sync::oneshot::channel();
-        drop(cancel);
+        let lifecycle = Lifecycle::new();
+        let stop = lifecycle.token();
+        stop.request_stop();
         assert!(matches!(
-            run_probe(&directory.path().join("absent-java"), cancelled).await,
-            Err(JavaRuntimeError::Invalid(_))
+            run_probe(&directory.path().join("absent-java"), &stop).await,
+            Err(JavaRuntimeError::Stopped(_))
         ));
     }
 
@@ -1389,8 +1579,12 @@ mod tests {
             .write(true)
             .open(directory.path().join("install.lock"))
             .unwrap();
-        let task =
-            tokio::spawn(async move { probe_java_with_owner(&executable, installation).await });
+        let lifecycle = Lifecycle::new();
+        let context = lifecycle.clone();
+        let task = tokio::spawn(async move {
+            probe_java_with_owner_tracked(&executable, installation, &context, &context.token())
+                .await
+        });
         let pid: u32 = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if let Ok(text) = fs::read_to_string(fake.join("probe.pid"))
@@ -1417,9 +1611,15 @@ mod tests {
             Err(error) => assert!(error.is_cancelled()),
             Ok(_) => panic!("stalled Java probe completed before cancellation"),
         }
-        acquire_install_lock(&waiter, Duration::from_secs(5))
+        lifecycle
+            .drain(tokio::time::Instant::now() + Duration::from_secs(5))
             .await
             .unwrap();
+        assert!(
+            !lifecycle.token().is_stopped(),
+            "caller cancellation stopped the shared lifecycle"
+        );
+        waiter.try_lock().unwrap();
         child_lock.try_lock().unwrap();
         #[cfg(target_os = "linux")]
         assert!(

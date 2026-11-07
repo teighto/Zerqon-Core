@@ -8,9 +8,18 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+native-types = ["dep:uuid", "serde_json/float_roundtrip"]
+native-read = ["native-types"]
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+uuid = { version = "1", default-features = false, features = ["serde"], optional = true }
+
+[dev-dependencies]
+proptest = "1"
 
 [lints.rust]
 unsafe_code = "deny"

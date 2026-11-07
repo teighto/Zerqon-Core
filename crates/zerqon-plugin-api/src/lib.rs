@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "native-types")]
+pub mod native;
+
 pub const ABI_VERSION: u32 = 1;
 pub const MAX_EVENT_BYTES: usize = 65_536;
 

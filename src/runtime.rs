@@ -1,3 +1,5 @@
+use crate::rust_plugins::{ActorLimits, RustPlugins};
+use crate::rust_plugins::{RustDelivery, RustRecipient};
 use crate::{
     Result,
     auth::Authenticator,
@@ -21,17 +23,74 @@ use std::{
 use tokio::sync::{RwLock, Semaphore, watch};
 use uuid::Uuid;
 use zerqon_inventory::ItemCatalog;
+use zerqon_plugin_api::native::{NativeCallbackContext, NativeSource};
 use zerqon_plugin_api::{Action, Event, LogLevel, SenderKind};
-use zerqon_plugins::{Limits, PluginManager};
+use zerqon_plugins::Limits;
+#[cfg(test)]
+use zerqon_plugins::PluginManager;
 use zerqon_world::{Chunk, ChunkCache, ChunkWorkers, GenerationPolicy, SpawnPoint, WorldStore};
 
 #[cfg(test)]
 mod review_tests;
+#[cfg(test)]
+mod startup_tests;
+
+async fn startup_work<T: Send + 'static>(
+    lifecycle: &crate::lifecycle::Lifecycle,
+    stop: &crate::lifecycle::StopToken,
+    label: &'static str,
+    work: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    crate::managed_tasks::blocking(lifecycle, stop, label, move |stop| {
+        stop.check()?;
+        let result = work()?;
+        stop.check()?;
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(result)
+    })
+    .await?
+}
+
+async fn cleanup_startup_plugins(
+    plugins: &RustPlugins,
+    java: Option<&JavaPlugins>,
+    lifecycle: &crate::lifecycle::Lifecycle,
+) -> Result<()> {
+    let mut failures = Vec::new();
+    if let Some(java) = java {
+        match java.shutdown().await {
+            Ok(results) => {
+                for result in results {
+                    if let Some(error) = result.error {
+                        failures.push(format!("Java plugin {}: {error}", result.name));
+                    }
+                }
+            }
+            Err(error) => failures.push(format!("Java host: {error}")),
+        }
+    }
+    let deadline = lifecycle
+        .cleanup_deadline()
+        .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(5));
+    for result in plugins.shutdown(deadline).await {
+        if let Err(error) = result.result {
+            failures.push(format!("Rust plugin {}: {error}", result.name));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; ").into())
+    }
+}
 
 #[derive(Clone, Copy)]
 pub enum CommandSource<'a> {
     Console,
-    Player { uuid: Uuid, name: &'a str },
+    Player {
+        uuid: Uuid,
+        session_id: i32,
+        name: &'a str,
+    },
 }
 
 pub enum BlockInteraction {
@@ -62,16 +121,25 @@ pub struct State {
     pub auth: Option<Authenticator>,
     pub players: Arc<Players>,
     pub queries: Arc<crate::server_queries::ServerQueries>,
+    pub native_read_budget: crate::native_query_runtime::NativeReadBudget,
+    pub lifecycle: crate::lifecycle::Lifecycle,
+    pub sessions: crate::player_session::SessionRegistry,
+    player_events: Mutex<HashMap<(Uuid, i32), PlayerEventReceipt>>,
     pub packet_budget: zerqon_protocol::inbound::PacketBudget,
     pub slots: Arc<Semaphore>,
-    pub plugins: Arc<Mutex<PluginManager>>,
+    pub plugins: RustPlugins,
     pub commands: Mutex<HashMap<String, (String, Option<String>)>>,
     pub operators: Arc<Mutex<crate::operator_store::OperatorStore>>,
     pub profiler: crate::profiling::ProfilerService,
     pub shutdown: watch::Sender<bool>,
     pub java: Option<JavaPlugins>,
     pub updates: Option<watch::Receiver<Option<crate::updates::UpdateAvailable>>>,
-    plugin_slots: Arc<Semaphore>,
+}
+
+#[derive(Default)]
+struct PlayerEventReceipt {
+    java: Option<u64>,
+    rust: Vec<RustRecipient>,
 }
 
 impl State {
@@ -356,6 +424,7 @@ impl State {
         Ok(())
     }
 
+    #[cfg(test)]
     pub async fn new(
         directory: &Path,
         properties: Properties,
@@ -364,20 +433,88 @@ impl State {
         shutdown: watch::Sender<bool>,
         updates: Option<watch::Receiver<Option<crate::updates::UpdateAvailable>>>,
     ) -> Result<Arc<Self>> {
+        let lifecycle = crate::lifecycle::Lifecycle::from_shutdown(shutdown);
+        Self::new_with_lifecycle(
+            directory,
+            properties,
+            settings,
+            status_only,
+            updates,
+            &lifecycle,
+            &lifecycle.token(),
+        )
+        .await
+    }
+
+    pub async fn new_with_lifecycle(
+        directory: &Path,
+        properties: Properties,
+        settings: Settings,
+        status_only: bool,
+        updates: Option<watch::Receiver<Option<crate::updates::UpdateAvailable>>>,
+        lifecycle: &crate::lifecycle::Lifecycle,
+        stop: &crate::lifecycle::StopToken,
+    ) -> Result<Arc<Self>> {
+        let directory = directory.to_owned();
+        let owner = lifecycle.clone();
+        crate::managed_tasks::run(
+            lifecycle,
+            stop,
+            "initialize runtime",
+            move |stop| async move {
+                Self::build_runtime(
+                    &directory,
+                    properties,
+                    settings,
+                    status_only,
+                    updates,
+                    &owner,
+                    &stop,
+                )
+                .await
+            },
+        )
+        .await?
+    }
+
+    async fn build_runtime(
+        directory: &Path,
+        properties: Properties,
+        settings: Settings,
+        status_only: bool,
+        updates: Option<watch::Receiver<Option<crate::updates::UpdateAvailable>>>,
+        lifecycle: &crate::lifecycle::Lifecycle,
+        stop: &crate::lifecycle::StopToken,
+    ) -> Result<Arc<Self>> {
+        stop.check()?;
+        let shutdown = lifecycle.shutdown_sender();
+        let packet_budget =
+            zerqon_protocol::inbound::PacketBudget::new(settings.packet_memory_mib * 1024 * 1024)?;
+        let profiler = crate::profiling::ProfilerService::new(
+            directory.to_owned(),
+            zerqon_profiler::ProfileConfig::default(),
+        )?;
         let gameplay = Arc::new(RwLock::new(()));
         let data = if status_only {
             None
         } else {
-            Some(Arc::new(GameData::load(
-                &directory.join(&settings.data_directory),
-            )?))
+            let path = directory.join(&settings.data_directory);
+            Some(Arc::new(
+                startup_work(lifecycle, stop, "load game data", move || {
+                    Ok(GameData::load(&path)?)
+                })
+                .await?,
+            ))
         };
         let items = if status_only {
             None
         } else {
             let path = directory.join(&settings.data_directory);
             Some(Arc::new(
-                tokio::task::spawn_blocking(move || ItemCatalog::load(&path)).await??,
+                startup_work(lifecycle, stop, "load item catalog", move || {
+                    Ok(ItemCatalog::load(&path)?)
+                })
+                .await?,
             ))
         };
         let auth = if properties.online_mode && !status_only {
@@ -385,17 +522,12 @@ impl State {
         } else {
             None
         };
-        let mut plugins = PluginManager::new(Limits {
-            fuel_per_event: settings.plugin_fuel,
-            memory_bytes: settings.plugin_memory_mib * 1024 * 1024,
-            ..Limits::default()
-        })?;
-        let loaded = if status_only {
-            Vec::new()
-        } else {
-            plugins.load_directory(&directory.join("plugins/rust-plugins"))?
-        };
-        let operators = crate::operator_store::OperatorStore::load(&directory.join("ops.json"))?;
+        stop.check()?;
+        let operator_path = directory.join("ops.json");
+        let operators = startup_work(lifecycle, stop, "load operators", move || {
+            Ok(crate::operator_store::OperatorStore::load(&operator_path)?)
+        })
+        .await?;
         tracing::info!(
             count = operators.entries().len(),
             "Loaded UUID operator records"
@@ -410,24 +542,31 @@ impl State {
                 .unwrap_or(0),
             Arc::clone(&entity_ids),
         );
-        let world = data
-            .as_ref()
-            .map(|data| {
-                World::new(
-                    &directory.join(&properties.level_name),
-                    &settings,
-                    Arc::clone(data),
-                    Arc::clone(&gameplay),
-                    Arc::clone(&players),
-                    shutdown.clone(),
-                )
-            })
-            .transpose()?
-            .map(Arc::new);
+        let world = if let Some(data) = &data {
+            let path = directory.join(&properties.level_name);
+            let settings = settings.clone();
+            let data = Arc::clone(data);
+            let gameplay = Arc::clone(&gameplay);
+            let players = Arc::clone(&players);
+            let shutdown = shutdown.clone();
+            Some(Arc::new(
+                startup_work(lifecycle, stop, "open world", move || {
+                    World::new(&path, &settings, data, gameplay, players, shutdown)
+                })
+                .await?,
+            ))
+        } else {
+            None
+        };
         let blocks = if status_only {
             None
         } else {
-            Some(Arc::new(zerqon_blocks::Catalog::embedded()?))
+            Some(Arc::new(
+                startup_work(lifecycle, stop, "load block catalog", || {
+                    Ok(zerqon_blocks::Catalog::embedded()?)
+                })
+                .await?,
+            ))
         };
         let inventories = items
             .as_ref()
@@ -477,33 +616,113 @@ impl State {
             operators: Arc::clone(&operators),
             worlds,
         });
-        let java_present = !status_only
-            && std::fs::read_dir(directory.join("plugins/java-plugins"))?
-                .filter_map(std::result::Result::ok)
-                .any(|entry| entry.path().extension().is_some_and(|ext| ext == "jar"));
-        let mut java = if settings.java_plugins && java_present {
-            Some(
-                JavaPlugins::spawn_with_services(
-                    JavaPluginConfig {
-                        java: settings.java_executable.clone().into(),
-                        host_jar: directory.join("libraries/zerqon-java-host-0.0.1.jar"),
-                        gson_jar: directory.join("libraries/gson-2.13.2.jar"),
-                        extra_classpath: crate::paper_libraries::classpath(
-                            &directory.join("libraries/paper"),
-                        )?,
-                        directory: directory.join("plugins/java-plugins"),
-                        server_version: env!("CARGO_PKG_VERSION").into(),
-                        request_timeout: Duration::from_secs(2),
-                        startup_timeout: Duration::from_secs(20),
-                        queue_capacity: 32,
-                    },
-                    queries.clone(),
-                )
-                .await?,
+        let native_read_budget = crate::native_query_runtime::NativeReadBudget::new(
+            crate::native_query_runtime::DEFAULT_READ_BUDGET_BYTES,
+        )?;
+        let native_reads = crate::native_query_runtime::NativeQueryRuntime::new(
+            queries.clone(),
+            native_read_budget.clone(),
+            lifecycle.clone(),
+            crate::native_query_runtime::NativeProviderContract::future_owned(
+                crate::native_query_runtime::MAX_PROVIDER_WORKING_SET_BYTES,
+            )?,
+        );
+        let java_present = if status_only {
+            false
+        } else {
+            let path = directory.join("plugins/java-plugins");
+            crate::managed_tasks::blocking(
+                lifecycle,
+                stop,
+                "inspect runtime Java plugins",
+                move |stop| {
+                    for entry in std::fs::read_dir(path)? {
+                        stop.check()?;
+                        if entry?.path().extension().is_some_and(|ext| ext == "jar") {
+                            return Ok::<_, Box<dyn std::error::Error + Send + Sync>>(true);
+                        }
+                    }
+                    Ok(false)
+                },
             )
+            .await??
+        };
+        let java_config = if settings.java_plugins && java_present {
+            let path = directory.join("libraries/paper");
+            let extra_classpath =
+                startup_work(lifecycle, stop, "verify Paper libraries", move || {
+                    Ok(crate::paper_libraries::classpath(&path)?)
+                })
+                .await?;
+            Some(JavaPluginConfig {
+                java: settings.java_executable.clone().into(),
+                host_jar: directory.join("libraries/zerqon-java-host-0.0.1.jar"),
+                gson_jar: directory.join("libraries/gson-2.13.2.jar"),
+                extra_classpath,
+                directory: directory.join("plugins/java-plugins"),
+                server_version: env!("CARGO_PKG_VERSION").into(),
+                request_timeout: Duration::from_secs(2),
+                startup_timeout: Duration::from_secs(20),
+                queue_capacity: 32,
+            })
         } else {
             None
         };
+        stop.check()?;
+        let plugins = RustPlugins::new(
+            Limits {
+                fuel_per_event: settings.plugin_fuel,
+                memory_bytes: settings.plugin_memory_mib * 1024 * 1024,
+                ..Limits::default()
+            },
+            native_reads.clone(),
+            lifecycle.clone(),
+            ActorLimits {
+                cpu_jobs: settings.world_threads.min(2),
+                ..ActorLimits::default()
+            },
+        )?;
+        let loaded = if status_only {
+            Vec::new()
+        } else {
+            plugins
+                .load_directory(
+                    &directory.join("plugins/rust-plugins"),
+                    stop,
+                    tokio::time::Instant::now() + Duration::from_secs(20),
+                )
+                .await?
+        };
+        let java_start: Result<Option<JavaPlugins>> = async {
+            if let Some(config) = java_config {
+                Ok(Some(
+                    JavaPlugins::spawn_with_query_runtime(
+                        config,
+                        native_reads.clone(),
+                        lifecycle,
+                        stop,
+                    )
+                    .await?,
+                ))
+            } else {
+                Ok(None)
+            }
+        }
+        .await;
+        let mut java = match java_start {
+            Ok(java) => java,
+            Err(error) => {
+                let cleanup = cleanup_startup_plugins(&plugins, None, lifecycle).await;
+                return match cleanup {
+                    Ok(()) => Err(error),
+                    Err(cleanup) => Err(format!("{error}; {cleanup}").into()),
+                };
+            }
+        };
+        if stop.is_stopped() {
+            cleanup_startup_plugins(&plugins, java.as_ref(), lifecycle).await?;
+            return Err(crate::lifecycle::Stopped.into());
+        }
         if java_present && !settings.java_plugins {
             tracing::warn!("Java plugins are disabled in server.settings");
         }
@@ -513,9 +732,7 @@ impl State {
             .unwrap_or_default();
         let state = Arc::new(Self {
             slots: Arc::new(Semaphore::new(properties.max_players)),
-            packet_budget: zerqon_protocol::inbound::PacketBudget::new(
-                settings.packet_memory_mib * 1024 * 1024,
-            )?,
+            packet_budget,
             properties,
             settings,
             stats: Mutex::new(TickStats::new()),
@@ -530,17 +747,17 @@ impl State {
             auth,
             players,
             queries,
-            plugins: Arc::new(Mutex::new(plugins)),
+            native_read_budget,
+            lifecycle: lifecycle.clone(),
+            sessions: crate::player_session::SessionRegistry::default(),
+            player_events: Mutex::new(HashMap::new()),
+            plugins,
             commands: Mutex::new(HashMap::new()),
             operators,
-            profiler: crate::profiling::ProfilerService::new(
-                directory.to_owned(),
-                zerqon_profiler::ProfileConfig::default(),
-            )?,
+            profiler,
             shutdown,
             java,
             updates,
-            plugin_slots: Arc::new(Semaphore::new(32)),
         });
         if let Some(items) = &state.items {
             tracing::info!(
@@ -557,7 +774,7 @@ impl State {
                 .unwrap_or("invalid");
             match loaded.result {
                 Ok(actions) => {
-                    state.apply_actions(name, actions);
+                    state.apply_rust_output(name, &actions);
                     tracing::info!("Loaded Rust plugin {name}");
                 }
                 Err(error) => tracing::error!(%error,plugin=name,"Plugin failed to load"),
@@ -577,6 +794,7 @@ impl State {
     pub fn online(&self) -> usize {
         self.players.count()
     }
+
     pub fn report(&self) -> String {
         self.stats.lock().map_or_else(
             |_| "Tick metrics unavailable".into(),
@@ -617,7 +835,11 @@ impl State {
             Ok(operators.revoke(uuid)?)
         }
     }
-    fn apply_actions(&self, plugin: &str, actions: Vec<Action>) -> Vec<String> {
+    fn apply_actions(
+        &self,
+        plugin: &str,
+        actions: impl IntoIterator<Item = Action>,
+    ) -> Vec<String> {
         let mut replies = Vec::new();
         for action in actions {
             match action {
@@ -643,8 +865,31 @@ impl State {
         replies
     }
 
+    fn apply_rust_output(
+        &self,
+        plugin: &str,
+        output: &crate::rust_plugins::RustCallbackOutput,
+    ) -> Vec<String> {
+        let usage = output.stats();
+        tracing::debug!(
+            plugin,
+            fuel = usage.fuel_consumed,
+            native_calls = usage.native_calls,
+            segments = usage.segments,
+            "Rust callback completed"
+        );
+        self.apply_actions(plugin, output.actions().iter().cloned())
+    }
+
     pub async fn event(&self, event: Event) -> Result<()> {
-        self.event_with_context(event, None).await
+        self.event_with_context(
+            event,
+            None,
+            NativeCallbackContext {
+                source: NativeSource::Server,
+            },
+        )
+        .await
     }
 
     async fn player_context(
@@ -688,41 +933,234 @@ impl State {
         name: &str,
         joining: bool,
     ) -> Result<()> {
-        let event = if joining {
-            Event::PlayerJoin {
-                uuid: uuid.to_string(),
-                name: name.into(),
-            }
+        if joining {
+            self.player_join(uuid, session, name).await
         } else {
-            Event::PlayerQuit {
-                uuid: uuid.to_string(),
-                name: name.into(),
-            }
-        };
-        let context = if self.java.is_some() {
-            match self.player_context(uuid, Some(session)).await {
-                Ok(context) => Some(context),
-                Err(error) if !joining => {
-                    let java_error = format!("Java player quit context: {error}");
-                    return match self.dispatch_rust_event(event).await {
-                        Ok(()) => Err(java_error.into()),
-                        Err(rust_error) => {
-                            Err(format!("{java_error}; Rust player quit: {rust_error}").into())
-                        }
-                    };
+            self.player_quit(uuid, session, name).await
+        }
+    }
+
+    async fn player_join(&self, uuid: Uuid, session: i32, name: &str) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let admission = self.lifecycle.token();
+        admission.check()?;
+        let validation_deadline = tokio::time::Instant::now() + Duration::from_millis(250);
+        loop {
+            match self.players.query_snapshot(uuid) {
+                Ok(Some(player)) if player.id == session && player.name == name => break,
+                Ok(_) => return Err("player Join identity is no longer active".into()),
+                Err(_) if tokio::time::Instant::now() < validation_deadline => {
+                    tokio::time::sleep(Duration::from_millis(1)).await
                 }
-                Err(error) => return Err(error),
+                Err(error) => return Err(error.into()),
             }
-        } else {
-            None
+        }
+        admission.check()?;
+        let admission = admission.admitted_child();
+        let recipients = self.plugins.recipients();
+        {
+            let mut receipts = self
+                .player_events
+                .lock()
+                .map_err(|_| "player event receipt lock poisoned")?;
+            if receipts.len() >= self.properties.max_players
+                || receipts.contains_key(&(uuid, session))
+            {
+                return Err("player Join is already active or its capacity is exhausted".into());
+            }
+            receipts.insert((uuid, session), PlayerEventReceipt::default());
+        }
+        let event = Event::PlayerJoin {
+            uuid: uuid.to_string(),
+            name: name.into(),
         };
-        self.event_with_context(event, context).await
+        let context = NativeCallbackContext {
+            source: NativeSource::Player {
+                uuid,
+                session_id: session,
+            },
+        };
+        let mut failures = Vec::new();
+        if let Some(java) = &self.java {
+            let player = self.player_context(uuid, Some(session)).await?;
+            match java
+                .dispatch_admitted_join(event.clone(), player, &admission)
+                .await
+            {
+                Ok(results) => {
+                    self.player_events
+                        .lock()
+                        .map_err(|_| "player event receipt lock poisoned")?
+                        .get_mut(&(uuid, session))
+                        .ok_or("player Join receipt disappeared")?
+                        .java = Some(java.generation());
+                    for result in results {
+                        if let Some(error) = result.error {
+                            tracing::error!(plugin=result.name,%error,"Java Join callback failed");
+                        }
+                        self.apply_actions(&format!("java:{}", result.name), result.actions);
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error,"Java Join delivery failed");
+                    if matches!(
+                        error,
+                        crate::java_plugins::JavaPluginError::QueueFull
+                            | crate::java_plugins::JavaPluginError::Timeout
+                            | crate::java_plugins::JavaPluginError::RequestTooLarge
+                            | crate::java_plugins::JavaPluginError::Rejected
+                            | crate::java_plugins::JavaPluginError::Cancelled(_)
+                    ) {
+                        failures.push(error.to_string());
+                    }
+                }
+            }
+        }
+        for recipient in recipients {
+            let results = self
+                .plugins
+                .dispatch_admitted_join(
+                    &event,
+                    &context,
+                    std::slice::from_ref(&recipient),
+                    &admission,
+                    deadline,
+                )
+                .await?;
+            for result in results {
+                match result.result {
+                    Ok(output) => {
+                        let recipient = result
+                            .recipient
+                            .ok_or("delivered Rust Join has no recipient")?;
+                        if recipient.name() != result.name {
+                            return Err("Rust Join recipient identity mismatch".into());
+                        }
+                        tracing::debug!(
+                            plugin = recipient.name(),
+                            generation = recipient.generation(),
+                            "Rust Join delivered"
+                        );
+                        self.player_events
+                            .lock()
+                            .map_err(|_| "player event receipt lock poisoned")?
+                            .get_mut(&(uuid, session))
+                            .ok_or("player Join receipt disappeared")?
+                            .rust
+                            .push(recipient);
+                        self.apply_rust_output(&result.name, &output);
+                    }
+                    Err(error) => {
+                        tracing::warn!(plugin=result.name,%error,delivery=?result.delivery,"Rust Join delivery failed");
+                        if result.delivery == RustDelivery::NotAdmitted {
+                            failures.push(format!("Rust plugin {}: {error}", result.name));
+                        }
+                    }
+                }
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("; ").into())
+        }
+    }
+
+    async fn player_quit(&self, uuid: Uuid, session: i32, name: &str) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let deadline = self
+            .lifecycle
+            .cleanup_deadline()
+            .map_or(deadline, |cleanup| cleanup.min(deadline));
+        let receipt = self
+            .player_events
+            .lock()
+            .map_err(|_| "player event receipt lock poisoned")?
+            .remove(&(uuid, session));
+        let Some(receipt) = receipt else {
+            return Ok(());
+        };
+        let event = Event::PlayerQuit {
+            uuid: uuid.to_string(),
+            name: name.into(),
+        };
+        let source = NativeCallbackContext {
+            source: NativeSource::Player {
+                uuid,
+                session_id: session,
+            },
+        };
+        let mut failures = Vec::new();
+        if let Some(java) = self
+            .java
+            .as_ref()
+            .filter(|java| receipt.java == Some(java.generation()))
+        {
+            match self.player_context(uuid, Some(session)).await {
+                Ok(context) => match java
+                    .dispatch_with_context(event.clone(), None, context)
+                    .await
+                {
+                    Ok(results) => {
+                        for result in results {
+                            if let Some(error) = result.error {
+                                tracing::error!(plugin=result.name,%error,"Java Quit callback failed");
+                            }
+                            self.apply_actions(&format!("java:{}", result.name), result.actions);
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error,"Java Quit delivery failed");
+                        failures.push(error.to_string());
+                    }
+                },
+                Err(error) => failures.push(format!("Java player quit context: {error}")),
+            }
+        }
+        let stop = self.lifecycle.cleanup_token();
+        for recipient in receipt.rust {
+            match self
+                .plugins
+                .dispatch_to_recipients(
+                    &event,
+                    &source,
+                    std::slice::from_ref(&recipient),
+                    &stop,
+                    deadline,
+                )
+                .await
+            {
+                Ok(results) => {
+                    for result in results {
+                        match result.result {
+                            Ok(output) => {
+                                self.apply_rust_output(&result.name, &output);
+                            }
+                            Err(error) => {
+                                tracing::warn!(plugin=result.name,%error,delivery=?result.delivery,"Rust Quit delivery failed");
+                                if result.delivery == RustDelivery::NotAdmitted {
+                                    failures
+                                        .push(format!("Rust player quit {}: {error}", result.name));
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(error) => failures.push(error.to_string()),
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("; ").into())
+        }
     }
 
     async fn event_with_context(
         &self,
         event: Event,
         context: Option<crate::plugin_services::NativeEventContext>,
+        source: NativeCallbackContext,
     ) -> Result<()> {
         if let Event::Tick { tick } = &event {
             self.tick.fetch_max(*tick, Ordering::Release);
@@ -758,7 +1196,7 @@ impl State {
                 }
             }
         }
-        if let Err(error) = self.dispatch_rust_event(event).await {
+        if let Err(error) = self.dispatch_rust_event(event, source).await {
             failures.push(error.to_string());
         }
         if failures.is_empty() {
@@ -768,47 +1206,35 @@ impl State {
         }
     }
 
-    async fn dispatch_rust_event(&self, event: Event) -> Result<()> {
+    async fn dispatch_rust_event(&self, event: Event, source: NativeCallbackContext) -> Result<()> {
         let disabling = matches!(event, Event::Disable);
-        let mut failures = Vec::new();
-        let permit = Arc::clone(&self.plugin_slots).acquire_owned().await?;
-        let plugins = Arc::clone(&self.plugins);
-        let dispatched = tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            let mut plugins = plugins.lock().map_err(|_| "plugin lock poisoned")?;
-            let results = if disabling {
-                plugins
-                    .list()
-                    .into_iter()
-                    .map(|plugin| zerqon_plugins::DispatchResult {
-                        name: plugin.name.clone(),
-                        result: plugins.unload(&plugin.name),
-                    })
-                    .collect()
+        let deadline =
+            tokio::time::Instant::now() + Duration::from_secs(if disabling { 5 } else { 1 });
+        let results = if disabling {
+            self.plugins.shutdown(deadline).await
+        } else {
+            let stop = if matches!(event, Event::PlayerQuit { .. }) {
+                self.lifecycle.cleanup_token()
             } else {
-                plugins.dispatch_all(&event)
+                self.lifecycle.token()
             };
-            Ok::<_, &str>(results)
-        })
-        .await;
-        match dispatched {
-            Ok(Ok(results)) => {
-                for result in results {
-                    match result.result {
-                        Ok(actions) => {
-                            self.apply_actions(&result.name, actions);
-                        }
-                        Err(error) => {
-                            tracing::error!(%error,plugin=result.name,"Rust plugin callback failed");
-                            if disabling {
-                                failures.push(format!("Rust plugin {}: {error}", result.name));
-                            }
-                        }
+            self.plugins
+                .dispatch(&event, &source, None, &stop, deadline)
+                .await
+        };
+        let mut failures = Vec::new();
+        for result in results {
+            match result.result {
+                Ok(output) => {
+                    self.apply_rust_output(&result.name, &output);
+                }
+                Err(error) => {
+                    tracing::error!(%error,plugin=result.name,"Rust plugin callback failed");
+                    if disabling {
+                        failures.push(format!("Rust plugin {}: {error}", result.name));
                     }
                 }
             }
-            Ok(Err(error)) => failures.push(error.into()),
-            Err(error) => failures.push(error.to_string()),
         }
         if failures.is_empty() {
             Ok(())
@@ -833,7 +1259,7 @@ impl State {
             "list"=>Ok(vec![format!("Players ({}): {}",self.online(),self.players.names().join(", "))]),
             "version"=>Ok(vec![format!("Zerqon {} | Minecraft 26.3 | teighto",env!("CARGO_PKG_VERSION"))]),
             "help"=>Ok(vec!["Commands: /help /version /tps /tpsbar /plugins; operator: /give player item [count], /summon pig|cow|zombie [x y z], /setblock x y z state, /stop".into()]),
-            "plugins"=>{let rust=self.plugins.lock().map_err(|_|"plugin lock poisoned")?.list().iter().map(|plugin|format!("{} ({})",plugin.name,if plugin.enabled{"enabled"}else{"disabled"})).collect::<Vec<_>>().join(", ");let java=if let Some(java)=&self.java{java.list().await?.iter().map(|plugin|format!("{} ({})",plugin.name,if plugin.enabled{"enabled"}else{"disabled"})).collect::<Vec<_>>().join(", ")}else{"disabled".into()};Ok(vec![format!("Rust: {rust}; Java: {java}")])},
+            "plugins"=>{let rust=self.plugins.list().iter().map(|plugin|format!("{} ({})",plugin.name,if plugin.enabled{"enabled"}else{"disabled"})).collect::<Vec<_>>().join(", ");let java=if let Some(java)=&self.java{java.list().await?.iter().map(|plugin|format!("{} ({})",plugin.name,if plugin.enabled{"enabled"}else{"disabled"})).collect::<Vec<_>>().join(", ")}else{"disabled".into()};let callbacks=self.plugins.stats();let reads=self.native_read_budget.snapshot();Ok(vec![format!("Rust: {rust}; Java: {java} | Rust callbacks: {}; event bytes: {}; native read memory: {}/{} bytes",callbacks.callbacks,callbacks.bytes,reads.reserved_bytes,reads.limit_bytes)])},
             "stop"=>{if level<4{return Ok(vec!["Permission denied".into()]);}let _=self.shutdown.send(true);Ok(vec!["Stopping Zerqon".into()])},
             "setblock"=>{
                 if level<2{return Ok(vec!["Permission denied".into()]);}
@@ -869,17 +1295,26 @@ impl State {
                 if permission.is_some()&&!authorized&&!plugin.starts_with("java:"){return Ok(vec!["Permission denied".into()]);}
                 let mut event=Event::Command{sender:sender.into(),operator:authorized,sender_kind:if matches!(source,CommandSource::Console){SenderKind::Console}else{SenderKind::Player},command:name,args};
                 if let Some(name)=plugin.strip_prefix("java:"){let java=self.java.as_ref().ok_or("Java plugins unavailable")?;let results=match source {
-                    CommandSource::Player{uuid,..}=>{
-                        let context=self.player_context(uuid,None).await?;
+                    CommandSource::Player{uuid,session_id,..}=>{
+                        let context=self.player_context(uuid,Some(session_id)).await?;
                         if let Event::Command {operator,..}=&mut event { *operator=context.player.operator; }
                         java.dispatch_with_context(event,Some(name.into()),context).await?
                     },
                     CommandSource::Console=>java.dispatch(event,Some(name.into())).await?,
                 };let mut replies=Vec::new();for result in results{if let Some(error)=result.error{return Err(error.into());}replies.extend(self.apply_actions(&plugin,result.actions));}return Ok(replies);}
-                let permit=Arc::clone(&self.plugin_slots).acquire_owned().await?;
-                let plugins=Arc::clone(&self.plugins);let plugin_name=plugin.clone();
-                let actions=tokio::task::spawn_blocking(move||{let _permit=permit;plugins.lock().map_err(|_|"plugin lock poisoned")?.dispatch(&plugin_name,&event).map_err(|error|error.to_string())}).await?.map_err(|error|format!("plugin {plugin}: {error}"))?;
-                Ok(self.apply_actions(&plugin,actions))
+                let source_context=match source {
+                    CommandSource::Console=>NativeCallbackContext{source:NativeSource::Console},
+                    CommandSource::Player{uuid,session_id,..}=>{
+                        let context=self.player_context(uuid,Some(session_id)).await?;
+                        if let Event::Command{operator,..}=&mut event{*operator=context.player.operator;}
+                        if permission.is_some()&&!context.player.operator{return Ok(vec!["Permission denied".into()]);}
+                        NativeCallbackContext{source:NativeSource::Player{uuid,session_id}}
+                    },
+                };
+                let results=self.plugins.dispatch(&event,&source_context,Some(&plugin),&self.lifecycle.token(),tokio::time::Instant::now()+Duration::from_secs(1)).await;
+                let mut replies=Vec::new();
+                for result in results{let output=match result.result {Err(crate::rust_plugins::RustPluginError::Stopped|crate::rust_plugins::RustPluginError::Cancelled) if self.lifecycle.token().is_stopped()=>return Err(crate::lifecycle::Stopped.into()), result=>result?};replies.extend(self.apply_rust_output(&result.name,&output));}
+                Ok(replies)
             }
         }
     }
@@ -1209,6 +1644,7 @@ mod authorization_tests {
         let reply = state
             .command(
                 CommandSource::Player {
+                    session_id: 1,
                     uuid: Uuid::from_u128(2),
                     name: "Admin",
                 },
@@ -1241,6 +1677,7 @@ mod authorization_tests {
         state
             .command(
                 CommandSource::Player {
+                    session_id: 1,
                     uuid: Uuid::from_u128(1),
                     name: "NewName",
                 },
@@ -1270,6 +1707,7 @@ mod authorization_tests {
         .await
         .unwrap();
         let source = CommandSource::Player {
+            session_id: 1,
             uuid: Uuid::from_u128(1),
             name: "Builder",
         };

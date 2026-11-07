@@ -3,6 +3,7 @@ include!("../src/plugin_services.rs");
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uuid::Uuid;
 
     fn position() -> NativePosition {
         NativePosition {

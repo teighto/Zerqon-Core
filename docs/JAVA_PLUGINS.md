@@ -93,6 +93,8 @@ World changes, inventory and entity management, task scheduling and persistent s
 
 Callbacks execute serially on the host thread. Constructor and callback thread context classloaders point to the plugin. Keep callbacks short and release resources during Disable. Do not retain thread-local data or spawn threads that outlive Disable. `System.out` is redirected to stderr, but return `Action.Log` for normal server logging.
 
+The player remains registered during Join and Quit. Disconnecting while an accepted Join is running waits for its result before sending Quit. These events wait for queue space within a ten-second transaction deadline; execution has a two-second limit once the host starts the request, capped by the remaining transaction time. A Java request includes all plugin handlers for that event. Exceeding its execution limit terminates the Java host, so handlers must finish promptly.
+
 ## Native server queries
 
 `NativeQueries.serverSnapshot()` reads an immutable snapshot from the Rust core. It is available inside synchronous callbacks, including Enable and Disable, when the host connection negotiates protocol 2. The plugin manifest remains `Zerqon-API: 1`; existing plugin interfaces and events are unchanged. Constructors and plugin-created threads cannot issue native queries.
@@ -111,6 +113,8 @@ The snapshot contains `serverVersion()`, `minecraftVersion()`, `protocol()`, `ma
 Player/world query results are cached for the current host request and refreshed for the next one. A player list is limited to 1,024 entries, a world list to 16, and both remain subject to the transport byte limits. Oversized results fail explicitly rather than silently truncating the server state. Only Rust supplies player command and lifecycle context; a display name is never used to construct a Player identity.
 
 Catch `NativeQueries.NativeQueryException` for a service error and inspect `code()`. `UNSUPPORTED` means native queries are unavailable on the legacy host protocol; `UNAVAILABLE` means the connected native service cannot currently answer. Other typed codes include `CAPACITY`, `CANCELLED` and `DEADLINE_EXCEEDED`. Errors do not become empty or invented snapshots. A malformed response terminates the Java host even if a plugin catches the resulting exception.
+
+Java and Rust native queries use the same 32 MiB reservation pool. Each active query workspace reserves 2 MiB. A completed service error can be handled by the plugin. If an executing provider exceeds the callback deadline, the Java host is stopped and the workspace remains reserved until that work finishes; a timeout does not make its memory immediately reusable. These reservations cover the query workspace, not the JVM heap or total process RAM.
 
 Each native query has a 250 ms deadline, capped by the time remaining on the original Rust request; making another query does not extend that parent deadline. One host request, including all plugin callbacks it dispatches, permits at most 128 native calls. A call frame is limited to 64 KiB, a result frame to 256 KiB and all result frames together to 1 MiB. Avoid polling the same snapshot repeatedly within one callback.
 
@@ -147,6 +151,8 @@ Direct diagnostic launch uses `java -Xms16M -Xmx128M -cp "libraries/zerqon-java-
 
 ## Русский
 
+Native-запросы Java и Rust используют общий резерв памяти 32 МиБ, по 2 МиБ на активную рабочую область. Завершённую ошибку сервиса плагин может обработать. Если выполняющийся запрос выходит за срок обработчика, Java-хост останавливается, а его резерв освобождается только после завершения принятой работы. Этот лимит не включает кучу JVM и остальную память процесса.
+
 У Zerqon собственный Java API. Ядро и мир работают на Rust; Java-плагины исполняются в одном дополнительном процессе Java 25. Этот же host распознаёт `plugin.yml` и запускает проверенную часть Paper 26.3 API при наличии `libraries/paper/` в classpath. Полной совместимости Paper пока нет; ограничения указаны в матрице. Папка Java-плагинов — `plugins/java-plugins/`, для Rust — `plugins/rust-plugins/`.
 
 Сборка: `python scripts/build-java-plugins.py`. Она проверяет SHA-256 библиотеки Gson, компилирует SDK, хост и пример, запускает интеграционные тесты с настоящими JAR и JVM. Скопируйте `dist/hello-java-plugin-0.0.1.jar` в `plugins/java-plugins/hello.jar`, хост и Gson — в `libraries/`. Настройка `java_plugins = true` в `server.settings` включает хост при наличии JAR; `java_executable` задаёт Java 25. Пример добавляет `/jhello` и `/jserver`.
@@ -161,6 +167,6 @@ Direct diagnostic launch uses `java -Xms16M -Xmx128M -cp "libraries/zerqon-java-
 
 Ошибка сервиса представлена `NativeQueries.NativeQueryException`: `code()` возвращает `UNSUPPORTED` для старого протокола, `UNAVAILABLE` для недоступного сервиса или другой конкретный код. Ошибки не подменяются пустыми снимками. Один запрос ограничен 250 мс и оставшимся временем исходного вызова Rust; новые запросы не продлевают общий дедлайн. На один вызов хоста, включая все обработчики плагинов, разрешено до 128 вложенных запросов; пределы сообщения запроса, ответа и суммы ответов — 64 КиБ, 256 КиБ и 1 МиБ. Повреждение протокола завершает Java-хост. Новый API только читает сведения о сервере.
 
-Собственный Java API пока не поддерживает изменение мира, управление инвентарями и сущностями, планировщик задач и постоянное хранилище. Обработчики последовательные; долгие операции блокируют Java-хост. При исключении отключается плагин, при зависании таймаут Rust-моста завершает весь Java-процесс. Java-плагины имеют права пользователя ОС и не изолированы как WASM; лимит JVM относится ко всем Java-плагинам вместе. Остановка процесса не отменяет уже выполненные внешние действия плагина.
+Собственный Java API пока не поддерживает изменение мира, управление инвентарями и сущностями, планировщик задач и постоянное хранилище. Во время Join и Quit игрок остаётся в реестре сервера. При отключении во время принятого Join сервер сначала ждёт его завершения, затем отправляет Quit. На ожидание очереди и доставку этих событий отведено до десяти секунд. После начала запроса все Java-обработчики вместе должны уложиться в две секунды и оставшееся время события. Обработчики последовательные; долгие операции блокируют Java-хост. При исключении отключается плагин, при зависании таймаут Rust-моста завершает весь Java-процесс. Java-плагины имеют права пользователя ОС и не изолированы как WASM; лимит JVM относится ко всем Java-плагинам вместе. Остановка процесса не отменяет уже выполненные внешние действия плагина.
 
 Проверенный пример и его манифест находятся в `examples/hello-java-plugin/`. SDK не требует Gson при компиляции плагинов.

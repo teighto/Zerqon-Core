@@ -1,7 +1,17 @@
+#[path = "../src/lifecycle.rs"]
+#[allow(dead_code)]
+mod lifecycle;
+#[path = "../src/managed_tasks.rs"]
+#[allow(dead_code)]
+mod managed_tasks;
+#[path = "../src/native_query_runtime.rs"]
+#[allow(dead_code)]
+mod native_query_runtime;
+
 #[path = "../src/java_launch.rs"]
 mod java_launch;
 #[path = "../src/plugin_services.rs"]
-mod plugin_services;
+pub mod plugin_services;
 
 include!("../src/java_plugins.rs");
 
@@ -9,7 +19,7 @@ include!("../src/java_plugins.rs");
 mod tests {
     use super::*;
     use crate::java_launch::classpath_manifest;
-    use crate::plugin_services::ServerSnapshot;
+    use crate::plugin_services::{NativeCallContext, NativeQueryValue, ServerSnapshot};
     use std::sync::OnceLock;
     use tokio::io::BufReader;
 
@@ -328,7 +338,69 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_service_errors_and_subdeadlines_do_not_poison_the_host() {
+    async fn wasm_workspace_pressure_returns_a_bounded_java_error_and_keeps_the_host_usable() {
+        use crate::native_query_runtime::WORKSPACE_BYTES;
+        let directory = tempfile::tempdir().unwrap();
+        let lifecycle = Lifecycle::new();
+        let budget = NativeReadBudget::new(WORKSPACE_BYTES).unwrap();
+        let service = ObservedService::new(
+            Duration::ZERO,
+            Err(NativeQueryError::new(NativeErrorCode::Unavailable, "busy")),
+        );
+        let executor = NativeQueryRuntime::new(
+            service.clone(),
+            budget.clone(),
+            lifecycle.clone(),
+            NativeProviderContract::future_owned(MAX_PROVIDER_WORKING_SET_BYTES).unwrap(),
+        );
+        let held = executor
+            .try_scope(NativeScopeContext {
+                key: NativePluginKey::new(NativeBackend::Wasm, "same-name", 1).unwrap(),
+                parent_id: 1,
+                deadline: Instant::now() + Duration::from_secs(10),
+                stop: lifecycle.token(),
+                admission: NativeAdmission::Normal,
+            })
+            .unwrap();
+        let plugins = JavaPlugins::spawn_with_query_runtime(
+            native_config("native_error", directory.path()),
+            executor,
+            &lifecycle,
+            &lifecycle.token(),
+        )
+        .await
+        .unwrap();
+        let reply = plugins
+            .dispatch(Event::Tick { tick: 1 }, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            reply[0].actions,
+            [Action::Reply {
+                message: "native-error".into()
+            }]
+        );
+        assert_eq!(service.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(budget.snapshot().reserved_bytes, WORKSPACE_BYTES);
+        assert!(plugins.list().await.unwrap()[0].enabled);
+        drop(held);
+        plugins
+            .dispatch(Event::Tick { tick: 2 }, None)
+            .await
+            .unwrap();
+        assert_eq!(service.calls.load(Ordering::SeqCst), 1);
+        plugins.shutdown().await.unwrap();
+        drop(plugins);
+        lifecycle.stop();
+        lifecycle
+            .drain(Instant::now() + Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(budget.snapshot().reserved_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn completed_native_service_errors_do_not_poison_the_host() {
         for (delay, result) in [
             (
                 Duration::ZERO,
@@ -337,7 +409,13 @@ mod tests {
                     "Unavailable",
                 )),
             ),
-            (Duration::from_secs(30), Ok(snapshot())),
+            (
+                Duration::ZERO,
+                Err(NativeQueryError::new(
+                    NativeErrorCode::DeadlineExceeded,
+                    "Provider deadline reached",
+                )),
+            ),
             (
                 Duration::ZERO,
                 Ok(ServerSnapshot {
@@ -398,32 +476,105 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelling_inflight_native_query_releases_service_future_and_stops_host() {
-        let directory = tempfile::tempdir().unwrap();
-        let service = ObservedService::new(Duration::from_secs(30), Ok(snapshot()));
-        let plugins = Arc::new(
-            JavaPlugins::spawn_with_services(
-                native_config("native", directory.path()),
+    async fn cancelled_or_timed_out_queries_keep_memory_and_cleanup_owned_until_the_provider_finishes()
+     {
+        struct HeldService {
+            entered: tokio::sync::Semaphore,
+            release: tokio::sync::Semaphore,
+            dropped: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl NativeQueryService for HeldService {
+            fn query(
+                &self,
+                _: NativeCallContext,
+                _: NativeQuery,
+            ) -> plugin_services::NativeQueryFuture<'_> {
+                struct DropMark(Arc<std::sync::atomic::AtomicUsize>);
+                impl Drop for DropMark {
+                    fn drop(&mut self) {
+                        self.0.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+                let guard = DropMark(Arc::clone(&self.dropped));
+                Box::pin(async move {
+                    let _guard = guard;
+                    self.entered.add_permits(1);
+                    self.release.acquire().await.unwrap().forget();
+                    Ok(snapshot().into())
+                })
+            }
+        }
+        for cancel_waiter in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let lifecycle = Lifecycle::new();
+            let budget =
+                NativeReadBudget::new(crate::native_query_runtime::WORKSPACE_BYTES).unwrap();
+            let service = Arc::new(HeldService {
+                entered: tokio::sync::Semaphore::new(0),
+                release: tokio::sync::Semaphore::new(0),
+                dropped: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            });
+            let executor = NativeQueryRuntime::new(
                 service.clone(),
-            )
-            .await
-            .unwrap(),
-        );
-        let requested = Arc::clone(&plugins);
-        let request =
-            tokio::spawn(async move { requested.dispatch(Event::Tick { tick: 1 }, None).await });
-        let started = Instant::now();
-        while service.calls.load(Ordering::SeqCst) == 0 {
-            assert!(started.elapsed() < Duration::from_secs(3));
-            tokio::task::yield_now().await;
+                budget.clone(),
+                lifecycle.clone(),
+                NativeProviderContract::future_owned(MAX_PROVIDER_WORKING_SET_BYTES).unwrap(),
+            );
+            let plugins = Arc::new(
+                JavaPlugins::spawn_with_query_runtime(
+                    native_config("native", directory.path()),
+                    executor,
+                    &lifecycle,
+                    &lifecycle.token(),
+                )
+                .await
+                .unwrap(),
+            );
+            let requested = Arc::clone(&plugins);
+            let request =
+                tokio::spawn(
+                    async move { requested.dispatch(Event::Tick { tick: 1 }, None).await },
+                );
+            tokio::time::timeout(Duration::from_secs(3), service.entered.acquire())
+                .await
+                .unwrap()
+                .unwrap()
+                .forget();
+            if cancel_waiter {
+                request.abort();
+                assert!(request.await.unwrap_err().is_cancelled());
+            } else {
+                assert!(matches!(
+                    request.await.unwrap(),
+                    Err(JavaPluginError::Timeout)
+                ));
+            }
+            assert!(plugins.list().await.is_err());
+            plugins.wait_closed().await.unwrap();
+            lifecycle.stop();
+            let pending = lifecycle
+                .drain(Instant::now() + Duration::from_millis(10))
+                .await;
+            let reserved = budget.snapshot().reserved_bytes;
+            let dropped_before = service.dropped.load(Ordering::SeqCst);
+            service.release.add_permits(1);
+            drop(plugins);
+            let drained = lifecycle
+                .drain(Instant::now() + Duration::from_secs(3))
+                .await;
+            assert!(matches!(
+                pending,
+                Err(crate::lifecycle::DrainError::Deadline { .. })
+            ));
+            assert_eq!(reserved, crate::native_query_runtime::WORKSPACE_BYTES);
+            assert_eq!(
+                dropped_before, 0,
+                "accepted provider was dropped while still running"
+            );
+            drained.unwrap();
+            assert_eq!(service.dropped.load(Ordering::SeqCst), 1);
+            assert_eq!(budget.snapshot().reserved_bytes, 0);
         }
-        request.abort();
-        assert!(request.await.unwrap_err().is_cancelled());
-        while service.dropped.load(Ordering::SeqCst) == 0 {
-            assert!(started.elapsed() < Duration::from_secs(3));
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(plugins.list().await.is_err());
     }
 
     #[tokio::test]
@@ -1188,6 +1339,199 @@ mod tests {
         assert!(matches!(third, Err(JavaPluginError::QueueFull)));
     }
 
+    fn unstarted_bridge() -> (JavaPlugins, mpsc::Receiver<Request>) {
+        let (sender, receiver) = mpsc::channel(1);
+        let (_, completion) = watch::channel(None);
+        (
+            JavaPlugins {
+                generation: 1,
+                sender,
+                cancel: Lifecycle::new().token().child(),
+                lifecycle: Lifecycle::new(),
+                completion,
+                sequence: AtomicU64::new(1),
+                request_timeout: Duration::from_millis(100),
+                startup_results: Vec::new(),
+            },
+            receiver,
+        )
+    }
+
+    fn critical_player_event(joining: bool) -> Operation {
+        let uuid = "00000000-0000-0000-0000-000000000001".to_owned();
+        let name = "QueuedPlayer".to_owned();
+        Operation::Event {
+            event: if joining {
+                Event::PlayerJoin { uuid, name }
+            } else {
+                Event::PlayerQuit { uuid, name }
+            },
+            plugin: None,
+            context: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn critical_join_queue_wait_cancels_before_request_publication() {
+        use std::future::Future;
+        let (plugins, mut receiver) = unstarted_bridge();
+        let held = plugins.sender.clone().reserve_owned().await.unwrap();
+        let admission = plugins.lifecycle.token().admitted_child();
+        let mut request = Box::pin(plugins.request_inner(
+            critical_player_event(true),
+            plugins.request_timeout,
+            Some(&admission),
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(request.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        admission.request_stop();
+        let result = request.await;
+        drop(held);
+        assert!(matches!(result, Err(JavaPluginError::Cancelled(_))));
+        assert_eq!(plugins.sequence.load(Ordering::Relaxed), 1);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn critical_quit_queue_deadline_expires_before_request_publication() {
+        let (plugins, mut receiver) = unstarted_bridge();
+        let held = plugins.sender.clone().reserve_owned().await.unwrap();
+        let started = Instant::now();
+        let result = plugins
+            .request(critical_player_event(false), plugins.request_timeout)
+            .await;
+        drop(held);
+        assert!(matches!(result, Err(JavaPluginError::Timeout)));
+        assert!(started.elapsed() >= Duration::from_secs(10));
+        assert!(started.elapsed() < Duration::from_secs(12));
+        assert_eq!(plugins.sequence.load(Ordering::Relaxed), 1);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn completed_critical_join_reply_wins_over_later_local_cancel() {
+        use std::future::Future;
+        let (plugins, mut receiver) = unstarted_bridge();
+        let admission = plugins.lifecycle.token().admitted_child();
+        let mut request = Box::pin(plugins.request_inner(
+            critical_player_event(true),
+            plugins.request_timeout,
+            Some(&admission),
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(request.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let published = receiver.recv().await.unwrap();
+        published.reply.send(Ok(Vec::new())).unwrap();
+        admission.request_stop();
+        assert!(request.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn critical_callback_execution_timeout_starts_after_dequeue() {
+        struct HeldFirstQuery {
+            entered: tokio::sync::Semaphore,
+            release: tokio::sync::Semaphore,
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        impl NativeQueryService for HeldFirstQuery {
+            fn query(
+                &self,
+                _: NativeCallContext,
+                _: NativeQuery,
+            ) -> plugin_services::NativeQueryFuture<'_> {
+                Box::pin(async move {
+                    if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        self.entered.add_permits(1);
+                        self.release.acquire().await.unwrap().forget();
+                    }
+                    Ok(snapshot().into())
+                })
+            }
+        }
+        use std::future::Future;
+        let directory = tempfile::tempdir().unwrap();
+        let mut settings = native_config("native", directory.path());
+        settings.request_timeout = Duration::from_millis(100);
+        let service = Arc::new(HeldFirstQuery {
+            entered: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let plugins = Arc::new(
+            JavaPlugins::spawn_with_services(settings, service.clone())
+                .await
+                .unwrap(),
+        );
+        let running = Arc::clone(&plugins);
+        let first = tokio::spawn(async move {
+            running
+                .request(
+                    Operation::Event {
+                        event: Event::Tick { tick: 1 },
+                        plugin: None,
+                        context: None,
+                    },
+                    Duration::from_secs(3),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), service.entered.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        let mut quit =
+            Box::pin(plugins.request(critical_player_event(false), plugins.request_timeout));
+        std::future::poll_fn(|cx| {
+            assert!(quit.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        service.release.add_permits(1);
+        let first = first.await;
+        let quit = quit.await;
+        let shutdown = plugins.shutdown().await;
+        assert!(
+            matches!(first, Ok(Ok(_))),
+            "first callback failed: {first:?}"
+        );
+        assert!(
+            quit.is_ok(),
+            "queue delay consumed execution budget: {quit:?}"
+        );
+        assert_eq!(service.calls.load(Ordering::SeqCst), 2);
+        assert!(shutdown.is_ok(), "host cleanup failed: {shutdown:?}");
+    }
+
+    #[tokio::test]
+    async fn critical_callback_execution_remains_bounded_after_dequeue() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut settings = config("timeout", directory.path());
+        settings.request_timeout = Duration::from_millis(150);
+        let plugins = JavaPlugins::spawn(settings).await.unwrap();
+        let started = Instant::now();
+        let result = plugins
+            .request(critical_player_event(false), plugins.request_timeout)
+            .await;
+        let closed = plugins.wait_closed().await;
+        assert!(matches!(result, Err(JavaPluginError::Timeout)));
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(closed.is_ok(), "host cleanup failed: {closed:?}");
+    }
+
     #[tokio::test]
     async fn startup_timeout_is_enforced_before_host_is_exposed() {
         let directory = tempfile::tempdir().unwrap();
@@ -1218,7 +1562,10 @@ mod tests {
         let unicode_host = directory.path().join("主机😀.jar");
         std::fs::copy(&settings.host_jar, &unicode_host).unwrap();
         settings.host_jar = unicode_host.clone();
-        let plugins = JavaPlugins::spawn(settings).await.unwrap();
+        let lifecycle = Lifecycle::new();
+        let plugins = JavaPlugins::spawn_tracked(settings, None, &lifecycle, &lifecycle.token())
+            .await
+            .unwrap();
         let artifacts = classpath_artifacts(&unicode_host);
         assert_eq!(artifacts.len(), 1);
         let result = plugins
@@ -1230,32 +1577,159 @@ mod tests {
         };
         let pid: u32 = message.parse().unwrap();
         drop(plugins);
-        let started = Instant::now();
-        loop {
-            let alive = if cfg!(windows) {
-                let output = std::process::Command::new("tasklist")
-                    .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
-                    .output()
-                    .unwrap();
-                String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\""))
-            } else {
-                std::process::Command::new("kill")
-                    .args(["-0", &pid.to_string()])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status()
-                    .unwrap()
-                    .success()
-            };
-            if !alive && artifacts.iter().all(|path| !path.exists()) {
-                break;
-            }
-            assert!(
-                started.elapsed() < Duration::from_secs(3),
-                "JVM {pid} survived bridge drop"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
+        lifecycle
+            .drain(Instant::now() + Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert!(
+            !lifecycle.token().is_stopped(),
+            "dropping one host must not stop its parent lifecycle"
+        );
+        let alive = if cfg!(windows) {
+            let output = std::process::Command::new("tasklist")
+                .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\""))
+        } else {
+            std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        };
+        assert!(
+            !alive,
+            "lifecycle drain acknowledged before JVM {pid} was reaped"
+        );
+        assert!(
+            artifacts.iter().all(|path| !path.exists()),
+            "lifecycle drain acknowledged before classpath cleanup"
+        );
+    }
+
+    #[tokio::test]
+    async fn global_stop_finishes_an_admitted_native_callback_before_quit_and_shutdown() {
+        struct HeldService {
+            entered: tokio::sync::Semaphore,
+            release: tokio::sync::Semaphore,
+            calls: std::sync::atomic::AtomicUsize,
+            completed: std::sync::atomic::AtomicUsize,
         }
+        impl NativeQueryService for HeldService {
+            fn query(
+                &self,
+                _: NativeCallContext,
+                _: NativeQuery,
+            ) -> plugin_services::NativeQueryFuture<'_> {
+                Box::pin(async move {
+                    self.calls.fetch_add(1, Ordering::SeqCst);
+                    self.entered.add_permits(1);
+                    self.release.acquire().await.unwrap().forget();
+                    self.completed.fetch_add(1, Ordering::SeqCst);
+                    Ok(snapshot().into())
+                })
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let lifecycle = Lifecycle::new();
+        let budget = NativeReadBudget::new(crate::native_query_runtime::WORKSPACE_BYTES).unwrap();
+        let service = Arc::new(HeldService {
+            entered: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            completed: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let executor = NativeQueryRuntime::new(
+            service.clone(),
+            budget.clone(),
+            lifecycle.clone(),
+            NativeProviderContract::future_owned(MAX_PROVIDER_WORKING_SET_BYTES).unwrap(),
+        );
+        let plugins = Arc::new(
+            JavaPlugins::spawn_with_query_runtime(
+                native_config("native", directory.path()),
+                executor,
+                &lifecycle,
+                &lifecycle.token(),
+            )
+            .await
+            .unwrap(),
+        );
+        let requested = Arc::clone(&plugins);
+        let request =
+            tokio::spawn(async move { requested.dispatch(Event::Tick { tick: 1 }, None).await });
+        tokio::time::timeout(Duration::from_secs(3), service.entered.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        lifecycle.stop();
+        service.release.add_permits(1);
+        let admitted = request.await.unwrap();
+        assert!(
+            admitted.is_ok(),
+            "global stop terminated the admitted callback before Quit/Disable: {admitted:?}"
+        );
+        assert_eq!(service.completed.load(Ordering::SeqCst), 1);
+        assert!(plugins.list().await.unwrap()[0].enabled);
+        assert!(matches!(
+            plugins.dispatch(Event::Tick { tick: 2 }, None).await,
+            Err(JavaPluginError::Stopped | JavaPluginError::Cancelled(_))
+        ));
+        assert_eq!(service.calls.load(Ordering::SeqCst), 1);
+        service.release.add_permits(1);
+        let quit = plugins
+            .dispatch(
+                Event::PlayerQuit {
+                    uuid: "00000000-0000-0000-0000-000000000001".into(),
+                    name: "Quitter".into(),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            quit[0].actions,
+            [Action::Reply {
+                message: "snapshot:123:2".into()
+            }]
+        );
+        assert_eq!(service.completed.load(Ordering::SeqCst), 2);
+        assert!(!plugins.shutdown().await.unwrap()[0].enabled);
+        plugins.wait_closed().await.unwrap();
+        drop(plugins);
+        lifecycle
+            .drain(Instant::now() + Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert_eq!(budget.snapshot().reserved_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn global_stop_allows_the_loaded_host_to_acknowledge_graceful_shutdown() {
+        let directory = tempfile::tempdir().unwrap();
+        let lifecycle = Lifecycle::new();
+        let plugins = JavaPlugins::spawn_tracked(
+            config("echo", directory.path()),
+            None,
+            &lifecycle,
+            &lifecycle.token(),
+        )
+        .await
+        .unwrap();
+        lifecycle.stop();
+        assert!(plugins.list().await.unwrap()[0].enabled);
+        let disabled = plugins.shutdown().await.unwrap();
+        assert!(!disabled[0].enabled);
+        plugins.wait_closed().await.unwrap();
+        drop(plugins);
+        lifecycle
+            .drain(Instant::now() + Duration::from_secs(3))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

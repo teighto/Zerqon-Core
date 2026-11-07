@@ -31,7 +31,7 @@ The manifest records original relative paths, byte sizes and SHA-256 digests. Na
 
 `import-report.json` separates `applied`, `retained` and `not_supported`. Applied entries describe native blocks, stored identity/spawn metadata and generation policy. Retention records the snapshot location, file count and bytes. Existing counts of omitted block entities, ticks, biome/light sections and unfinished chunks remain available.
 
-Failed imports retain `IMPORT_INCOMPLETE`; opening such a destination fails. Metadata and the final report are published atomically, and the marker is removed only after successful completion. Retry into a new directory after correcting the error. Source files are never deleted.
+Failed or cancelled imports retain `IMPORT_INCOMPLETE`; opening such a destination fails. Metadata and the final report are each published before the marker is removed. An `import-report.json` file alone does not mean the import finished. Retry into a new directory after correcting the error; do not remove the marker by hand. Source files are never deleted.
 
 The first server startup migrates imported chunk files into the current [transactional store](WORLD_STORAGE.md). Its versioned downgrade guard also uses the name `IMPORT_INCOMPLETE`; this specific guard is accepted only alongside a valid storage database. It is distinct from a failed-import marker.
 
@@ -97,6 +97,8 @@ The wire integration test imports a temporary copy of that world with nonzero sp
 Нужны корректные `level.dat` и `data/minecraft/world_gen_settings.dat` версии 26.3 / 5023. Поддержан стандартный overworld. Неизвестное измерение spawn, повреждения, ссылки и превышение лимитов вызывают явную ошибку. Исходный сервер нужно остановить до импорта.
 
 Политика `ExistingOnly` запрещает создавать flat-чанки вместо отсутствующего импортированного ландшафта. Игрок появляется в исходной точке с сохранённым направлением взгляда. Отсутствующие чанки пропускаются при отправке; попытка пересечь край доступной территории возвращает игрока в последнюю принятую позицию. Это проверка доступности территории, а не полноценная физика или античит. Чанк spawn проверяется при запуске. Ошибка импорта оставляет `IMPORT_INCOMPLETE`, и такой каталог нельзя открыть. Старые native-миры сохраняют прежний режим; старый импорт без метаданных требуется повторить в новый каталог.
+
+При отмене импорта исходный мир сохраняется, а незаконченный каталог остаётся с отметкой `IMPORT_INCOMPLETE`. Наличие `import-report.json` ещё не означает завершение: пока отметка не снята самим импортёром, сервер откажется открывать этот мир. Повторяйте импорт в новый каталог, не удаляя отметку вручную.
 
 Сохранение сущностей, сундуков, playerdata, правил, времени и режима игры не означает восстановления их поведения. Отчёт разделяет применённые поля, сохранённые оригиналы и неподдержанные возможности. Полный импорт миров и его игровая совместимость остаются последующими этапами.
 

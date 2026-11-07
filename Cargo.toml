@@ -39,7 +39,7 @@ zerqon-profiler = { path = "crates/zerqon-profiler" }
 zerqon-inventory = { path = "crates/zerqon-inventory" }
 zerqon-blocks = { path = "crates/zerqon-blocks" }
 zerqon-plugins = { path = "crates/zerqon-plugins" }
-zerqon-plugin-api = { path = "crates/zerqon-plugin-api" }
+zerqon-plugin-api = { path = "crates/zerqon-plugin-api", features = ["native-types"] }
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -61,6 +61,9 @@ semver = "1"
 zip = { version = "9.4", default-features = false, features = ["deflate"] }
 tar = { version = "0.4", default-features = false }
 flate2 = "1"
+
+[dev-dependencies]
+wat = "1"
 
 [lints]
 workspace = true

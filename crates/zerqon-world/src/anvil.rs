@@ -38,9 +38,27 @@ pub fn import_world_blocks(
     destination: &Path,
     resolver: &impl Fn(&str, &BTreeMap<String, String>) -> Option<u32>,
 ) -> Result<ImportReport, ImportError> {
-    let snapshot = crate::source_data::SourceSnapshot::open(source)?;
+    import_world_blocks_cancellable(source, destination, resolver, &|| false)
+}
+
+pub fn import_world_blocks_cancellable(
+    source: &Path,
+    destination: &Path,
+    resolver: &impl Fn(&str, &BTreeMap<String, String>) -> Option<u32>,
+    cancelled: &impl Fn() -> bool,
+) -> Result<ImportReport, ImportError> {
+    let check = || {
+        if cancelled() {
+            Err(crate::WorldError::Cancelled)
+        } else {
+            Ok(())
+        }
+    };
+    check()?;
+    let snapshot = crate::source_data::SourceSnapshot::open(source, cancelled)?;
     let source = snapshot.root().to_owned();
     let mut world_metadata = crate::WorldMetadata::from_vanilla(&source)?;
+    check()?;
     crate::metadata::reject_links(destination)?;
     if destination.try_exists()? || std::fs::symlink_metadata(destination).is_ok() {
         return Err(invalid("destination must not already exist"));
@@ -70,6 +88,7 @@ pub fn import_world_blocks(
     };
     let mut files = Vec::new();
     for entry in std::fs::read_dir(&regions)? {
+        check()?;
         let entry = entry?;
         if entry
             .path()
@@ -109,6 +128,7 @@ pub fn import_world_blocks(
     {
         return Err(invalid("duplicate region coordinates"));
     }
+    check()?;
     std::fs::create_dir(destination)?;
     let marker = destination.join("IMPORT_INCOMPLETE");
     use std::io::Write;
@@ -136,7 +156,8 @@ pub fn import_world_blocks(
         File::open(&parent)?.sync_all()?;
     }
     let store = crate::WorldStore::open_import(destination)?;
-    world_metadata.retained_source = Some(snapshot.retain_into(destination, &world_metadata)?);
+    world_metadata.retained_source =
+        Some(snapshot.retain_into(destination, &world_metadata, cancelled)?);
     let retained_root = destination.join("source-data/files");
     let mut report = ImportReport {
         minecraft_version: "26.3".into(),
@@ -187,17 +208,20 @@ pub fn import_world_blocks(
         Err(error) => return Err(error.into()),
     };
     for namespace in dimensions.into_iter().flatten() {
+        check()?;
         let namespace = namespace?;
         if !namespace.file_type()?.is_dir() {
             continue;
         }
         for dimension in std::fs::read_dir(namespace.path())? {
+            check()?;
             let dimension = dimension?;
             if namespace.file_name() == "minecraft"
                 && dimension.file_name() == "overworld"
                 && dimension.file_type()?.is_dir()
             {
                 for child in std::fs::read_dir(dimension.path())? {
+                    check()?;
                     let child = child?;
                     if child.file_name() != "region" {
                         report.source_artifacts_not_imported.push(
@@ -229,12 +253,14 @@ pub fn import_world_blocks(
         }
     }
     for (x, z, path) in files {
+        check()?;
         let relative = path
             .strip_prefix(&source)
             .map_err(|_| invalid("region escaped source world"))?;
         let mut region = RegionReader::open(&retained_root.join(relative), x, z)?;
         for local_z in 0..32 {
             for local_x in 0..32 {
+                check()?;
                 let imported = match region.read_chunk(local_x, local_z, resolver) {
                     Ok(value) => value,
                     Err(ImportError::IncompleteChunk(_)) => {
@@ -244,6 +270,7 @@ pub fn import_world_blocks(
                     Err(error) => return Err(error),
                 };
                 if let Some(imported) = imported {
+                    check()?;
                     store.save(&imported.chunk)?;
                     report.chunks += 1;
                     report.block_entities_not_imported += imported.metadata.block_entities;
@@ -263,6 +290,7 @@ pub fn import_world_blocks(
     if report.chunks == 0 {
         return Err(invalid("source contains no completed overworld chunks"));
     }
+    check()?;
     world_metadata.write_new(destination)?;
     let bytes = serde_json::to_vec_pretty(&report)
         .map_err(|error| invalid(format!("report serialization: {error}")))?;
@@ -272,6 +300,7 @@ pub fn import_world_blocks(
     report_file
         .persist_noclobber(destination.join("import-report.json"))
         .map_err(|error| error.error)?;
+    check()?;
     std::fs::remove_file(marker)?;
     #[cfg(unix)]
     File::open(destination)?.sync_all()?;

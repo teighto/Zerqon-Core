@@ -38,7 +38,8 @@ struct RetainedFile {
 }
 
 impl SourceSnapshot {
-    pub fn open(source: &Path) -> Result<Self, WorldError> {
+    pub fn open(source: &Path, cancelled: &impl Fn() -> bool) -> Result<Self, WorldError> {
+        check_cancelled(cancelled)?;
         let root = metadata::source_root(source)?;
         let lock_path = root.join("session.lock");
         metadata::reject_links(&lock_path)?;
@@ -110,10 +111,12 @@ impl SourceSnapshot {
         };
         let mut pending = vec![(PathBuf::new(), 0usize)];
         while let Some((relative, depth)) = pending.pop() {
+            check_cancelled(cancelled)?;
             if depth > 32 {
                 return Err(invalid("source tree exceeds 32 directory levels"));
             }
             for entry in fs::read_dir(snapshot.root.join(&relative))? {
+                check_cancelled(cancelled)?;
                 let entry = entry?;
                 let path = relative.join(entry.file_name());
                 let name = relative_name(&path)?;
@@ -163,7 +166,9 @@ impl SourceSnapshot {
         &self,
         destination: &Path,
         world: &WorldMetadata,
+        cancelled: &impl Fn() -> bool,
     ) -> Result<RetainedSource, WorldError> {
+        check_cancelled(cancelled)?;
         let destination = metadata::source_root(destination)?;
         let root = destination.join("source-data");
         metadata::reject_links(&root)?;
@@ -171,12 +176,14 @@ impl SourceSnapshot {
         let raw = root.join("files");
         fs::create_dir(&raw)?;
         for directory in &self.directories {
+            check_cancelled(cancelled)?;
             let path = raw.join(directory);
             metadata::reject_links(&path)?;
             fs::create_dir_all(path)?;
         }
         let mut retained = Vec::with_capacity(self.files.len());
         for source in &self.files {
+            check_cancelled(cancelled)?;
             let path = self.root.join(&source.relative);
             metadata::reject_links(&path)?;
             let before = fs::symlink_metadata(&path)?;
@@ -198,6 +205,7 @@ impl SourceSnapshot {
             let mut bytes = 0u64;
             let mut buffer = [0u8; 65536];
             loop {
+                check_cancelled(cancelled)?;
                 let count = input.read(&mut buffer)?;
                 if count == 0 {
                     break;
@@ -212,6 +220,7 @@ impl SourceSnapshot {
                 temporary.write_all(&buffer[..count])?;
             }
             let after = input.metadata()?;
+            check_cancelled(cancelled)?;
             if bytes != source.bytes
                 || after.len() != source.bytes
                 || after.modified().ok() != source.modified
@@ -246,6 +255,7 @@ impl SourceSnapshot {
                         .map(|entry| (entry.path.as_str(), entry.sha256.as_str())),
                 )
         {
+            check_cancelled(cancelled)?;
             if retained
                 .iter()
                 .find(|file| file.path == path)
@@ -260,6 +270,7 @@ impl SourceSnapshot {
         #[cfg(unix)]
         {
             for directory in self.directories.iter().rev() {
+                check_cancelled(cancelled)?;
                 File::open(raw.join(directory))?.sync_all()?;
             }
             File::open(&raw)?.sync_all()?;
@@ -281,6 +292,7 @@ impl SourceSnapshot {
             return Err(invalid("retained source manifest exceeds 16 MiB"));
         }
         let checksum = metadata::checksum(&bytes);
+        check_cancelled(cancelled)?;
         let mut file = tempfile::NamedTempFile::new_in(&root)?;
         file.write_all(&bytes)?;
         file.as_file().sync_all()?;
@@ -294,6 +306,14 @@ impl SourceSnapshot {
             files: self.files.len(),
             bytes: self.bytes,
         })
+    }
+}
+
+fn check_cancelled(cancelled: &impl Fn() -> bool) -> Result<(), WorldError> {
+    if cancelled() {
+        Err(WorldError::Cancelled)
+    } else {
+        Ok(())
     }
 }
 

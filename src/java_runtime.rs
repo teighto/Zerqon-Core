@@ -1,3 +1,5 @@
+use crate::lifecycle::{Lifecycle, StopToken, Stopped};
+use crate::managed_tasks::{self as tasks, OperationError, TaskError};
 use aws_lc_rs::digest::{Context, SHA256};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -58,6 +60,22 @@ pub enum JavaRuntimeError {
     Zip(#[from] zip::result::ZipError),
     #[error(transparent)]
     Task(#[from] tokio::task::JoinError),
+    #[error("{0}")]
+    Managed(#[from] TaskError),
+    #[error("{0}")]
+    Stopped(#[from] Stopped),
+    #[error("{0}")]
+    Cleanup(#[from] tasks::CleanupError),
+}
+impl OperationError for JavaRuntimeError {
+    fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Stopped(_))
+            || matches!(self, Self::Managed(error) if error.is_cancelled())
+    }
+    fn is_cleanup_failure(&self) -> bool {
+        matches!(self, Self::Cleanup(_) | Self::Task(_))
+            || matches!(self, Self::Managed(error) if error.is_cleanup_failure())
+    }
 }
 fn invalid(message: impl Into<String>) -> JavaRuntimeError {
     JavaRuntimeError::Invalid(message.into())
@@ -94,26 +112,59 @@ fn current_asset() -> Result<Asset, JavaRuntimeError> {
     }
 }
 
-pub async fn resolve_java(
+pub async fn resolve_java_with_lifecycle(
     requested: &Path,
     cache: &Path,
     allow_download: bool,
+    lifecycle: &Lifecycle,
+    stop: &StopToken,
 ) -> Result<PathBuf, JavaRuntimeError> {
+    let requested = requested.to_owned();
+    let cache = cache.to_owned();
+    let context = lifecycle.clone();
+    tasks::run(
+        lifecycle,
+        stop,
+        "resolve Java runtime",
+        move |stop| async move {
+            resolve_java_inner(&requested, &cache, allow_download, &context, &stop).await
+        },
+    )
+    .await?
+}
+
+async fn resolve_java_inner(
+    requested: &Path,
+    cache: &Path,
+    allow_download: bool,
+    lifecycle: &Lifecycle,
+    stop: &StopToken,
+) -> Result<PathBuf, JavaRuntimeError> {
+    stop.check()?;
     if !is_default_java(requested) {
-        return probe_java(requested).await.map_err(|error| {
-            invalid(format!(
-                "configured Java executable {} is unavailable or is not Java 25: {error}",
-                requested.display()
-            ))
-        });
+        return probe_java_tracked(requested, lifecycle, stop)
+            .await
+            .map_err(|error| {
+                if error.is_cancelled() || error.is_cleanup_failure() {
+                    return error;
+                }
+                invalid(format!(
+                    "configured Java executable {} is unavailable or is not Java 25: {error}",
+                    requested.display()
+                ))
+            });
     }
     let mut failed_unicode_runtime = None;
     for candidate in default_java_candidates() {
+        stop.check()?;
         let managed = if let Some(runtime) = managed_runtime_for(&candidate, cache)? {
             runtime
         } else {
-            let java = match probe_java(&candidate).await {
+            let java = match probe_java_tracked(&candidate, lifecycle, stop).await {
                 Ok(java) => java,
+                Err(error) if error.is_cancelled() || error.is_cleanup_failure() => {
+                    return Err(error);
+                }
                 Err(JavaRuntimeError::Io(error))
                     if cfg!(unix) && error.kind() == io::ErrorKind::PermissionDenied =>
                 {
@@ -127,8 +178,10 @@ pub async fn resolve_java(
                 return Ok(java);
             }
         };
-        match validated_cached_runtime(&managed, current_asset()?).await {
-            Ok(java) => return Ok(java),
+        match validated_cached_runtime_tracked(&managed, current_asset()?, (), lifecycle, stop)
+            .await
+        {
+            Ok((java, ())) => return Ok(java),
             Err(JavaRuntimeError::ProbeExit(_))
                 if cfg!(windows) && !managed.as_os_str().as_encoded_bytes().is_ascii() =>
             {
@@ -148,8 +201,9 @@ pub async fn resolve_java(
     if failed_unicode_runtime.as_ref() != Some(&requested_runtime)
         && requested_runtime.try_exists()?
     {
-        match validated_cached_runtime(&requested_runtime, asset).await {
-            Ok(java) => return Ok(java),
+        match validated_cached_runtime_tracked(&requested_runtime, asset, (), lifecycle, stop).await
+        {
+            Ok((java, ())) => return Ok(java),
             Err(JavaRuntimeError::ProbeExit(_))
                 if cfg!(windows) && !requested_cache.as_os_str().as_encoded_bytes().is_ascii() => {}
             Err(error) => return Err(error),
@@ -159,14 +213,18 @@ pub async fn resolve_java(
     let directory = cache.join("25").join(asset.platform.cache_name());
     let runtime = directory.join(ARCHIVE_ROOT);
     if runtime.try_exists()? {
-        return validated_cached_runtime(&runtime, asset).await;
+        return Ok(
+            validated_cached_runtime_tracked(&runtime, asset, (), lifecycle, stop)
+                .await?
+                .0,
+        );
     }
     if !allow_download {
         return Err(invalid(
             "Java 25 was not found and automatic runtime downloads are disabled; configure java_executable",
         ));
     }
-    install_managed(&cache, asset).await
+    install_managed_tracked(&cache, asset, lifecycle, stop).await
 }
 
 fn default_java_candidates() -> impl Iterator<Item = PathBuf> {
@@ -279,22 +337,21 @@ fn is_default_java(path: &Path) -> bool {
         })
 }
 
-async fn validated_cached_runtime(
-    runtime: &Path,
-    asset: Asset,
-) -> Result<PathBuf, JavaRuntimeError> {
-    let (java, ()) = validated_cached_runtime_with_owner(runtime, asset, ()).await?;
-    Ok(java)
-}
-
-async fn validated_cached_runtime_with_owner<T: Send + 'static>(
+async fn validated_cached_runtime_tracked<T: Send + 'static>(
     runtime: &Path,
     asset: Asset,
     owner: T,
+    lifecycle: &Lifecycle,
+    stop: &StopToken,
 ) -> Result<(PathBuf, T), JavaRuntimeError> {
+    stop.check()?;
     let checked = runtime.to_owned();
-    let owner = tokio::task::spawn_blocking(move || {
-        validate_cached_files(&checked, asset)?;
+    let owner = tasks::blocking(lifecycle, stop, "validate Java runtime", move |stop| {
+        stop.check()?;
+        validate_cached_files(&checked, asset, &|| {
+            stop.check().map_err(JavaRuntimeError::from)
+        })?;
+        stop.check()?;
         Ok::<_, JavaRuntimeError>(owner)
     })
     .await??;
@@ -304,7 +361,7 @@ async fn validated_cached_runtime_with_owner<T: Send + 'static>(
     if !binary.starts_with(runtime.canonicalize()?) {
         return Err(invalid("managed Java binary is outside the runtime cache"));
     }
-    let (resolved, owner) = probe_java_with_owner(&binary, owner).await?;
+    let (resolved, owner) = probe_java_with_owner_tracked(&binary, owner, lifecycle, stop).await?;
     if !resolved
         .canonicalize()?
         .starts_with(runtime.canonicalize()?)
@@ -316,7 +373,12 @@ async fn validated_cached_runtime_with_owner<T: Send + 'static>(
     Ok((resolved, owner))
 }
 
-fn validate_cached_files(runtime: &Path, asset: Asset) -> Result<(), JavaRuntimeError> {
+fn validate_cached_files(
+    runtime: &Path,
+    asset: Asset,
+    check: &dyn Fn() -> Result<(), JavaRuntimeError>,
+) -> Result<(), JavaRuntimeError> {
+    check()?;
     reject_runtime_links(runtime)?;
     let marker = runtime.join("zerqon-runtime.json");
     reject_runtime_links(&marker)?;
@@ -334,10 +396,16 @@ fn validate_cached_files(runtime: &Path, asset: Asset) -> Result<(), JavaRuntime
             "managed Java cache identity is invalid; existing files were preserved",
         ));
     }
-    validate_runtime_tree(runtime, asset, true)
+    validate_runtime_tree(runtime, asset, true, check)
 }
 
-async fn install_managed(cache: &Path, asset: Asset) -> Result<PathBuf, JavaRuntimeError> {
+async fn install_managed_tracked(
+    cache: &Path,
+    asset: Asset,
+    lifecycle: &Lifecycle,
+    stop: &StopToken,
+) -> Result<PathBuf, JavaRuntimeError> {
+    stop.check()?;
     let cache = checked_runtime_directory(cache)?;
     let version_dir = cache.join("25");
     create_managed_directory(&version_dir)?;
@@ -350,10 +418,11 @@ async fn install_managed(cache: &Path, asset: Asset) -> Result<PathBuf, JavaRunt
         .read(true)
         .write(true)
         .open(directory.join("install.lock"))?;
-    acquire_install_lock(&lock, Duration::from_secs(600)).await?;
+    acquire_install_lock_tracked(&lock, Duration::from_secs(600), stop).await?;
     let runtime = directory.join(ARCHIVE_ROOT);
     if runtime.try_exists()? {
-        let (java, _lock) = validated_cached_runtime_with_owner(&runtime, asset, lock).await?;
+        let (java, _lock) =
+            validated_cached_runtime_tracked(&runtime, asset, lock, lifecycle, stop).await?;
         return Ok(java);
     }
     tracing::info!(
@@ -361,16 +430,25 @@ async fn install_managed(cache: &Path, asset: Asset) -> Result<PathBuf, JavaRunt
         asset.platform.cache_name()
     );
     let client = trusted_client()?;
-    let metadata = fetch_metadata(&client, asset).await?;
+    let metadata = fetch_metadata(&client, asset, stop).await?;
     validate_metadata(&metadata, asset)?;
     let mut archive = tempfile::NamedTempFile::new_in(&directory)?;
-    download_archive(&client, asset.url, asset.size, asset.sha256, &mut archive).await?;
+    download_archive_tracked(
+        &client,
+        asset.url,
+        asset.size,
+        asset.sha256,
+        &mut archive,
+        stop,
+    )
+    .await?;
     let staging = tempfile::Builder::new()
         .prefix("install-")
         .tempdir_in(&directory)?;
     let output = staging.path().join("runtime");
     fs::create_dir(&output)?;
-    finish_installation(
+    let extraction_stop = stop.clone();
+    finish_installation_tracked(
         Installation {
             archive,
             stage: staging,
@@ -378,7 +456,13 @@ async fn install_managed(cache: &Path, asset: Asset) -> Result<PathBuf, JavaRunt
             _lock: lock,
         },
         asset,
-        extract_archive,
+        move |archive, output, platform| {
+            extract_archive(archive, output, platform, &|| {
+                extraction_stop.check().map_err(JavaRuntimeError::from)
+            })
+        },
+        lifecycle,
+        stop,
     )
     .await
 }
@@ -390,21 +474,30 @@ struct Installation {
     _lock: File,
 }
 
-async fn finish_installation(
+async fn finish_installation_tracked(
     installation: Installation,
     asset: Asset,
     extract: impl FnOnce(&Path, &Path, Platform) -> Result<(), JavaRuntimeError> + Send + 'static,
+    lifecycle: &Lifecycle,
+    stop: &StopToken,
 ) -> Result<PathBuf, JavaRuntimeError> {
-    let installation = tokio::task::spawn_blocking(move || {
+    let installation = tasks::blocking(lifecycle, stop, "extract Java runtime", move |stop| {
+        stop.check()?;
         let output = installation.stage.path().join("runtime");
         extract(installation.archive.path(), &output, asset.platform)?;
-        validate_runtime_tree(&output, asset, false)?;
+        stop.check()?;
+        validate_runtime_tree(&output, asset, false, &|| {
+            stop.check().map_err(JavaRuntimeError::from)
+        })?;
+        stop.check()?;
         Ok::<_, JavaRuntimeError>(installation)
     })
     .await??;
     let output = installation.stage.path().join("runtime");
     let executable = output.join("bin").join(asset.platform.executable());
-    let (_, installation) = probe_java_with_owner(&executable, installation).await?;
+    let (_, installation) =
+        probe_java_with_owner_tracked(&executable, installation, lifecycle, stop).await?;
+    stop.check()?;
     let mut marker = fs::OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -428,7 +521,7 @@ async fn finish_installation(
     .sync_all()?;
     let runtime = installation.runtime.clone();
     let (java, _installation) =
-        validated_cached_runtime_with_owner(&runtime, asset, installation).await?;
+        validated_cached_runtime_tracked(&runtime, asset, installation, lifecycle, stop).await?;
     tracing::info!("Managed Java 25 is ready at {}", java.display());
     Ok(java)
 }
@@ -566,7 +659,9 @@ fn validate_runtime_tree(
     root: &Path,
     asset: Asset,
     marker_allowed: bool,
+    check: &dyn Fn() -> Result<(), JavaRuntimeError>,
 ) -> Result<(), JavaRuntimeError> {
+    check()?;
     reject_runtime_links(root)?;
     if !root.is_dir() {
         return Err(invalid("managed runtime must be a directory"));
@@ -576,6 +671,7 @@ fn validate_runtime_tree(
     let mut directories = HashSet::new();
     let mut expected_total = 0_u64;
     for file in &inventory.files {
+        check()?;
         if file.path.is_absolute()
             || file
                 .path
@@ -605,7 +701,9 @@ fn validate_runtime_tree(
     let mut count = 0usize;
     let mut buffer = [0_u8; 65_536];
     while let Some(directory) = pending.pop() {
+        check()?;
         for entry in fs::read_dir(directory)? {
+            check()?;
             let entry = entry?;
             count += 1;
             if count > MAX_ENTRIES {
@@ -661,31 +759,7 @@ fn validate_runtime_tree(
                 }
                 #[cfg(not(unix))]
                 let _ = expected.executable;
-                let mut digest = Context::new(&SHA256);
-                let mut read = 0_u64;
-                loop {
-                    let count = input.read(&mut buffer)?;
-                    if count == 0 {
-                        break;
-                    }
-                    read += count as u64;
-                    if read > expected.size {
-                        return Err(invalid("managed runtime file grew beyond pinned size"));
-                    }
-                    digest.update(&buffer[..count]);
-                }
-                let actual = digest
-                    .finish()
-                    .as_ref()
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>();
-                if read != expected.size || actual != expected.sha256 {
-                    return Err(invalid(format!(
-                        "managed runtime file contents differ from pinned content: {}",
-                        expected.path.display()
-                    )));
-                }
+                validate_runtime_contents(&mut input, expected, &mut buffer, check)?;
             } else {
                 return Err(invalid("managed runtime contains a special file"));
             }
@@ -699,9 +773,43 @@ fn validate_runtime_tree(
     Ok(())
 }
 
-async fn acquire_install_lock(lock: &File, timeout: Duration) -> Result<(), JavaRuntimeError> {
+fn validate_runtime_contents(
+    input: &mut impl Read,
+    expected: &RuntimeFile,
+    buffer: &mut [u8; 65_536],
+    check: &dyn Fn() -> Result<(), JavaRuntimeError>,
+) -> Result<(), JavaRuntimeError> {
+    let mut digest = Context::new(&SHA256);
+    let mut read = 0_u64;
+    loop {
+        check()?;
+        let count = input.read(buffer)?;
+        if count == 0 {
+            break;
+        }
+        read += count as u64;
+        if read > expected.size {
+            return Err(invalid("managed runtime file grew beyond pinned size"));
+        }
+        digest.update(&buffer[..count]);
+    }
+    if read != expected.size || hex(digest.finish().as_ref()) != expected.sha256 {
+        return Err(invalid(format!(
+            "managed runtime file contents differ from pinned content: {}",
+            expected.path.display()
+        )));
+    }
+    Ok(())
+}
+
+async fn acquire_install_lock_tracked(
+    lock: &File,
+    timeout: Duration,
+    stop: &StopToken,
+) -> Result<(), JavaRuntimeError> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
+        stop.check()?;
         match lock.try_lock() {
             Ok(()) => return Ok(()),
             Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
@@ -709,7 +817,11 @@ async fn acquire_install_lock(lock: &File, timeout: Duration) -> Result<(), Java
                 if tokio::time::Instant::now() >= deadline {
                     return Err(invalid("timed out waiting for managed Java installation"));
                 }
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                tasks::cancellable(stop, async {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    Ok::<_, JavaRuntimeError>(())
+                })
+                .await?;
             }
         }
     }
@@ -745,7 +857,12 @@ fn trusted_client() -> Result<reqwest::Client, JavaRuntimeError> {
         .build()
         .map_err(|error| invalid(error.without_url().to_string()))
 }
-async fn fetch_metadata(client: &reqwest::Client, asset: Asset) -> Result<Value, JavaRuntimeError> {
+async fn fetch_metadata(
+    client: &reqwest::Client,
+    asset: Asset,
+    stop: &StopToken,
+) -> Result<Value, JavaRuntimeError> {
+    tasks::cancellable(stop, async {
     let url = format!(
         "https://api.adoptium.net/v3/assets/release_name/eclipse/jdk-25.0.5%2B8?architecture=x64&heap_size=normal&image_type=jre&jvm_impl=hotspot&os={}&project=jdk",
         asset.platform.os()
@@ -769,6 +886,7 @@ async fn fetch_metadata(client: &reqwest::Client, asset: Asset) -> Result<Value,
         bytes.extend_from_slice(&chunk);
     }
     Ok(serde_json::from_slice(&bytes)?)
+    }).await
 }
 fn validate_metadata(value: &Value, asset: Asset) -> Result<(), JavaRuntimeError> {
     if value["release_name"] != RELEASE
@@ -808,23 +926,28 @@ fn validate_metadata(value: &Value, asset: Asset) -> Result<(), JavaRuntimeError
     Ok(())
 }
 
-async fn download_archive(
+async fn download_archive_tracked(
     client: &reqwest::Client,
     url: &str,
     size: u64,
     sha256: &str,
     target: &mut tempfile::NamedTempFile,
+    stop: &StopToken,
 ) -> Result<(), JavaRuntimeError> {
+    stop.check()?;
     if size > 128 * 1024 * 1024 {
         return Err(invalid("runtime archive exceeds128MiB"));
     }
-    let mut response = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|error| invalid(error.without_url().to_string()))?
-        .error_for_status()
-        .map_err(|error| invalid(error.without_url().to_string()))?;
+    let mut response = tasks::cancellable(stop, async {
+        client
+            .get(url)
+            .send()
+            .await
+            .map_err(|error| invalid(error.without_url().to_string()))?
+            .error_for_status()
+            .map_err(|error| invalid(error.without_url().to_string()))
+    })
+    .await?;
     if response
         .content_length()
         .is_some_and(|length| length != size)
@@ -834,10 +957,13 @@ async fn download_archive(
     let mut file = tokio::fs::File::from_std(target.reopen()?);
     let mut count = 0u64;
     let mut digest = Context::new(&SHA256);
-    while let Some(bytes) = response
-        .chunk()
-        .await
-        .map_err(|error| invalid(error.without_url().to_string()))?
+    while let Some(bytes) = tasks::cancellable(stop, async {
+        response
+            .chunk()
+            .await
+            .map_err(|error| invalid(error.without_url().to_string()))
+    })
+    .await?
     {
         count = count
             .checked_add(bytes.len() as u64)
@@ -847,11 +973,14 @@ async fn download_archive(
         }
         digest.update(&bytes);
         file.write_all(&bytes).await?;
+        file.flush().await?;
+        stop.check()?;
     }
     if count != size || hex(digest.finish().as_ref()) != sha256 {
         return Err(invalid("runtime archive failed pinned length/SHA256 check"));
     }
     file.sync_all().await?;
+    stop.check()?;
     Ok(())
 }
 fn hex(bytes: &[u8]) -> String {
@@ -923,10 +1052,12 @@ fn extract_archive(
     archive: &Path,
     output: &Path,
     platform: Platform,
+    check: &dyn Fn() -> Result<(), JavaRuntimeError>,
 ) -> Result<(), JavaRuntimeError> {
+    check()?;
     match platform {
-        Platform::WindowsX64 => extract_zip(archive, output),
-        Platform::LinuxX64 => extract_tar(archive, output),
+        Platform::WindowsX64 => extract_zip(archive, output, check),
+        Platform::LinuxX64 => extract_tar(archive, output, check),
     }
 }
 fn write_entry(
@@ -935,7 +1066,9 @@ fn write_entry(
     size: u64,
     total: &mut u64,
     mode: u32,
+    check: &dyn Fn() -> Result<(), JavaRuntimeError>,
 ) -> Result<(), JavaRuntimeError> {
+    check()?;
     if size > MAX_FILE || *total > MAX_UNPACKED.saturating_sub(size) {
         return Err(invalid("runtime archive content exceeds limits"));
     }
@@ -948,7 +1081,18 @@ fn write_entry(
         .create_new(true)
         .write(true)
         .open(path)?;
-    let copied = io::copy(&mut reader.take(size + 1), &mut file)?;
+    let mut reader = reader.take(size + 1);
+    let mut buffer = [0; 65_536];
+    let mut copied = 0_u64;
+    loop {
+        check()?;
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        file.write_all(&buffer[..count])?;
+        copied += count as u64;
+    }
     if copied != size {
         return Err(invalid("runtime entry length mismatch"));
     }
@@ -963,10 +1107,17 @@ fn write_entry(
     }
     #[cfg(not(unix))]
     let _ = mode;
+    check()?;
     file.sync_all()?;
+    check()?;
     Ok(())
 }
-fn extract_zip(path: &Path, output: &Path) -> Result<(), JavaRuntimeError> {
+fn extract_zip(
+    path: &Path,
+    output: &Path,
+    check: &dyn Fn() -> Result<(), JavaRuntimeError>,
+) -> Result<(), JavaRuntimeError> {
+    check()?;
     let mut archive = zip::ZipArchive::new(File::open(path)?)?;
     if archive.len() > MAX_ENTRIES {
         return Err(invalid("too many runtime ZIP entries"));
@@ -974,6 +1125,7 @@ fn extract_zip(path: &Path, output: &Path) -> Result<(), JavaRuntimeError> {
     let mut total = 0;
     let mut seen = HashSet::new();
     for index in 0..archive.len() {
+        check()?;
         let mut entry = archive.by_index(index)?;
         let name = entry.name()?.into_owned();
         let relative = archive_path(&name)?;
@@ -994,7 +1146,14 @@ fn extract_zip(path: &Path, output: &Path) -> Result<(), JavaRuntimeError> {
             fs::create_dir_all(output.join(relative))?;
         } else {
             let size = entry.size();
-            write_entry(&mut entry, &output.join(relative), size, &mut total, mode)?;
+            write_entry(
+                &mut entry,
+                &output.join(relative),
+                size,
+                &mut total,
+                mode,
+                check,
+            )?;
         }
     }
     Ok(())
@@ -1017,7 +1176,12 @@ impl<R: Read> Read for LimitedReader<R> {
         Ok(read)
     }
 }
-fn extract_tar(path: &Path, output: &Path) -> Result<(), JavaRuntimeError> {
+fn extract_tar(
+    path: &Path,
+    output: &Path,
+    check: &dyn Fn() -> Result<(), JavaRuntimeError>,
+) -> Result<(), JavaRuntimeError> {
+    check()?;
     let gzip = flate2::read::GzDecoder::new(File::open(path)?);
     let mut archive = tar::Archive::new(LimitedReader {
         inner: gzip,
@@ -1027,6 +1191,7 @@ fn extract_tar(path: &Path, output: &Path) -> Result<(), JavaRuntimeError> {
     let mut seen = HashSet::new();
     let mut links = HashMap::new();
     for (index, entry) in archive.entries()?.enumerate() {
+        check()?;
         if index >= MAX_ENTRIES {
             return Err(invalid("too many runtime tar entries"));
         }
@@ -1050,7 +1215,14 @@ fn extract_tar(path: &Path, output: &Path) -> Result<(), JavaRuntimeError> {
         } else if kind.is_file() {
             let size = entry.size();
             let mode = entry.header().mode()?;
-            write_entry(&mut entry, &output.join(relative), size, &mut total, mode)?;
+            write_entry(
+                &mut entry,
+                &output.join(relative),
+                size,
+                &mut total,
+                mode,
+                check,
+            )?;
         } else if kind.is_symlink() {
             let name = entry
                 .link_name()?
@@ -1066,11 +1238,20 @@ fn extract_tar(path: &Path, output: &Path) -> Result<(), JavaRuntimeError> {
             ));
         }
     }
-    io::copy(&mut archive.into_inner(), &mut io::sink())?;
+    let mut remaining = archive.into_inner();
+    let mut buffer = [0; 65_536];
+    loop {
+        check()?;
+        if remaining.read(&mut buffer)? == 0 {
+            break;
+        }
+    }
     while !links.is_empty() {
+        check()?;
         let before = links.len();
         let pending: Vec<_> = links.keys().cloned().collect();
         for path in pending {
+            check()?;
             let target = &links[&path];
             let target_path = output.join(target);
             if target_path.is_file() {
@@ -1084,6 +1265,7 @@ fn extract_tar(path: &Path, output: &Path) -> Result<(), JavaRuntimeError> {
                     metadata.len(),
                     &mut total,
                     0o644,
+                    check,
                 )?;
                 links.remove(&path);
             }
@@ -1111,36 +1293,40 @@ fn parse_probe(text: &str) -> Result<PathBuf, JavaRuntimeError> {
         .join("bin")
         .join(if cfg!(windows) { "java.exe" } else { "java" }))
 }
-async fn probe_java(executable: &Path) -> Result<PathBuf, JavaRuntimeError> {
-    let (java, ()) = probe_java_with_owner(executable, ()).await?;
-    Ok(java)
+
+async fn probe_java_tracked(
+    executable: &Path,
+    lifecycle: &Lifecycle,
+    stop: &StopToken,
+) -> Result<PathBuf, JavaRuntimeError> {
+    Ok(
+        probe_java_with_owner_tracked(executable, (), lifecycle, stop)
+            .await?
+            .0,
+    )
 }
 
-async fn probe_java_with_owner<T: Send + 'static>(
+async fn probe_java_with_owner_tracked<T: Send + 'static>(
     executable: &Path,
     owner: T,
+    lifecycle: &Lifecycle,
+    stop: &StopToken,
 ) -> Result<(PathBuf, T), JavaRuntimeError> {
     let executable = executable.to_owned();
-    let (cancel, cancelled) = tokio::sync::oneshot::channel::<()>();
-    let task = tokio::spawn(async move {
-        let java = run_probe(&executable, cancelled).await?;
-        Ok::<_, JavaRuntimeError>((java, owner))
-    });
-    let result = task.await?;
-    drop(cancel);
-    result
+    tasks::run(
+        lifecycle,
+        stop,
+        "Java runtime probe",
+        move |stop| async move {
+            let java = run_probe(&executable, &stop).await?;
+            Ok::<_, JavaRuntimeError>((java, owner))
+        },
+    )
+    .await?
 }
 
-async fn run_probe(
-    executable: &Path,
-    mut cancelled: tokio::sync::oneshot::Receiver<()>,
-) -> Result<PathBuf, JavaRuntimeError> {
-    if !matches!(
-        cancelled.try_recv(),
-        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
-    ) {
-        return Err(invalid("Java runtime probe cancelled"));
-    }
+async fn run_probe(executable: &Path, stop: &StopToken) -> Result<PathBuf, JavaRuntimeError> {
+    stop.check()?;
     let mut child = tokio::process::Command::new(executable)
         .args([
             "-Dfile.encoding=UTF-8",
@@ -1178,18 +1364,16 @@ async fn run_probe(
     };
     let result = tokio::select! {
         biased;
-        _ = &mut cancelled => Err(invalid("Java runtime probe cancelled")),
-        result = tokio::time::timeout(Duration::from_secs(15), run) => {
-            result.unwrap_or_else(|_| Err(invalid("Java runtime probe timed out")))
+        _ = stop.cancelled() => Err(Stopped.into()),
+        result = tokio::time::timeout(Duration::from_secs(15), tasks::catch_panic(run)) => {
+            match result {
+                Ok(Ok(result)) => result,
+                Ok(Err(error)) => Err(error.into()),
+                Err(_) => Err(invalid("Java runtime probe timed out")),
+            }
         },
     };
-    if child.try_wait()?.is_none()
-        && let Err(error) = child.kill().await
-    {
-        tracing::warn!(kind = ?error.kind(), "Java probe termination failed; waiting for child exit");
-        child.wait().await?;
-        return Err(error.into());
-    }
+    tasks::terminate_child(&mut child).await?;
     result
 }
 fn read_limited(path: &Path, limit: u64) -> Result<Vec<u8>, JavaRuntimeError> {

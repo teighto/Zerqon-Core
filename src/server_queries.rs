@@ -13,6 +13,9 @@ use std::sync::{
 };
 use tokio::{sync::watch, time::Instant};
 
+#[cfg(test)]
+mod native_runtime_tests;
+
 pub struct ServerQueries {
     pub players: Arc<Players>,
     pub tick: Arc<AtomicU64>,

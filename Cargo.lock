@@ -2701,6 +2701,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "wat",
  "zeroize",
  "zerqon-blocks",
  "zerqon-entities",
@@ -2760,8 +2761,10 @@ dependencies = [
 name = "zerqon-plugin-api"
 version = "0.0.1"
 dependencies = [
+ "proptest",
  "serde",
  "serde_json",
+ "uuid",
 ]
 
 [[package]]
@@ -2773,6 +2776,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "wasmi",
+ "wasmi_core",
  "wat",
  "zerqon-plugin-api",
 ]

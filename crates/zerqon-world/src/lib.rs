@@ -20,6 +20,8 @@ pub use workers::{ChunkTicket, ChunkWorkers};
 
 #[derive(Debug, thiserror::Error)]
 pub enum WorldError {
+    #[error("world operation cancelled")]
+    Cancelled,
     #[error("world storage: {0}")]
     Storage(String),
     #[error("world storage requires reopening after an uncertain commit")]

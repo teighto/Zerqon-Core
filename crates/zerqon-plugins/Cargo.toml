@@ -9,11 +9,12 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-zerqon-plugin-api = { path = "../zerqon-plugin-api" }
+zerqon-plugin-api = { path = "../zerqon-plugin-api", features = ["native-types"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 wasmi = { version = "2.0.0", default-features = false, features = ["std", "validate", "portable-dispatch"] }
+wasmi_core = { version = "2.0.0", default-features = false }
 
 [dev-dependencies]
 wat = "1"

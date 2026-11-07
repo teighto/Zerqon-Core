@@ -10,13 +10,64 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+#[cfg(test)]
+use tokio::sync::watch;
 use tokio::{
     net::TcpListener,
-    sync::{Semaphore, mpsc, watch},
+    sync::{Semaphore, mpsc},
     task::JoinSet,
     time::MissedTickBehavior,
 };
 use zerqon_protocol::{MINECRAFT_VERSION, PROTOCOL_VERSION};
+
+mod jobs;
+use jobs::{Kind as JobKind, OrderedJobs};
+#[cfg(test)]
+mod responsiveness_tests;
+
+#[derive(Clone, Copy, Debug)]
+enum ConsoleControl {
+    Tps,
+    Version,
+    Help,
+}
+
+fn submit_console_line(
+    line: String,
+    commands: &mpsc::Sender<String>,
+    controls: &mpsc::Sender<ConsoleControl>,
+    lifecycle: &crate::lifecycle::Lifecycle,
+) -> bool {
+    let control = match line.trim() {
+        "stop" | "/stop" => {
+            lifecycle.stop();
+            return false;
+        }
+        "tps" | "/tps" => Some(ConsoleControl::Tps),
+        "version" | "/version" => Some(ConsoleControl::Version),
+        "help" | "/help" => Some(ConsoleControl::Help),
+        "" => return true,
+        _ => None,
+    };
+    if let Some(control) = control {
+        match controls.try_send(control) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                tracing::warn!("Console control queue is full; request rejected")
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => return false,
+        }
+    } else {
+        match commands.try_send(line) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                tracing::warn!("Console command queue is full; command rejected")
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => return false,
+        }
+    }
+    true
+}
 
 pub struct TickStats {
     samples: VecDeque<(Instant, Duration)>,
@@ -80,14 +131,17 @@ pub async fn run(
     settings: Settings,
     status_only: bool,
     no_console: bool,
+    lifecycle: &crate::lifecycle::Lifecycle,
 ) -> Result<()> {
+    let stop = lifecycle.token();
+    stop.check()?;
     let bind = if properties.address.is_empty() {
         "0.0.0.0"
     } else {
         &properties.address
     };
     let listener = TcpListener::bind((bind, properties.port)).await?;
-    let (shutdown_tx, mut shutdown) = watch::channel(false);
+    let local_address = listener.local_addr()?;
     let update_monitor = if !status_only && settings.update_check {
         Some(
             crate::updates::UpdateChecker::new(env!("CARGO_PKG_VERSION"))?.spawn(
@@ -100,19 +154,71 @@ pub async fn run(
     let update_receiver = update_monitor
         .as_ref()
         .map(crate::updates::UpdateMonitor::subscribe);
-    let state = State::new(
+    let prepared = State::new_with_lifecycle(
         &directory,
         properties,
         settings,
         status_only,
-        shutdown_tx.clone(),
         update_receiver,
+        lifecycle,
+        &stop,
     )
-    .await?;
-    #[cfg(unix)]
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    #[cfg(unix)]
-    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    .await;
+    let state = match prepared {
+        Ok(state) => state,
+        Err(error) => {
+            if let Some(monitor) = update_monitor {
+                monitor.stop().await;
+            }
+            return Err(error);
+        }
+    };
+    let (commands_tx, commands) = mpsc::channel::<String>(32);
+    let (controls_tx, controls) = mpsc::channel::<ConsoleControl>(8);
+    if !no_console {
+        let console_lifecycle = lifecycle.clone();
+        let started = std::thread::Builder::new()
+            .name("zerqon-console".into())
+            .spawn(move || {
+                for line in std::io::stdin().lock().lines() {
+                    match line {
+                        Ok(line) if line.len() <= 4096 => {
+                            if !submit_console_line(
+                                line,
+                                &commands_tx,
+                                &controls_tx,
+                                &console_lifecycle,
+                            ) {
+                                break;
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+            });
+        if let Err(error) = started {
+            lifecycle.stop();
+            if let Some(monitor) = update_monitor {
+                monitor.stop().await;
+            }
+            let cleanup = shutdown_components(&state).await;
+            return match cleanup {
+                Ok(()) => Err(error.into()),
+                Err(cleanup) => Err(format!("{error}; {cleanup}").into()),
+            };
+        }
+    }
+    if let Err(error) = lifecycle.mark_ready() {
+        if let Some(monitor) = update_monitor {
+            monitor.stop().await;
+        }
+        let cleanup = shutdown_components(&state).await;
+        return match cleanup {
+            Ok(()) => Err(error.into()),
+            Err(cleanup) => Err(format!("{error}; {cleanup}").into()),
+        };
+    }
     tracing::info!(
         "Zerqon {} | Minecraft {MINECRAFT_VERSION} | protocol {PROTOCOL_VERSION}",
         env!("CARGO_PKG_VERSION")
@@ -125,87 +231,191 @@ pub async fn run(
     if !state.properties.online_mode {
         tracing::warn!("Offline mode: player identities are not authenticated");
     }
-    tracing::info!("Listening on {}", listener.local_addr()?);
-    let (commands_tx, mut commands) = mpsc::channel::<String>(32);
-    if !no_console {
-        std::thread::Builder::new()
-            .name("zerqon-console".into())
-            .spawn(move || {
-                for line in std::io::stdin().lock().lines() {
-                    match line {
-                        Ok(line) if line.len() <= 4096 => {
-                            if commands_tx.blocking_send(line).is_err() {
-                                break;
-                            }
-                        }
-                        Ok(_) => {}
-                        Err(_) => break,
-                    }
-                }
-            })?;
+    tracing::info!("Listening on {local_address}");
+    let mut failures = match ready_jobs(lifecycle) {
+        Ok(Some(jobs)) => {
+            accept_loop(
+                listener,
+                Arc::clone(&state),
+                commands,
+                controls,
+                !no_console,
+                lifecycle,
+                jobs,
+            )
+            .await
+        }
+        Ok(None) => Vec::new(),
+        Err(error) => vec![error.to_string()],
+    };
+    lifecycle.stop();
+    if let Some(monitor) = update_monitor {
+        monitor.stop().await;
     }
-    let signal = shutdown_tx.clone();
-    let signal_task = tokio::spawn(async move {
-        #[cfg(unix)]
+    if let Err(error) = shutdown_components(&state).await {
+        failures.push(error.to_string());
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; ").into())
+    }
+}
+
+fn ready_jobs(lifecycle: &crate::lifecycle::Lifecycle) -> Result<Option<OrderedJobs>> {
+    match OrderedJobs::new(lifecycle) {
+        Ok(jobs) => Ok(Some(jobs)),
+        Err(error)
+            if lifecycle.token().is_stopped()
+                && matches!(
+                    error.downcast_ref::<crate::lifecycle::RegistrationError>(),
+                    Some(crate::lifecycle::RegistrationError::Stopped)
+                ) =>
         {
-            tokio::select! {
-                _ = terminate.recv() => {},
-                _ = interrupt.recv() => {},
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn run_tick(state: Arc<State>, tick: u64) -> Result<()> {
+    if *state.shutdown.borrow() {
+        return Err(crate::lifecycle::Stopped.into());
+    }
+    let started = Instant::now();
+    let mut failures = Vec::new();
+    if let Err(error) = state.players.tracking_tick() {
+        failures.push(format!("player tracking: {error}"));
+    }
+    if !*state.shutdown.borrow()
+        && let Some(mobs) = &state.mobs
+        && let Err(error) = mobs.tick(tick).await
+    {
+        if error
+            .downcast_ref::<crate::mob_store::StoreError>()
+            .is_some()
+        {
+            tracing::error!(%error,"Mob tick failed");
+        } else {
+            failures.push(format!("mob tick: {error}"));
+        }
+    }
+    if !*state.shutdown.borrow()
+        && let Err(error) = state.event(zerqon_plugin_api::Event::Tick { tick }).await
+    {
+        failures.push(format!("plugin tick: {error}"));
+    }
+    if let Ok(mut stats) = state.stats.lock() {
+        stats.record(started, started.elapsed());
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; ").into())
+    }
+}
+
+async fn run_console(state: Arc<State>, line: String) -> Result<()> {
+    let line = line.trim();
+    if let Some((name, add)) = line
+        .strip_prefix("op ")
+        .map(|name| (name, true))
+        .or_else(|| line.strip_prefix("deop ").map(|name| (name, false)))
+    {
+        let state = Arc::clone(&state);
+        let name = name.trim().to_owned();
+        tokio::task::spawn_blocking(move || match state.update_operator(&name, add) {
+            Ok(changed) => {
+                tracing::info!(operator=%name,granted=add,changed,"Operator list updated")
             }
-            let _ = signal.send(true);
+            Err(error) => tracing::warn!(%error,"Operator update failed"),
+        })
+        .await?;
+    } else {
+        match state
+            .command(crate::runtime::CommandSource::Console, line)
+            .await
+        {
+            Ok(replies) => {
+                for reply in replies {
+                    tracing::info!("{reply}");
+                }
+            }
+            Err(error) => tracing::warn!(%error,"Command failed"),
         }
-        #[cfg(not(unix))]
-        if tokio::signal::ctrl_c().await.is_ok() {
-            let _ = signal.send(true);
-        }
-    });
-    let marker = std::env::var_os("ZERQON_SHUTDOWN_FILE").map(PathBuf::from);
+    }
+    Ok(())
+}
+
+async fn accept_loop(
+    listener: TcpListener,
+    state: Arc<State>,
+    mut commands: mpsc::Receiver<String>,
+    mut controls: mpsc::Receiver<ConsoleControl>,
+    console_enabled: bool,
+    lifecycle: &crate::lifecycle::Lifecycle,
+    mut jobs: OrderedJobs,
+) -> Vec<String> {
+    let mut shutdown = lifecycle.subscribe();
     let permits = Arc::new(Semaphore::new(state.settings.max_connections));
     let mut clients = JoinSet::new();
     let mut tick = tokio::time::interval(Duration::from_millis(50));
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut commands_open = !no_console;
+    let mut commands_open = console_enabled;
+    let mut controls_open = console_enabled;
     let mut tick_number = 0u64;
     let mut update_notifications = crate::updates::NotificationState::default();
+    let mut failures = Vec::new();
+    let mut omitted_failures = 0_u64;
     loop {
+        if *shutdown.borrow() {
+            break;
+        }
         tokio::select! {
             _=shutdown.changed()=>break,
             _=tick.tick()=>{
-                let started=Instant::now();
                 if let Some(updates) = &state.updates {
                     let update = updates.borrow();
                     if let Some(message) = update_notifications.next(true, update.as_ref()) {
                         tracing::info!("{message}");
                     }
                 }
-                if marker.as_ref().is_some_and(|path|path.exists()){break;}
-                tick_number=tick_number.wrapping_add(1);
-                if let Err(error)=state.players.tracking_tick(){tracing::error!(%error,"Player tracking tick failed");}
-                if let Some(mobs)=&state.mobs&&let Err(error)=mobs.tick(tick_number).await{tracing::error!(%error,"Mob tick failed");}
-                if let Err(error)=state.event(zerqon_plugin_api::Event::Tick{tick:tick_number}).await{tracing::error!(%error,"Plugin tick failed");}
-                if let Ok(mut stats)=state.stats.lock(){stats.record(started,started.elapsed());}
+                if jobs.available(JobKind::Tick) {
+                    tick_number=tick_number.wrapping_add(1);
+                    if let Err(error)=jobs.submit(JobKind::Tick,run_tick(Arc::clone(&state),tick_number)) {
+                        if !*shutdown.borrow() { record_failure(&mut failures,&mut omitted_failures,error.to_string()); }
+                        break;
+                    }
+                }
             },
-            line=commands.recv(),if commands_open=>{
-                match line.as_deref().map(str::trim) {
-                    Some("stop"|"/stop")=>break,
-                    Some("tps"|"/tps")=>{if let Ok(stats)=state.stats.lock(){tracing::info!("{}",stats.report());}},
-                    Some("version"|"/version")=>tracing::info!("Zerqon {} / Minecraft {MINECRAFT_VERSION}",env!("CARGO_PKG_VERSION")),
-                    Some("help"|"/help")=>tracing::info!("Commands: help, version, tps, plugins, op NAME, deop NAME, setblock X Y Z STATE, stop"),
-                    Some("")=>{},
-                    Some(line)=>{
-                        if let Some((name,add))=line.strip_prefix("op ").map(|name|(name,true)).or_else(||line.strip_prefix("deop ").map(|name|(name,false))){
-                            match state.update_operator(name.trim(),add){
-                                Ok(changed)=>tracing::info!(operator=name.trim(),granted=add,changed,"Operator list updated"),
-                                Err(error)=>tracing::warn!(%error,"Operator update failed"),
-                            }
-                        }
-                        else {match state.command(crate::runtime::CommandSource::Console,line).await{Ok(replies)=>for reply in replies{tracing::info!("{reply}");},Err(error)=>tracing::warn!(%error,"Command failed")}}
+            control=controls.recv(),if controls_open=>{
+                match control {
+                    Some(ConsoleControl::Tps)=>{if let Ok(stats)=state.stats.lock(){tracing::info!("{}",stats.report());}},
+                    Some(ConsoleControl::Version)=>tracing::info!("Zerqon {} / Minecraft {MINECRAFT_VERSION}",env!("CARGO_PKG_VERSION")),
+                    Some(ConsoleControl::Help)=>tracing::info!("Commands: help, version, tps, plugins, op NAME, deop NAME, setblock X Y Z STATE, stop"),
+                    None=>controls_open=false,
+                }
+            },
+            line=commands.recv(),if commands_open&&jobs.available(JobKind::Console)=>{
+                match line {
+                    Some(line)=>if let Err(error)=jobs.submit(JobKind::Console,run_console(Arc::clone(&state),line)) {
+                        if !*shutdown.borrow() { record_failure(&mut failures,&mut omitted_failures,error.to_string()); }
+                        break;
                     },
                     None=>commands_open=false,
                 }
             },
+            result=jobs.next(),if jobs.has_pending()=>{
+                match result {
+                    Some(completion)=>{
+                        if completion.cancelled { tracing::debug!(?completion.kind,"Server work cancelled before completion"); }
+                        if let Err(error)=completion.result { tracing::error!(?completion.kind,%error,"Server work failed");record_failure(&mut failures,&mut omitted_failures,error);lifecycle.stop(); }
+                    },
+                    None=>{record_failure(&mut failures,&mut omitted_failures,"Server worker stopped unexpectedly".into());break;},
+                }
+            },
             accepted=listener.accept()=>{
-                let (socket,peer)=accepted?;
+                let (socket,peer)=match accepted { Ok(client)=>client, Err(error)=>{record_failure(&mut failures,&mut omitted_failures,error.to_string());break;} };
                 let Ok(permit)=Arc::clone(&permits).try_acquire_owned() else {drop(socket);continue;};
                 let state=Arc::clone(&state);
                 clients.spawn(async move {
@@ -213,25 +423,62 @@ pub async fn run(
                     if let Err(error)=crate::connection::handle(socket,Arc::clone(&state)).await{tracing::debug!(%peer,%error,"Connection closed");}
                 });
             },
-            Some(result)=clients.join_next(),if !clients.is_empty()=>{if let Err(error)=result{tracing::error!(%error,"Connection task failed");}},
+            Some(result)=clients.join_next(),if !clients.is_empty()=>{if let Err(error)=result{tracing::error!(%error,"Connection task failed");record_failure(&mut failures,&mut omitted_failures,error.to_string());}},
         }
     }
-    let _ = shutdown_tx.send(true);
-    while let Some(result) = clients.join_next().await {
-        if let Err(error) = result {
-            tracing::error!(%error,"Connection shutdown failed");
+    lifecycle.stop();
+    commands.close();
+    let mut cancelled_commands = 0;
+    while commands.try_recv().is_ok() {
+        cancelled_commands += 1;
+    }
+    if cancelled_commands > 0 {
+        tracing::warn!(
+            count = cancelled_commands,
+            "Queued console commands cancelled by shutdown"
+        );
+    }
+    let clients_drain = async {
+        let mut errors = Vec::new();
+        let mut omitted = 0;
+        while let Some(result) = clients.join_next().await {
+            if let Err(error) = result {
+                record_failure(&mut errors, &mut omitted, error.to_string());
+            }
         }
+        if omitted > 0 {
+            errors.push(format!("{omitted} additional connection shutdown failures"));
+        }
+        errors
+    };
+    let (job_failures, client_failures) = tokio::join!(jobs.drain(), clients_drain);
+    for error in job_failures.into_iter().chain(client_failures) {
+        record_failure(&mut failures, &mut omitted_failures, error);
     }
-    signal_task.abort();
-    if let Some(monitor) = update_monitor {
-        monitor.stop().await;
+    if omitted_failures > 0 {
+        failures.push(format!(
+            "{omitted_failures} additional server work failures"
+        ));
     }
-    shutdown_components(&state).await?;
-    tracing::info!("Stopped cleanly; directory {}", directory.display());
-    Ok(())
+    failures
+}
+
+fn record_failure(failures: &mut Vec<String>, omitted: &mut u64, error: String) {
+    if failures.len() < 32 {
+        let mut error = error;
+        let mut end = error.len().min(1024);
+        while !error.is_char_boundary(end) {
+            end -= 1;
+        }
+        error.truncate(end);
+        failures.push(error);
+    } else {
+        *omitted = omitted.saturating_add(1);
+    }
 }
 
 async fn shutdown_components(state: &State) -> Result<()> {
+    state.sessions.drain().await;
     let mut failures = Vec::new();
     if let Some(mobs) = &state.mobs
         && let Err(error) = mobs.flush().await
@@ -365,6 +612,14 @@ mod tests {
             b"corrupt shutdown snapshot",
         )
         .unwrap();
+        assert!(
+            run_tick(Arc::clone(&state), 100).await.is_ok(),
+            "mob snapshot save failure must remain retryable"
+        );
+        assert!(
+            !*state.shutdown.borrow(),
+            "retryable mob save failure stopped the server"
+        );
         assert!(shutdown_components(&state).await.is_err());
         assert!(matches!(
             state

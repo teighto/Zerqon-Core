@@ -22,6 +22,82 @@ fn source_metadata(root: &std::path::Path) {
     .unwrap();
 }
 
+#[test]
+fn cancelled_import_before_start_preserves_source_and_creates_no_destination() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("original");
+    let destination = directory.path().join("imported");
+    source_metadata(&source);
+    std::fs::create_dir(source.join("region")).unwrap();
+    std::fs::copy(fixture_path(), source.join("region/r.-1.-2.mca")).unwrap();
+    let original = std::fs::read(source.join("level.dat")).unwrap();
+    let result = zerqon_world::anvil::import_world_blocks_cancellable(
+        &source,
+        &destination,
+        &resolve,
+        &|| true,
+    );
+    assert!(result.is_err(), "cancelled import still completed");
+    assert!(!destination.exists());
+    assert_eq!(std::fs::read(source.join("level.dat")).unwrap(), original);
+}
+
+#[test]
+fn cancellation_during_source_copy_keeps_an_incomplete_destination_and_releases_source_lock() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("original");
+    let destination = directory.path().join("imported");
+    source_metadata(&source);
+    std::fs::create_dir(source.join("region")).unwrap();
+    std::fs::copy(fixture_path(), source.join("region/r.-1.-2.mca")).unwrap();
+    std::fs::write(source.join("session.lock"), b"lock").unwrap();
+    let contents = vec![93; 512 * 1024];
+    std::fs::write(source.join("a-retained.bin"), &contents).unwrap();
+    let observed = std::cell::Cell::new(false);
+    let result = zerqon_world::anvil::import_world_blocks_cancellable(
+        &source,
+        &destination,
+        &resolve,
+        &|| {
+            let pending_copy = std::fs::read_dir(destination.join("source-data/files"))
+                .ok()
+                .is_some_and(|mut entries| {
+                    entries.any(|entry| {
+                        entry.is_ok_and(|entry| {
+                            entry
+                                .metadata()
+                                .is_ok_and(|metadata| metadata.len() >= 65536)
+                        })
+                    })
+                });
+            observed.set(observed.get() || pending_copy);
+            pending_copy
+        },
+    );
+    assert!(
+        observed.get(),
+        "copy did not expose a bounded cancellation checkpoint"
+    );
+    assert!(result.is_err());
+    assert!(destination.join("IMPORT_INCOMPLETE").is_file());
+    assert!(!destination.join("import-report.json").exists());
+    assert!(zerqon_world::WorldStore::open(&destination).is_err());
+    assert_eq!(
+        std::fs::read(source.join("a-retained.bin")).unwrap(),
+        contents
+    );
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(source.join("session.lock"))
+        .unwrap();
+    lock.try_lock()
+        .expect("source lock leaked after import cancellation");
+    drop(lock);
+    assert!(import_world_blocks(&source, &destination, &resolve).is_err());
+    assert!(import_world_blocks(&source, &directory.path().join("retry"), &resolve).is_ok());
+}
+
 fn resolve(name: &str, properties: &BTreeMap<String, String>) -> Option<u32> {
     match (
         name,

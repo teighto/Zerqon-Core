@@ -11,5 +11,9 @@ publish = false
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+default = []
+native-read = ["zerqon-plugin-api/native-read"]
+
 [dependencies]
 zerqon-plugin-api = { path = "../../crates/zerqon-plugin-api" }

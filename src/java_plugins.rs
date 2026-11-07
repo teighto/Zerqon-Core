@@ -1,19 +1,33 @@
 use crate::java_launch::{JavaLaunchError, JavaLaunchPath};
+use crate::lifecycle::{Lifecycle, StopToken, Stopped};
+use crate::managed_tasks::{self as tasks, OperationError, TaskError};
+use crate::native_query_runtime::{
+    NativeAdmission, NativeBackend, NativeExecutionError, NativePluginKey, NativeQueryRuntime,
+    NativeQueryScope, NativeReplyFormat, NativeScopeContext,
+};
 use crate::plugin_services::{
-    MAX_NATIVE_CALL_BYTES, MAX_NATIVE_CALLS, MAX_NATIVE_RESULT_BYTES, MAX_NATIVE_TOTAL_BYTES,
-    NativeCallContext, NativeErrorCode, NativeEventContext, NativeQuery, NativeQueryError,
-    NativeQueryService, NativeQueryValue,
+    MAX_NATIVE_CALL_BYTES, MAX_NATIVE_CALLS, MAX_NATIVE_TOTAL_BYTES, NativeErrorCode,
+    NativeEventContext, NativeQuery, NativeQueryError,
+};
+#[cfg(test)]
+use crate::{
+    native_query_runtime::{
+        DEFAULT_READ_BUDGET_BYTES, MAX_PROVIDER_WORKING_SET_BYTES, NativeProviderContract,
+        NativeReadBudget,
+    },
+    plugin_services::NativeQueryService,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::process::Stdio;
+#[cfg(test)]
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout_at};
 use zerqon_plugin_api::{Action, Event};
@@ -64,11 +78,32 @@ pub enum JavaPluginError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Launch(#[from] JavaLaunchError),
+    #[error("{0}")]
+    Managed(#[from] TaskError),
+    #[error("{0}")]
+    Cancelled(#[from] Stopped),
+    #[error("{0}")]
+    Cleanup(#[from] tasks::CleanupError),
+    #[error("native query execution: {0}")]
+    Native(#[from] NativeExecutionError),
+}
+impl OperationError for JavaPluginError {
+    fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Cancelled(_))
+            || matches!(self, Self::Managed(error) if error.is_cancelled())
+    }
+    fn is_cleanup_failure(&self) -> bool {
+        matches!(self, Self::Cleanup(_))
+            || matches!(self, Self::Managed(error) if error.is_cleanup_failure())
+    }
 }
 
 pub struct JavaPlugins {
+    generation: u64,
     sender: mpsc::Sender<Request>,
-    cancel: Option<oneshot::Sender<()>>,
+    cancel: StopToken,
+    lifecycle: Lifecycle,
+    completion: watch::Receiver<Option<Result<(), String>>>,
     sequence: AtomicU64,
     request_timeout: Duration,
     startup_results: Vec<JavaPluginResult>,
@@ -108,6 +143,7 @@ struct Request {
     bytes: Vec<u8>,
     kind: RequestKind,
     deadline: Instant,
+    execution_timeout: Option<Duration>,
     reply: oneshot::Sender<Result<Vec<JavaPluginResult>, JavaPluginError>>,
 }
 
@@ -188,12 +224,16 @@ struct NativeResult {
 #[derive(Serialize)]
 #[serde(untagged)]
 enum NativeResultValue {
-    Success { ok: bool, value: NativeQueryValue },
     Error { ok: bool, error: NativeQueryError },
 }
 
+static NEXT_HOST_GENERATION: AtomicU64 = AtomicU64::new(1);
+
 struct NativeHost {
-    service: Arc<dyn NativeQueryService>,
+    executor: NativeQueryRuntime,
+    lifecycle: Lifecycle,
+    cancel: StopToken,
+    generation: u64,
     available: HashSet<String>,
     known: HashSet<String>,
     active: HashSet<String>,
@@ -213,7 +253,21 @@ impl NativeHost {
     }
 }
 
+#[cfg(test)]
+fn native_runtime(
+    service: Arc<dyn NativeQueryService>,
+    lifecycle: &Lifecycle,
+) -> Result<NativeQueryRuntime, JavaPluginError> {
+    Ok(NativeQueryRuntime::new(
+        service,
+        NativeReadBudget::new(DEFAULT_READ_BUDGET_BYTES)?,
+        lifecycle.clone(),
+        NativeProviderContract::future_owned(MAX_PROVIDER_WORKING_SET_BYTES)?,
+    ))
+}
+
 impl JavaPlugins {
+    #[cfg(test)]
     pub async fn spawn_with_services(
         config: JavaPluginConfig,
         services: Arc<dyn NativeQueryService>,
@@ -221,10 +275,50 @@ impl JavaPlugins {
         Self::spawn_internal(config, Some(services)).await
     }
 
+    pub async fn spawn_with_query_runtime(
+        config: JavaPluginConfig,
+        runtime: NativeQueryRuntime,
+        lifecycle: &Lifecycle,
+        stop: &StopToken,
+    ) -> Result<Self, JavaPluginError> {
+        Self::spawn_tracked(config, Some(runtime), lifecycle, stop).await
+    }
+
+    #[cfg(test)]
     async fn spawn_internal(
         config: JavaPluginConfig,
         services: Option<Arc<dyn NativeQueryService>>,
     ) -> Result<Self, JavaPluginError> {
+        let lifecycle = Lifecycle::new();
+        let runtime = services
+            .map(|service| native_runtime(service, &lifecycle))
+            .transpose()?;
+        Self::spawn_tracked(config, runtime, &lifecycle, &lifecycle.token()).await
+    }
+
+    async fn spawn_tracked(
+        config: JavaPluginConfig,
+        services: Option<NativeQueryRuntime>,
+        lifecycle: &Lifecycle,
+        stop: &StopToken,
+    ) -> Result<Self, JavaPluginError> {
+        let context = lifecycle.clone();
+        tasks::run(
+            lifecycle,
+            stop,
+            "start Java plugin host",
+            move |stop| async move { Self::spawn_body(config, services, &context, &stop).await },
+        )
+        .await?
+    }
+
+    async fn spawn_body(
+        config: JavaPluginConfig,
+        services: Option<NativeQueryRuntime>,
+        lifecycle: &Lifecycle,
+        stop: &StopToken,
+    ) -> Result<Self, JavaPluginError> {
+        stop.check()?;
         if !(1..=1024).contains(&config.queue_capacity)
             || config.request_timeout.is_zero()
             || config.startup_timeout.is_zero()
@@ -239,11 +333,20 @@ impl JavaPlugins {
             ));
         }
         std::fs::create_dir_all(&config.directory)?;
+        let cancel = Lifecycle::new().token().child();
+        let generation = NEXT_HOST_GENERATION
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                value.checked_add(1)
+            })
+            .map_err(|_| JavaPluginError::Protocol("Java host generation exhausted"))?;
         let negotiate = services.is_some();
         let native = services
             .map(|service| {
                 Ok::<_, JavaPluginError>(NativeHost {
-                    service,
+                    executor: service,
+                    lifecycle: lifecycle.clone(),
+                    cancel: cancel.clone(),
+                    generation,
                     available: plugin_candidates(&config.directory)?,
                     known: HashSet::new(),
                     active: HashSet::new(),
@@ -258,8 +361,17 @@ impl JavaPlugins {
             ))?
             .to_owned();
         let classpath = java_classpath(&config)?;
-        let java = resolve_java(&config.java, config.startup_timeout).await?;
-        let mut child = Command::new(java)
+        let java =
+            resolve_java_tracked(&config.java, config.startup_timeout, lifecycle, stop).await?;
+        stop.check()?;
+        let host_job = lifecycle
+            .register("Java plugin host")
+            .map_err(TaskError::from)?;
+        if let Err(error) = stop.check() {
+            host_job.finish(Ok(()));
+            return Err(error.into());
+        }
+        let child = Command::new(java)
             .args([
                 "-Dfile.encoding=UTF-8",
                 "-Dsun.stdout.encoding=UTF-8",
@@ -274,57 +386,94 @@ impl JavaPlugins {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
-            .spawn()?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or(JavaPluginError::Protocol("missing host stdin"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or(JavaPluginError::Protocol("missing host stdout"))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or(JavaPluginError::Protocol("missing host stderr"))?;
-        let (sender, receiver) = mpsc::channel(config.queue_capacity);
-        let (cancel, cancelled) = oneshot::channel();
-        tokio::spawn(async move {
-            let _classpath = classpath;
-            let stderr_task = StderrTask(tokio::spawn(drain_stderr(stderr)));
-            tokio::select! {
-                () = run_host(&mut child, stdin, stdout, receiver, native) => {}
-                _ = cancelled => terminate(&mut child).await,
+            .spawn();
+        let mut child = match child {
+            Ok(child) => child,
+            Err(error) => {
+                host_job.finish(Ok(()));
+                return Err(error.into());
             }
-            drop(stderr_task);
+        };
+        let (Some(stdin), Some(stdout), Some(stderr)) =
+            (child.stdin.take(), child.stdout.take(), child.stderr.take())
+        else {
+            let cleanup = tasks::terminate_child(&mut child).await;
+            host_job.finish(cleanup.as_ref().map(|_| ()).map_err(ToString::to_string));
+            cleanup?;
+            return Err(JavaPluginError::Protocol("missing host process pipe"));
+        };
+        let (sender, receiver) = mpsc::channel(config.queue_capacity);
+        let cancelled = cancel.clone();
+        let (completed, completion) = watch::channel(None);
+        tokio::spawn(async move {
+            let stderr_task = StderrTask(Some(tokio::spawn(drain_stderr(stderr))));
+            let execution = tokio::select! {
+                biased;
+                result = tasks::catch_panic(run_host(&mut child, stdin, stdout, receiver, native)) => result,
+                _ = cancelled.cancelled() => Ok(()),
+            };
+            let mut failures = Vec::new();
+            if let Err(error) = execution {
+                failures.push(error.to_string());
+            }
+            if let Err(error) = tasks::terminate_child(&mut child).await {
+                failures.push(error.to_string());
+            }
+            if let Err(error) = stderr_task.finish().await {
+                failures.push(error.to_string());
+            }
+            drop(classpath);
+            let result = if failures.is_empty() {
+                Ok(())
+            } else {
+                Err(failures.join("; "))
+            };
+            completed.send_replace(Some(result.clone()));
+            host_job.finish(result);
         });
         let mut plugins = Self {
+            generation,
             sender,
-            cancel: Some(cancel),
+            cancel,
+            lifecycle: lifecycle.clone(),
+            completion,
             sequence: AtomicU64::new(1),
             request_timeout: config.request_timeout,
             startup_results: Vec::new(),
         };
-        if negotiate {
-            plugins
+        let startup = tasks::cancellable(stop, async {
+            if negotiate {
+                plugins
+                    .request(
+                        Operation::Hello {
+                            min_protocol: 2,
+                            max_protocol: 2,
+                        },
+                        config.startup_timeout,
+                    )
+                    .await?;
+            }
+            plugins.startup_results = plugins
                 .request(
-                    Operation::Hello {
-                        min_protocol: 2,
-                        max_protocol: 2,
+                    Operation::Load {
+                        directory,
+                        server_version: config.server_version,
                     },
                     config.startup_timeout,
                 )
                 .await?;
+            Ok::<_, JavaPluginError>(())
+        })
+        .await;
+        if let Err(error) = startup {
+            plugins.cancel.request_stop();
+            plugins.wait_closed().await?;
+            return Err(error);
         }
-        plugins.startup_results = plugins
-            .request(
-                Operation::Load {
-                    directory,
-                    server_version: config.server_version,
-                },
-                config.startup_timeout,
-            )
-            .await?;
+        if stop.is_stopped() {
+            plugins.shutdown().await?;
+            return Err(Stopped.into());
+        }
         Ok(plugins)
     }
 
@@ -370,12 +519,66 @@ impl JavaPlugins {
         )
         .await
     }
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub async fn dispatch_admitted_join(
+        &self,
+        event: Event,
+        context: NativeEventContext,
+        admission: &StopToken,
+    ) -> Result<Vec<JavaPluginResult>, JavaPluginError> {
+        admission.check()?;
+        if !matches!(event, Event::PlayerJoin { .. }) || !context.matches_event(&event) {
+            return Err(JavaPluginError::Configuration(
+                "invalid admitted Join context",
+            ));
+        }
+        self.request_inner(
+            Operation::Event {
+                event,
+                plugin: None,
+                context: Some(context),
+            },
+            self.request_timeout,
+            Some(admission),
+        )
+        .await
+    }
     pub async fn list(&self) -> Result<Vec<JavaPluginResult>, JavaPluginError> {
         self.request(Operation::List, self.request_timeout).await
     }
     pub async fn shutdown(&self) -> Result<Vec<JavaPluginResult>, JavaPluginError> {
-        self.request(Operation::Shutdown, self.request_timeout)
-            .await
+        let result = self
+            .request(Operation::Shutdown, self.request_timeout)
+            .await;
+        if result.is_err() {
+            self.cancel.request_stop();
+        }
+        if let Err(cleanup) = self.wait_closed().await {
+            let primary = result
+                .as_ref()
+                .err()
+                .map(|error| format!("; shutdown request: {error}"))
+                .unwrap_or_default();
+            return Err(tasks::CleanupError(format!("{cleanup}{primary}")).into());
+        }
+        result
+    }
+    pub async fn wait_closed(&self) -> Result<(), JavaPluginError> {
+        let mut completion = self.completion.clone();
+        loop {
+            if let Some(result) = completion.borrow().clone() {
+                return result.map_err(|error| tasks::CleanupError(error).into());
+            }
+            if completion.changed().await.is_err() {
+                return Err(tasks::CleanupError(
+                    "Java host supervisor ended without a cleanup acknowledgement".into(),
+                )
+                .into());
+            }
+        }
     }
     pub fn take_startup_results(&mut self) -> Vec<JavaPluginResult> {
         std::mem::take(&mut self.startup_results)
@@ -386,6 +589,65 @@ impl JavaPlugins {
         operation: Operation,
         duration: Duration,
     ) -> Result<Vec<JavaPluginResult>, JavaPluginError> {
+        self.request_inner(operation, duration, None).await
+    }
+
+    async fn request_inner(
+        &self,
+        operation: Operation,
+        duration: Duration,
+        admission: Option<&StopToken>,
+    ) -> Result<Vec<JavaPluginResult>, JavaPluginError> {
+        let cleanup = matches!(
+            operation,
+            Operation::List
+                | Operation::Shutdown
+                | Operation::Event {
+                    event: Event::PlayerQuit { .. } | Event::Disable,
+                    ..
+                }
+        );
+        if self.lifecycle.token().is_stopped() && !cleanup && admission.is_none() {
+            return Err(JavaPluginError::Cancelled(Stopped));
+        }
+        let critical = admission.is_some()
+            || matches!(
+                operation,
+                Operation::Event {
+                    event: Event::PlayerQuit { .. },
+                    ..
+                }
+            );
+        let duration_limit = if critical {
+            duration.max(Duration::from_secs(10))
+        } else {
+            duration
+        };
+        let mut deadline = Instant::now() + duration_limit;
+        if critical
+            && cleanup
+            && let Some(cleanup) = self.lifecycle.cleanup_deadline()
+        {
+            deadline = deadline.min(cleanup);
+        }
+        let stop = admission.unwrap_or(&self.cancel);
+        let reservation = if critical {
+            stop.check()?;
+            let permit = tokio::select! {
+                result = timeout_at(deadline, self.sender.reserve()) => {
+                    result.map_err(|_| JavaPluginError::Timeout)?
+                        .map_err(|_| JavaPluginError::Stopped)?
+                },
+                _ = stop.cancelled() => return Err(JavaPluginError::Cancelled(Stopped)),
+            };
+            stop.check()?;
+            if Instant::now() >= deadline {
+                return Err(JavaPluginError::Timeout);
+            }
+            Some(permit)
+        } else {
+            None
+        };
         let kind = RequestKind::of(&operation);
         let id = self
             .sequence
@@ -400,24 +662,37 @@ impl JavaPlugins {
         serde_json::to_writer(&mut writer, &Envelope { id, operation })
             .map_err(|_| JavaPluginError::RequestTooLarge)?;
         writer.bytes.push(b'\n');
-        let deadline = Instant::now() + duration;
         let (reply, receiver) = oneshot::channel();
-        self.sender
-            .try_send(Request {
-                id,
-                bytes: writer.bytes,
-                kind,
-                deadline,
-                reply,
-            })
-            .map_err(|error| match error {
+        let request = Request {
+            id,
+            bytes: writer.bytes,
+            kind,
+            deadline,
+            execution_timeout: critical.then_some(duration),
+            reply,
+        };
+        if let Some(permit) = reservation {
+            permit.send(request);
+        } else {
+            self.sender.try_send(request).map_err(|error| match error {
                 mpsc::error::TrySendError::Full(_) => JavaPluginError::QueueFull,
                 mpsc::error::TrySendError::Closed(_) => JavaPluginError::Stopped,
             })?;
-        timeout_at(deadline, receiver)
-            .await
-            .map_err(|_| JavaPluginError::Timeout)?
-            .map_err(|_| JavaPluginError::Stopped)?
+        }
+        if admission.is_some() {
+            tokio::select! {
+                biased;
+                result = timeout_at(deadline, receiver) => result
+                    .map_err(|_| JavaPluginError::Timeout)?
+                    .map_err(|_| JavaPluginError::Stopped)?,
+                _ = stop.cancelled() => Err(JavaPluginError::Cancelled(Stopped)),
+            }
+        } else {
+            timeout_at(deadline, receiver)
+                .await
+                .map_err(|_| JavaPluginError::Timeout)?
+                .map_err(|_| JavaPluginError::Stopped)?
+        }
     }
 }
 
@@ -485,16 +760,47 @@ fn plugin_candidates(directory: &std::path::Path) -> Result<HashSet<String>, Jav
 
 impl Drop for JavaPlugins {
     fn drop(&mut self) {
-        if let Some(cancel) = self.cancel.take() {
-            let _ = cancel.send(());
-        }
+        self.cancel.request_stop();
     }
 }
 
-struct StderrTask(JoinHandle<()>);
+struct StderrTask(Option<JoinHandle<Result<(), std::io::Error>>>);
+impl StderrTask {
+    async fn finish(mut self) -> Result<(), tasks::CleanupError> {
+        let Some(task) = self.0.as_mut() else {
+            return Ok(());
+        };
+        let result = match tokio::time::timeout(Duration::from_secs(1), &mut *task).await {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(error))) => Err(tasks::CleanupError(format!(
+                "Java stderr drain failed: {error}"
+            ))),
+            Ok(Err(error)) => Err(tasks::CleanupError(format!(
+                "Java stderr drain task failed: {error}"
+            ))),
+            Err(_) => {
+                task.abort();
+                if let Err(error) = task.await
+                    && !error.is_cancelled()
+                {
+                    return Err(tasks::CleanupError(format!(
+                        "Java stderr drain task failed: {error}"
+                    )));
+                }
+                Err(tasks::CleanupError(
+                    "Java stderr drain exceeded one second".into(),
+                ))
+            }
+        };
+        self.0.take();
+        result
+    }
+}
 impl Drop for StderrTask {
     fn drop(&mut self) {
-        self.0.abort();
+        if let Some(task) = &self.0 {
+            task.abort();
+        }
     }
 }
 
@@ -513,6 +819,9 @@ async fn run_host(
         if Instant::now() >= request.deadline {
             let _ = request.reply.send(Err(JavaPluginError::Timeout));
             continue;
+        }
+        if let Some(duration) = request.execution_timeout {
+            request.deadline = request.deadline.min(Instant::now() + duration);
         }
         let exchange = async {
             stdin.write_all(&request.bytes).await?;
@@ -540,6 +849,7 @@ async fn run_host(
             }
             let mut calls = 0;
             let mut response_bytes = 0;
+            let mut query_scope: Option<(String, NativeQueryScope)> = None;
             loop {
                 let line = read_line_limited(&mut stdout, MAX_RESPONSE_BYTES).await?;
                 let frame: HostFrame = serde_json::from_slice(&line)
@@ -590,86 +900,89 @@ async fn run_host(
                             return Err(JavaPluginError::Protocol("invalid native query frame"));
                         }
                         calls += 1;
-                        let deadline = request
-                            .deadline
-                            .min(Instant::now() + Duration::from_millis(250));
-                        let context = NativeCallContext {
-                            plugin: call.plugin,
-                            parent_id: request.id,
-                            call_id: call.call_id,
-                            deadline,
-                        };
-                        let query = call.operation;
-                        let queried = if query.valid() {
-                            timeout_at(deadline, native.service.query(context, query.clone()))
-                                .await
-                                .unwrap_or_else(|_| {
-                                    Err(NativeQueryError::new(
-                                        NativeErrorCode::DeadlineExceeded,
-                                        "Native query deadline exceeded",
-                                    ))
-                                })
-                        } else {
-                            Err(NativeQueryError::new(
-                                NativeErrorCode::InvalidArgument,
-                                "Invalid native query arguments",
-                            ))
-                        };
-                        let result = match queried {
-                            Ok(value) if value.valid_for(&query) => {
-                                NativeResultValue::Success { ok: true, value }
-                            }
-                            Err(error) if error.valid() => {
-                                NativeResultValue::Error { ok: false, error }
-                            }
-                            _ => NativeResultValue::Error {
-                                ok: false,
-                                error: NativeQueryError::new(
-                                    NativeErrorCode::Internal,
-                                    "Native query service returned an invalid result",
-                                ),
-                            },
-                        };
-                        let mut writer = LimitedWriter {
-                            bytes: Vec::new(),
-                            limit: MAX_NATIVE_RESULT_BYTES,
-                        };
-                        let encoded = serde_json::to_writer(
-                            &mut writer,
-                            &NativeResult {
-                                kind: "native_result",
+                        if query_scope
+                            .as_ref()
+                            .is_none_or(|(plugin, _)| plugin != &call.plugin)
+                        {
+                            drop(query_scope.take());
+                            let cleanup = matches!(request.kind, RequestKind::Shutdown)
+                                || native.lifecycle.token().is_stopped();
+                            let context = NativeScopeContext {
+                                key: NativePluginKey::new(
+                                    NativeBackend::Java,
+                                    &call.plugin,
+                                    native.generation,
+                                )?,
                                 parent_id: request.id,
-                                call_id: call.call_id,
-                                result,
-                            },
-                        );
-                        if encoded.is_err() {
-                            writer.bytes.clear();
-                            serde_json::to_writer(
-                                &mut writer,
-                                &NativeResult {
-                                    kind: "native_result",
-                                    parent_id: request.id,
-                                    call_id: call.call_id,
-                                    result: NativeResultValue::Error {
-                                        ok: false,
-                                        error: NativeQueryError::new(
-                                            NativeErrorCode::Capacity,
-                                            "Native query result exceeds its byte limit",
-                                        ),
-                                    },
+                                deadline: request.deadline,
+                                stop: native.cancel.clone(),
+                                admission: if cleanup {
+                                    NativeAdmission::Cleanup
+                                } else {
+                                    NativeAdmission::Admitted
                                 },
-                            )
-                            .map_err(|_| {
-                                JavaPluginError::Protocol("native query error exceeds limit")
-                            })?;
+                            };
+                            match native.executor.try_scope(context) {
+                                Ok(scope) => query_scope = Some((call.plugin.clone(), scope)),
+                                Err(
+                                    NativeExecutionError::Capacity | NativeExecutionError::Busy,
+                                ) => {
+                                    let mut writer = LimitedWriter {
+                                        bytes: Vec::new(),
+                                        limit: 2048,
+                                    };
+                                    serde_json::to_writer(
+                                        &mut writer,
+                                        &NativeResult {
+                                            kind: "native_result",
+                                            parent_id: request.id,
+                                            call_id: call.call_id,
+                                            result: NativeResultValue::Error {
+                                                ok: false,
+                                                error: NativeQueryError::new(
+                                                    NativeErrorCode::Capacity,
+                                                    "Native query memory is busy",
+                                                ),
+                                            },
+                                        },
+                                    )
+                                    .map_err(|_| {
+                                        JavaPluginError::Protocol("native error exceeds limit")
+                                    })?;
+                                    response_bytes += writer.bytes.len();
+                                    if response_bytes > MAX_NATIVE_TOTAL_BYTES {
+                                        return Err(JavaPluginError::Protocol(
+                                            "native query budget exceeded",
+                                        ));
+                                    }
+                                    writer.bytes.push(b'\n');
+                                    stdin.write_all(&writer.bytes).await?;
+                                    stdin.flush().await?;
+                                    continue;
+                                }
+                                Err(error) => return Err(error.into()),
+                            }
                         }
-                        response_bytes += writer.bytes.len();
+                        let scope = &query_scope
+                            .as_ref()
+                            .ok_or(JavaPluginError::Protocol("native scope missing"))?
+                            .1;
+                        let reply = scope
+                            .execute(
+                                call.call_id,
+                                call.operation,
+                                NativeReplyFormat::JavaProtocol2,
+                            )
+                            .await
+                            .map_err(|error| match error {
+                                NativeExecutionError::DeadlineExceeded => JavaPluginError::Timeout,
+                                error => JavaPluginError::Native(error),
+                            })?;
+                        response_bytes += reply.json_len();
                         if response_bytes > MAX_NATIVE_TOTAL_BYTES {
                             return Err(JavaPluginError::Protocol("native query budget exceeded"));
                         }
-                        writer.bytes.push(b'\n');
-                        stdin.write_all(&writer.bytes).await?;
+                        stdin.write_all(reply.bytes()).await?;
                         stdin.flush().await?;
                     }
                 }
@@ -681,7 +994,6 @@ async fn run_host(
         };
         let fatal = matches!(result, Err(ref error) if !matches!(error, JavaPluginError::Rejected));
         if fatal {
-            terminate(child).await;
             let _ = request.reply.send(result);
             return;
         }
@@ -691,24 +1003,12 @@ async fn run_host(
                 Ok(Ok(status)) if status.success() => result,
                 Ok(Ok(_)) => Err(JavaPluginError::Protocol("host exited unsuccessfully")),
                 Ok(Err(error)) => Err(error.into()),
-                Err(_) => {
-                    terminate(child).await;
-                    Err(JavaPluginError::Timeout)
-                }
+                Err(_) => Err(JavaPluginError::Timeout),
             };
             let _ = request.reply.send(result);
             return;
         }
         let _ = request.reply.send(result);
-    }
-    terminate(child).await;
-}
-
-async fn terminate(child: &mut Child) {
-    match tokio::time::timeout(Duration::from_secs(2), child.kill()).await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => tracing::warn!(kind = ?error.kind(), "Java host termination failed"),
-        Err(_) => tracing::warn!("Java host termination timed out"),
     }
 }
 
@@ -794,10 +1094,28 @@ fn valid_plugin_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
-async fn resolve_java(
+async fn resolve_java_tracked(
     java: &std::path::Path,
     duration: Duration,
+    lifecycle: &Lifecycle,
+    stop: &StopToken,
 ) -> Result<PathBuf, JavaPluginError> {
+    let java = java.to_owned();
+    tasks::run(
+        lifecycle,
+        stop,
+        "Java plugin runtime probe",
+        move |stop| async move { run_java_probe(&java, duration, &stop).await },
+    )
+    .await?
+}
+
+async fn run_java_probe(
+    java: &std::path::Path,
+    duration: Duration,
+    stop: &StopToken,
+) -> Result<PathBuf, JavaPluginError> {
+    stop.check()?;
     let mut child = Command::new(java)
         .args([
             "-Dfile.encoding=UTF-8",
@@ -811,10 +1129,10 @@ async fn resolve_java(
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()?;
-    let stderr = child.stderr.take().ok_or(JavaPluginError::Configuration(
-        "Java runtime probe has no stderr",
-    ))?;
-    let result = tokio::time::timeout(duration, async {
+    let run = async {
+        let stderr = child.stderr.take().ok_or(JavaPluginError::Configuration(
+            "Java runtime probe has no stderr",
+        ))?;
         let mut bytes = Vec::new();
         stderr.take(65_537).read_to_end(&mut bytes).await?;
         if bytes.len() > 65_536 {
@@ -856,19 +1174,18 @@ async fn resolve_java(
             ));
         }
         Ok(executable)
-    })
-    .await;
-    match result {
-        Ok(Ok(executable)) => Ok(executable),
-        Ok(Err(error)) => {
-            terminate(&mut child).await;
-            Err(error)
-        }
-        Err(_) => {
-            terminate(&mut child).await;
-            Err(JavaPluginError::Timeout)
-        }
-    }
+    };
+    let result = tokio::select! {
+        biased;
+        _ = stop.cancelled() => Err(Stopped.into()),
+        result = tokio::time::timeout(duration, tasks::catch_panic(run)) => match result {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => Err(error.into()),
+            Err(_) => Err(JavaPluginError::Timeout),
+        },
+    };
+    tasks::terminate_child(&mut child).await?;
+    result
 }
 
 struct LimitedWriter {
@@ -966,7 +1283,7 @@ impl StderrDecoder {
     }
 }
 
-async fn drain_stderr(mut stderr: tokio::process::ChildStderr) {
+async fn drain_stderr(mut stderr: tokio::process::ChildStderr) -> Result<(), std::io::Error> {
     let mut buffer = [0; 4096];
     let mut decoder = StderrDecoder::default();
     let mut window = Instant::now();
@@ -976,8 +1293,7 @@ async fn drain_stderr(mut stderr: tokio::process::ChildStderr) {
             Ok(0) => (decoder.finish(), true),
             Ok(count) => (decoder.push(&buffer[..count]), false),
             Err(error) => {
-                tracing::warn!(kind = ?error.kind(), "Java host stderr read failed");
-                (decoder.finish(), true)
+                return Err(error);
             }
         };
         if window.elapsed() >= Duration::from_secs(1) {
@@ -1003,4 +1319,5 @@ async fn drain_stderr(mut stderr: tokio::process::ChildStderr) {
             break;
         }
     }
+    Ok(())
 }

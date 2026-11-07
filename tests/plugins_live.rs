@@ -324,12 +324,104 @@ fn install_read_model_probes(directory: &Path, root: &Path) {
 }
 
 #[tokio::test]
+#[ignore = "requires prepared 26.3 data and a native-read Rust WASM example"]
+async fn rust_native_reads_observe_real_sessions_positions_and_persistent_world_identity() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let directory = tempfile::tempdir().unwrap();
+    setup(directory.path(), &root);
+    let guest = std::env::var_os("ZERQON_TEST_NATIVE_WASM").map_or_else(
+        || root.join(".cache/rust-plugin-fixtures/hello-native-read.wasm"),
+        PathBuf::from,
+    );
+    fs::copy(
+        guest,
+        directory.path().join("plugins/rust-plugins/hello.wasm"),
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("server.settings"),
+        "update_check=false\njava_plugins=false\nspawn_mobs=false\n",
+    )
+    .unwrap();
+    let data = root.join(".cache/vanilla/26.3");
+    let (mut server, address) = Server::start(directory.path(), &data);
+    let (mut player, _) = Client::join(&address, "CONSOLE").await;
+    let first = player.response("rwhere").await;
+    assert!(
+        first.contains(&format!(
+            "CONSOLE: uuid={}, session={}",
+            player.uuid, player.entity_id
+        )),
+        "{first}"
+    );
+    assert!(first.contains("position=(0.5,64,0.5)"), "{first}");
+    assert!(first.contains("online=1/20, protocol=777"), "{first}");
+    let world_uuid = first
+        .split("world=world(")
+        .nth(1)
+        .and_then(|tail| tail.split(')').next())
+        .map(|value| Uuid::parse_str(value).unwrap())
+        .unwrap();
+    assert!(!world_uuid.is_nil());
+    player.move_to([4.25, 70.0, -2.5], 90.0, -15.0).await;
+    let moved = player.response("rwhere").await;
+    assert!(moved.contains("position=(4.25,70,-2.5)"), "{moved}");
+    let uuid = player.uuid;
+    let old_session = player.entity_id;
+    drop(player);
+    let (mut observer, _) = Client::join(&address, "Observer").await;
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if observer.response("rwhere").await.contains("online=1/20") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let (mut rejoined, _) = Client::join(&address, "CONSOLE").await;
+    assert_eq!(rejoined.uuid, uuid);
+    assert_ne!(rejoined.entity_id, old_session);
+    let reply = rejoined.response("rwhere").await;
+    assert!(
+        reply.contains(&format!("session={}", rejoined.entity_id)),
+        "{reply}"
+    );
+    assert!(
+        reply.contains(&format!("world=world({world_uuid})")),
+        "{reply}"
+    );
+    drop(rejoined);
+    drop(observer);
+    server.stop().await;
+    let (mut restarted, address) = Server::start(directory.path(), &data);
+    let (mut player, _) = Client::join(&address, "CONSOLE").await;
+    let reply = player.response("rwhere").await;
+    assert!(
+        reply.contains(&format!("world=world({world_uuid})")),
+        "{reply}"
+    );
+    drop(player);
+    restarted.stop().await;
+}
+
+#[tokio::test]
 #[ignore = "requires prepared 26.3 data, Java25 Paper probes and Rust WASM example"]
 async fn paper_read_models_observe_real_players_worlds_and_once_only_join_quit_events() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let directory = tempfile::tempdir().unwrap();
     setup(directory.path(), &root);
     install_read_model_probes(directory.path(), &root);
+    let native_guest = std::env::var_os("ZERQON_TEST_NATIVE_WASM").map_or_else(
+        || root.join(".cache/rust-plugin-fixtures/hello-native-read.wasm"),
+        PathBuf::from,
+    );
+    fs::copy(
+        native_guest,
+        directory.path().join("plugins/rust-plugins/hello.wasm"),
+    )
+    .unwrap();
     let data = std::env::var_os("ZERQON_TEST_DATA")
         .map_or_else(|| root.join(".cache/vanilla/26.3"), PathBuf::from);
     let (mut server, address) = Server::start(directory.path(), &data);
@@ -380,6 +472,19 @@ async fn paper_read_models_observe_real_players_worlds_and_once_only_join_quit_e
         world.contains(":minecraft:overworld:NORMAL:-64:320:0.0:64.0:0.0:0.0:0.0"),
         "{world}"
     );
+    let rust_view = operator.response("rwhere").await;
+    assert!(
+        rust_view.contains(&format!(
+            "uuid={}, session={}",
+            operator.uuid, operator.entity_id
+        )),
+        "{rust_view}"
+    );
+    assert!(
+        rust_view.contains(&format!("world=world({world_uuid})")),
+        "{rust_view}"
+    );
+    assert!(rust_view.contains("position=(4.25,70,1.5)"), "{rust_view}");
     let departed_uuid = ordinary.uuid;
     let departed_entity = ordinary.entity_id;
     drop(ordinary);

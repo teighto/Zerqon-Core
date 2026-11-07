@@ -9,6 +9,8 @@ use wasmi::{
 };
 use zerqon_plugin_api::{ABI_VERSION, Action, Event, MAX_EVENT_BYTES};
 
+pub mod resumable;
+
 #[derive(Debug, thiserror::Error)]
 pub enum PluginError {
     #[error("invalid plugin limits: {0}")]
@@ -23,6 +25,20 @@ pub enum PluginError {
     ModuleSize,
     #[error("plugin event exceeds size limit")]
     EventSize,
+    #[error("native read imports require a resumable driver")]
+    NativeDriverRequired,
+    #[error("invalid native callback context")]
+    CallbackContext,
+    #[error("invalid native plugin protocol: {0}")]
+    NativeProtocol(&'static str),
+    #[error("plugin callback was cancelled")]
+    Cancelled,
+    #[error("plugin callback deadline exceeded")]
+    Deadline,
+    #[error("plugin callback fuel exhausted")]
+    FuelExhausted,
+    #[error("invalid plugin lifecycle transition")]
+    Lifecycle,
     #[error("plugin not found: {0}")]
     NotFound(String),
     #[error("plugin is disabled: {0}")]
@@ -78,6 +94,8 @@ struct HostState {
     copy_limit: usize,
     action_limit: usize,
     kind: EventKind,
+    native: Option<resumable::NativeState>,
+    fuel: Option<resumable::FuelLedger>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -126,39 +144,7 @@ pub struct PluginManager {
 
 impl PluginManager {
     pub fn new(limits: Limits) -> Result<Self, PluginError> {
-        if limits.memory_bytes < 65_536 || limits.memory_bytes > 1024 * 1024 * 1024 {
-            return Err(PluginError::Limits(
-                "memory must be between 64 KiB and 1 GiB",
-            ));
-        }
-        if limits.fuel_per_event == 0 || limits.fuel_per_event > 100_000_000 {
-            return Err(PluginError::Limits(
-                "fuel must be between 1 and 100,000,000",
-            ));
-        }
-        if limits.module_bytes == 0 || limits.module_bytes > 64 * 1024 * 1024 {
-            return Err(PluginError::Limits(
-                "module size must be between 1 and 64 MiB",
-            ));
-        }
-        if limits.event_bytes == 0
-            || limits.event_bytes > MAX_EVENT_BYTES
-            || limits.output_bytes == 0
-            || limits.output_bytes > MAX_EVENT_BYTES
-        {
-            return Err(PluginError::Limits(
-                "event and output size must be between 1 and 64 KiB",
-            ));
-        }
-        if limits.actions_per_event == 0
-            || limits.actions_per_event > 1024
-            || limits.plugins == 0
-            || limits.plugins > 256
-        {
-            return Err(PluginError::Limits(
-                "actions must be 1..1024 and plugin count 1..256",
-            ));
-        }
+        validate_limits(&limits)?;
         let mut config = Config::default();
         config
             .consume_fuel(true)
@@ -200,6 +186,12 @@ impl PluginManager {
             return Err(PluginError::ModuleSize);
         }
         let module = Module::new(&self.engine, bytes)?;
+        if module
+            .imports()
+            .any(|import| import.module() == "zerqon_read_v1")
+        {
+            return Err(PluginError::NativeDriverRequired);
+        }
         let state = HostState {
             limits: StoreLimitsBuilder::new()
                 .memory_size(self.limits.memory_bytes)
@@ -217,6 +209,8 @@ impl PluginManager {
             copy_limit: self.limits.event_bytes * 4 + self.limits.output_bytes,
             action_limit: self.limits.actions_per_event,
             kind: EventKind::None,
+            native: None,
+            fuel: None,
         };
         let mut store = Store::new(&self.engine, state);
         store.limiter(|state| &mut state.limits);
@@ -381,6 +375,43 @@ impl Runtime {
     }
 }
 
+fn validate_limits(limits: &Limits) -> Result<(), PluginError> {
+    if limits.memory_bytes < 65_536 || limits.memory_bytes > 1024 * 1024 * 1024 {
+        return Err(PluginError::Limits(
+            "memory must be between 64 KiB and 1 GiB",
+        ));
+    }
+    if limits.fuel_per_event == 0 || limits.fuel_per_event > 100_000_000 {
+        return Err(PluginError::Limits(
+            "fuel must be between 1 and 100,000,000",
+        ));
+    }
+    if limits.module_bytes == 0 || limits.module_bytes > 64 * 1024 * 1024 {
+        return Err(PluginError::Limits(
+            "module size must be between 1 and 64 MiB",
+        ));
+    }
+    if limits.event_bytes == 0
+        || limits.event_bytes > MAX_EVENT_BYTES
+        || limits.output_bytes == 0
+        || limits.output_bytes > MAX_EVENT_BYTES
+    {
+        return Err(PluginError::Limits(
+            "event and output size must be between 1 and 64 KiB",
+        ));
+    }
+    if limits.actions_per_event == 0
+        || limits.actions_per_event > 1024
+        || limits.plugins == 0
+        || limits.plugins > 256
+    {
+        return Err(PluginError::Limits(
+            "actions must be 1..1024 and plugin count 1..256",
+        ));
+    }
+    Ok(())
+}
+
 fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
@@ -421,11 +452,7 @@ fn charge_copy(caller: &mut Caller<'_, HostState>, len: usize) -> Result<(), was
     if state.copied_bytes > state.copy_limit {
         return Err(wasmi::Error::new("plugin I/O limit exceeded"));
     }
-    let fuel = caller.get_fuel()?;
-    let remaining = fuel
-        .checked_sub(len as u64)
-        .ok_or_else(|| wasmi::Error::new("plugin I/O fuel exhausted"))?;
-    caller.set_fuel(remaining)
+    resumable::charge_fuel(caller, len as u64)
 }
 
 fn read_event(
@@ -433,6 +460,7 @@ fn read_event(
     pointer: i32,
     capacity: i32,
 ) -> Result<i32, wasmi::Error> {
+    resumable::check_control(&caller)?;
     let len = caller.data().event.len();
     if pointer < 0
         || capacity < 0
@@ -459,6 +487,7 @@ fn emit_action(
     pointer: i32,
     len: i32,
 ) -> Result<i32, wasmi::Error> {
+    resumable::check_control(&caller)?;
     if pointer < 0 || len <= 0 || caller.data().kind == EventKind::None {
         return Err(wasmi::Error::new("invalid output buffer"));
     }

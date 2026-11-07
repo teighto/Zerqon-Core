@@ -177,7 +177,7 @@ pub async fn handle(socket: TcpStream, state: Arc<State>) -> Result<()> {
             properties: Vec::new(),
         }
     };
-    let Ok(_slot) = Arc::clone(&state.slots).try_acquire_owned() else {
+    let Ok(slot) = Arc::clone(&state.slots).try_acquire_owned() else {
         return login_disconnect(&mut writer, "The server is full").await;
     };
     let (outbound, packets) = mpsc::channel(32);
@@ -360,24 +360,32 @@ pub async fn handle(socket: TcpStream, state: Arc<State>) -> Result<()> {
         return Err("configuration did not finish".into());
     }
     configuration_deadline(&client_profile)?;
-    let mut joined = false;
+    let session = crate::player_session::ConnectionSession::new(
+        Arc::clone(&state),
+        profile.uuid,
+        profile.name.clone(),
+        registration,
+        inventory,
+        slot,
+    )?;
+    let resources = session.resources();
     let result = play(
         (reader, writer),
         Arc::clone(&state),
         &profile,
-        (&registration, &inventory),
+        (&resources.registration, &resources.inventory),
         packets,
         disconnect_rx,
-        &mut joined,
+        &session,
     )
     .await;
-    if joined {
-        state
-            .player_event(profile.uuid, registration.id(), &profile.name, false)
-            .await?;
-        tracing::info!(player=%profile.name,"Player left");
+    drop(resources);
+    let cleanup = session.close().await;
+    match (result, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(error), Err(cleanup)) => Err(format!("{error}; player cleanup: {cleanup}").into()),
     }
-    result
 }
 
 async fn configuration_packet(
@@ -466,7 +474,7 @@ async fn play(
     (registration, inventory): (&PlayerHandle, &InventoryHandle),
     mut outbound: mpsc::Receiver<PacketBatch>,
     mut disconnected: watch::Receiver<bool>,
-    joined: &mut bool,
+    session: &crate::player_session::ConnectionSession,
 ) -> Result<()> {
     let (incoming_tx, mut incoming) = mpsc::channel(32);
     let _reader_task = AbortTask(tokio::spawn(async move {
@@ -555,10 +563,7 @@ async fn play(
         writer.send(&packets::position(1, 0.5, 64.0, 0.5)).await?;
     }
     writer.send(&packets::game_event(13, 0.0)).await?;
-    state
-        .player_event(profile.uuid, registration.id(), &profile.name, true)
-        .await?;
-    *joined = true;
+    session.join().await?;
     tracing::info!(player=%profile.name,"Player joined");
     let radius = i32::from(state.properties.view_distance);
     let mut loaded = HashSet::new();
@@ -652,7 +657,7 @@ async fn play(
                         if let Some((_,sent))=outstanding{registration.latency(sent.elapsed().as_millis().min(i32::MAX as u128) as i32)?;}
                         outstanding=None;
                     },
-                    7|8=>{let command=zerqon_protocol::decode_command(view,id==8)?;if command.trim()=="tpsbar"{show_bar = !show_bar;if show_bar{let (title,progress)=tpsbar_metrics(&state);writer.send(&packets::bossbar_add(bar,&title,progress)).await?;}else{writer.send(&packets::bossbar_remove(bar)).await?;}}else{match state.command(CommandSource::Player{uuid:profile.uuid,name:&profile.name},command).await{Ok(replies)=>for reply in replies{writer.send(&packets::system_chat(&reply)).await?;},Err(error)=>writer.send(&packets::system_chat(&format!("Command failed: {error}"))).await?,}}},
+                    7|8=>{let command=zerqon_protocol::decode_command(view,id==8)?;if command.trim()=="tpsbar"{show_bar = !show_bar;if show_bar{let (title,progress)=tpsbar_metrics(&state);writer.send(&packets::bossbar_add(bar,&title,progress)).await?;}else{writer.send(&packets::bossbar_remove(bar)).await?;}}else{match state.command(CommandSource::Player{uuid:profile.uuid,session_id:registration.id(),name:&profile.name},command).await{Ok(replies)=>for reply in replies{writer.send(&packets::system_chat(&reply)).await?;},Err(error)=>writer.send(&packets::system_chat(&format!("Command failed: {error}"))).await?,}}},
                     30|31=>{
                         let x=f64::from_be_bytes(take(&mut view,8)?.try_into()?);
                         let y=f64::from_be_bytes(take(&mut view,8)?.try_into()?);

@@ -76,6 +76,22 @@ fn rejects_wasi_and_unknown_imports() {
 }
 
 #[test]
+fn legacy_host_requires_an_explicit_resumable_driver_for_native_imports() {
+    let bytes = wat::parse_str(
+        r#"(module
+        (import "zerqon_read_v1" "capabilities" (func (param i32) (result i64)))
+        (memory (export "memory") 1)
+        (func (export "zerqon_abi_version") (result i32) i32.const 1)
+        (func (export "zerqon_on_event") (result i32) i32.const 0))"#,
+    )
+    .unwrap();
+    let mut manager = PluginManager::new(Limits::default()).unwrap();
+    let error = manager.load("native", &bytes).unwrap_err();
+    assert!(error.to_string().contains("resumable driver"), "{error}");
+    assert!(manager.list().is_empty());
+}
+
+#[test]
 fn traps_infinite_loop_and_disables_failing_plugin() {
     let mut manager = PluginManager::new(Limits {
         fuel_per_event: 1000,

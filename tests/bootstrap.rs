@@ -1,3 +1,10 @@
+#[path = "../src/lifecycle.rs"]
+#[allow(dead_code)]
+mod lifecycle;
+#[path = "../src/managed_tasks.rs"]
+#[allow(dead_code)]
+mod managed_tasks;
+
 #[path = "../src/java_launch.rs"]
 #[allow(dead_code)]
 pub mod java_launch;
@@ -6,6 +13,40 @@ include!("../src/bootstrap.rs");
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    impl Bootstrap {
+        async fn prepare(directory: &Path, java: &Path) -> Result<PreparedData, BootstrapError> {
+            let lifecycle = Lifecycle::new();
+            Self::prepare_with_lifecycle(directory, java, &lifecycle, &lifecycle.token()).await
+        }
+    }
+
+    async fn acquire_prepare_lock(lock: &File, timeout: Duration) -> Result<(), BootstrapError> {
+        acquire_prepare_lock_tracked(lock, timeout, &Lifecycle::new().token()).await
+    }
+
+    async fn download(
+        destination: &Path,
+        url: &str,
+        size: u64,
+        sha1: &str,
+    ) -> Result<(), BootstrapError> {
+        download_tracked(destination, url, size, sha1, &Lifecycle::new().token()).await
+    }
+
+    async fn java_runtime(java: &Path) -> Result<PathBuf, BootstrapError> {
+        let lifecycle = Lifecycle::new();
+        java_runtime_tracked(java, &lifecycle, &lifecycle.token()).await
+    }
+
+    async fn generate_reports(
+        java: &Path,
+        jar: &Path,
+        stage: std::sync::Arc<tempfile::TempDir>,
+    ) -> Result<(), BootstrapError> {
+        let lifecycle = Lifecycle::new();
+        generate_reports_tracked(java, jar, stage, &lifecycle, &lifecycle.token()).await
+    }
 
     #[test]
     fn generator_manifest_requires_one_main_section_entrypoint_with_bounded_size() {
@@ -538,13 +579,24 @@ mod tests {
         let (started, running) = tokio::sync::oneshot::channel();
         let (release, released) = std::sync::mpsc::channel();
         let (completed, completion) = tokio::sync::oneshot::channel();
-        let task = tokio::spawn(preparation_task(stage, lock, move |stage| {
-            started.send(()).unwrap();
-            released.recv_timeout(Duration::from_secs(5)).unwrap();
-            let result = fs::write(stage.join("late-install.txt"), b"committed");
-            completed.send(result.is_ok()).unwrap();
-            result.map_err(BootstrapError::from)
-        }));
+        let lifecycle = Lifecycle::new();
+        let context = lifecycle.clone();
+        let task = tokio::spawn(async move {
+            preparation_task_tracked(
+                stage,
+                lock,
+                move |stage| {
+                    started.send(()).unwrap();
+                    released.recv_timeout(Duration::from_secs(5)).unwrap();
+                    let result = fs::write(stage.join("late-install.txt"), b"committed");
+                    completed.send(result.is_ok()).unwrap();
+                    result.map_err(BootstrapError::from)
+                },
+                &context,
+                &context.token(),
+            )
+            .await
+        });
         running.await.unwrap();
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
@@ -553,16 +605,21 @@ mod tests {
             second.try_lock(),
             Err(fs::TryLockError::WouldBlock)
         ));
+        let pending = lifecycle
+            .drain(tokio::time::Instant::now() + Duration::from_millis(20))
+            .await;
         release.send(()).unwrap();
         assert!(completion.await.unwrap());
-        let finished = tokio::time::Instant::now();
-        while stage_path.exists() {
-            assert!(finished.elapsed() < Duration::from_secs(3));
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        acquire_prepare_lock(&second, Duration::from_secs(3))
+        lifecycle
+            .drain(tokio::time::Instant::now() + Duration::from_secs(3))
             .await
             .unwrap();
+        assert!(matches!(
+            pending,
+            Err(lifecycle::DrainError::Deadline { .. })
+        ));
+        assert!(!stage_path.exists());
+        second.try_lock().unwrap();
     }
 
     async fn generator_fixture(main_class: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
@@ -644,7 +701,11 @@ mod tests {
                 .unwrap(),
         );
         let stage = output.path().to_owned();
-        let task = tokio::spawn(async move { generate_reports(&java, &jar, output).await });
+        let lifecycle = Lifecycle::new();
+        let context = lifecycle.clone();
+        let task = tokio::spawn(async move {
+            generate_reports_tracked(&java, &jar, output, &context, &context.token()).await
+        });
         let started = tokio::time::Instant::now();
         while !stage.join("generator.ready").is_file() {
             assert!(
@@ -662,32 +723,32 @@ mod tests {
         assert!(manifest.is_file());
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
-        let cancelled = tokio::time::Instant::now();
-        loop {
-            let alive = if cfg!(windows) {
-                let output = std::process::Command::new("tasklist")
-                    .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
-                    .output()
-                    .unwrap();
-                String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\""))
-            } else {
-                std::process::Command::new("kill")
-                    .args(["-0", &pid.to_string()])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status()
-                    .unwrap()
-                    .success()
-            };
-            if !alive && !manifest.exists() && !stage.exists() {
-                break;
-            }
-            assert!(
-                cancelled.elapsed() < Duration::from_secs(3),
-                "cancelled generator survived or retained manifest: pid={pid}, alive={alive}, manifest={}",
-                manifest.display()
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        lifecycle
+            .drain(tokio::time::Instant::now() + Duration::from_secs(3))
+            .await
+            .unwrap();
+        let alive = if cfg!(windows) {
+            let output = std::process::Command::new("tasklist")
+                .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\""))
+        } else {
+            std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        };
+        assert!(
+            !alive,
+            "lifecycle drain acknowledged before generator {pid} was reaped"
+        );
+        assert!(
+            !manifest.exists() && !stage.exists(),
+            "lifecycle drain acknowledged before generator resources were removed"
+        );
     }
 }

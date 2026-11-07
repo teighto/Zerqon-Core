@@ -54,6 +54,19 @@ jobs:
         run: cargo build -p zerqon-hello-plugin --target wasm32-unknown-unknown --release --locked
       - name: Run compiled Rust plugin
         run: cargo run -p zerqon-plugins --example verify-plugin --locked -- target/wasm32-unknown-unknown/release/zerqon_hello_plugin.wasm
+      - name: Prepare Rust native API plugin fixtures
+        shell: python
+        run: |
+          from pathlib import Path
+          import shutil
+          import subprocess
+          source = Path("target/wasm32-unknown-unknown/release/zerqon_hello_plugin.wasm")
+          fixtures = Path(".cache/rust-plugin-fixtures")
+          fixtures.mkdir(parents=True, exist_ok=True)
+          shutil.copy2(source, fixtures / "hello-abi1.wasm")
+          subprocess.run(["cargo", "build", "-p", "zerqon-hello-plugin", "--target", "wasm32-unknown-unknown", "--release", "--locked", "--features", "native-read"], check=True)
+          shutil.copy2(source, fixtures / "hello-native-read.wasm")
+          shutil.copy2(fixtures / "hello-abi1.wasm", source)
       - name: Java plugin API and host
         run: python scripts/build-java-plugins.py
       - name: Python tests
@@ -98,7 +111,7 @@ jobs:
       - name: Generate isolated vanilla world fixture
         run: python scripts/generate-test-world.py --server-jar .cache/vanilla/26.3/server.jar --directory .local/vanilla-world-filled --accept-eula
       - name: Data and plugin integration tests
-        run: cargo test --workspace --locked -- --ignored --skip measure_one_thousand_entities_on_flat_ground --skip measure_sixty_four_player_tracking_resource_cost --skip measure_small_packet_budget_cost --skip profiling::tests::real_cpu_capture_survives_cancelled_request_autosaves_stops_and_shuts_down
+        run: cargo test --workspace --locked -- --ignored --skip measure_one_thousand_entities_on_flat_ground --skip measure_sixty_four_player_tracking_resource_cost --skip measure_small_packet_budget_cost --skip measure_resumable_cpu_segment_latency --skip profiling::tests::real_cpu_capture_survives_cancelled_request_autosaves_stops_and_shuts_down
       - name: Native CPU sampler integration
         if: runner.os == 'Linux'
         shell: bash

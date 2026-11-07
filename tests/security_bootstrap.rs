@@ -1,6 +1,7 @@
 #[path = "../src/java_launch.rs"]
 #[allow(dead_code)]
 pub mod java_launch;
+#[allow(dead_code)]
 pub mod bootstrap_under_review {
     include!("../src/bootstrap.rs");
     pub fn install_fixture(
@@ -11,6 +12,7 @@ pub mod bootstrap_under_review {
     }
 }
 
+#[allow(dead_code)]
 pub mod runtime_under_review {
     include!("../src/java_runtime.rs");
     #[cfg(windows)]
@@ -30,7 +32,12 @@ pub mod runtime_under_review {
                 "release": RELEASE, "sha256": asset.sha256, "size": asset.size, "platform": asset.platform.cache_name()
             }))?,
         )?;
-        validated_cached_runtime(runtime, asset).await
+        let lifecycle = Lifecycle::new();
+        Ok(
+            validated_cached_runtime_tracked(runtime, asset, (), &lifecycle, &lifecycle.token())
+                .await?
+                .0,
+        )
     }
 }
 
@@ -169,3 +176,9 @@ async fn managed_java_rejects_library_junction_before_executing_the_launcher() {
     assert!(runtime_under_review::probe_fixture(&runtime).await.is_err());
     assert!(!runtime.join("bin/executed").exists());
 }
+#[path = "../src/lifecycle.rs"]
+#[allow(dead_code)]
+mod lifecycle;
+#[path = "../src/managed_tasks.rs"]
+#[allow(dead_code)]
+mod managed_tasks;

@@ -4,6 +4,8 @@ use std::{
     time::Duration,
 };
 use tokio::net::TcpStream;
+#[cfg(unix)]
+use tokio::time::timeout;
 use zerqon_protocol::codec::{
     get_string, get_varint, put_string, put_varint, read_frame, write_frame,
 };
@@ -35,6 +37,150 @@ impl Drop for Process {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn termination_during_startup_reaps_the_java_probe_without_publishing_readiness() {
+    struct Probe {
+        pid: u32,
+        executable: std::path::PathBuf,
+    }
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            let path = format!("/proc/{}/exe", self.pid);
+            if std::fs::read_link(path).ok().as_ref() == Some(&self.executable) {
+                let _ = Command::new("kill")
+                    .args(["-KILL", &self.pid.to_string()])
+                    .status();
+            }
+        }
+    }
+    let fixture = tempfile::tempdir().unwrap();
+    let java = fixture.path().join("java");
+    let compiler = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let compiled = Command::new(compiler)
+        .args(["--edition=2024", "-C", "debuginfo=0", "-o"])
+        .arg(&java)
+        .arg(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/startup_probe.rs"),
+        )
+        .output()
+        .unwrap();
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    for signal in ["-TERM", "-INT"] {
+        let directory = tempfile::tempdir().unwrap();
+        let binary = env!("CARGO_BIN_EXE_zerqon");
+        assert!(
+            Command::new(binary)
+                .args(["--init", "--directory"])
+                .arg(directory.path())
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        std::fs::write(directory.path().join("eula.txt"), "eula=true\n").unwrap();
+        std::fs::write(
+            directory.path().join("server.properties"),
+            "server-ip=127.0.0.1\nserver-port=0\nonline-mode=false\n",
+        )
+        .unwrap();
+        let settings = toml::Table::from_iter([
+            (
+                "java_executable".into(),
+                toml::Value::String(java.to_string_lossy().into_owned()),
+            ),
+            ("auto_download_runtime".into(), toml::Value::Boolean(false)),
+            ("java_plugins".into(), toml::Value::Boolean(false)),
+            ("update_check".into(), toml::Value::Boolean(false)),
+        ]);
+        std::fs::write(
+            directory.path().join("server.settings"),
+            toml::to_string(&settings).unwrap(),
+        )
+        .unwrap();
+        let marker = directory.path().join("probe.pid");
+        let mut child = Process(
+            Command::new(binary)
+                .args(["--directory"])
+                .arg(directory.path())
+                .args(["--no-console", "--no-color"])
+                .env("ZERQON_TEST_PROBE_PID", &marker)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let probe_pid = timeout(Duration::from_secs(10), async {
+            loop {
+                if let Ok(text) = std::fs::read_to_string(&marker)
+                    && let Ok(pid) = text.parse::<u32>()
+                {
+                    break pid;
+                }
+                assert!(
+                    child.0.try_wait().unwrap().is_none(),
+                    "server exited before probe"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("probe did not start");
+        let probe = Probe {
+            pid: probe_pid,
+            executable: java.canonicalize().unwrap(),
+        };
+        assert_eq!(
+            std::fs::read_link(format!("/proc/{probe_pid}/exe")).unwrap(),
+            probe.executable
+        );
+        assert!(
+            Command::new("kill")
+                .args([signal, &child.0.id().to_string()])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let status = timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(status) = child.0.try_wait().unwrap() {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("startup cancellation did not finish");
+        let mut output = String::new();
+        use std::io::Read;
+        child
+            .0
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut output)
+            .unwrap();
+        let orphan = std::path::Path::new(&format!("/proc/{probe_pid}")).exists();
+        assert!(
+            status.success(),
+            "{signal} bypassed startup cleanup: {status}; orphan={orphan}"
+        );
+        assert!(!orphan, "Java probe was not reaped before server exit");
+        assert!(!output.contains("Listening on "));
+        assert!(
+            !directory
+                .path()
+                .join(".cache/vanilla/26.3/prepared.json")
+                .exists()
+        );
     }
 }
 

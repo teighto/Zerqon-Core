@@ -33,9 +33,13 @@ async fn java_quit_context_failure_still_delivers_the_rust_quit_event() {
     ];
     state
         .plugins
-        .lock()
-        .unwrap()
-        .load("quit-observer", observer)
+        .load(
+            "quit-observer",
+            observer,
+            &state.lifecycle.token(),
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await
         .unwrap();
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let java = JavaPlugins::spawn_with_services(
@@ -67,12 +71,7 @@ async fn java_quit_context_failure_still_delivers_the_rust_quit_event() {
         args: Vec::new(),
     };
     assert_eq!(
-        state
-            .plugins
-            .lock()
-            .unwrap()
-            .dispatch("quit-observer", &count)
-            .unwrap(),
+        rust_actions(&state, "quit-observer", &count).await,
         [Action::Reply {
             message: "0".into()
         }]
@@ -108,12 +107,7 @@ async fn java_quit_context_failure_still_delivers_the_rust_quit_event() {
         .await;
     release.send(()).unwrap();
     holder.join().unwrap();
-    let observed = state
-        .plugins
-        .lock()
-        .unwrap()
-        .dispatch("quit-observer", &count)
-        .unwrap();
+    let observed = rust_actions(&state, "quit-observer", &count).await;
     state.java.as_ref().unwrap().shutdown().await.unwrap();
     assert!(quit.is_err(), "Java context error must remain observable");
     assert_eq!(
@@ -123,6 +117,25 @@ async fn java_quit_context_failure_still_delivers_the_rust_quit_event() {
         }],
         "Rust PlayerQuit must be delivered exactly once despite Java context failure"
     );
+}
+
+async fn rust_actions(state: &State, plugin: &str, event: &Event) -> Vec<Action> {
+    let results = state
+        .plugins
+        .dispatch(
+            event,
+            &NativeCallbackContext {
+                source: NativeSource::Console,
+            },
+            Some(plugin),
+            &state.lifecycle.token(),
+            tokio::time::Instant::now() + Duration::from_secs(2),
+        )
+        .await;
+    results
+        .into_iter()
+        .flat_map(|result| result.result.unwrap().actions().to_vec())
+        .collect()
 }
 
 async fn state() -> (tempfile::TempDir, Arc<State>) {
