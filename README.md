@@ -7,11 +7,9 @@
 <a id="english"></a>
 ## English
 
-Zerqon is a Minecraft 26.3 server written in Rust by teighto. The project focuses on memory use and splitting server work across CPU cores. Plugins can be written in Java or Rust.
+Zerqon is a Minecraft 26.3 server written in Rust. The focus is on speed, reliability and control over memory use. Plugins can be written in Java or Rust.
 
 The server keeps the familiar folder layout: worlds, logs, configuration files and a plugins folder. Java and Rust plugins can run on the same server, while players connect with their usual client.
-
-Version 0.0.1 is in development. Players can join, see each other and mobs, and keep their inventory between restarts. Java and Rust plugins run together. Existing worlds can be imported for testing, with their original spawn point. Survival, complete world transfers and full Paper support still need work.
 
 ### Paper and Zerqon
 
@@ -93,11 +91,9 @@ Put Rust `.wasm` plugins in `plugins/rust-plugins/` and Java `.jar` plugins in `
 <a id="russian"></a>
 ## Русский
 
-Zerqon, сервер Minecraft 26.3 на Rust от teighto. Работа над ядром сосредоточена на расходе памяти и распределении нагрузки между ядрами процессора. Плагины можно писать на Java и Rust.
+Zerqon, сервер Minecraft на версии 26.3, написанный на Rust. Основной упор на скорость, надёжность и контроль расхода памяти. Плагины можно писать на Java и Rust.
 
 Папки остаются привычными: миры, логи, настройки и плагины. На одном сервере можно использовать Java- и Rust-плагины. Игроки подключаются обычным клиентом.
-
-Версия 0.0.1 в разработке. Игроки видят друг друга и мобов, инвентарь сохраняется между запусками. Java- и Rust-плагины работают вместе. Готовый мир можно импортировать для проверки: исходная точка появления сохраняется. Выживание, полный перенос миров и совместимость со всем Paper API ещё дорабатываются.
 
 ### Paper и Zerqon
 
