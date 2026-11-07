@@ -40,6 +40,18 @@ fn fixture(path: &Path) {
 }
 
 #[test]
+fn configuration_brand_encodes_default_and_unicode_names_as_protocol_strings() {
+    for brand in ["zerqon", "teighto Привет 😀"] {
+        let packet = packets::configuration_brand(brand);
+        let mut body = packet.as_slice();
+        assert_eq!(get_varint(&mut body).unwrap(), 1);
+        assert_eq!(get_string(&mut body, 32767).unwrap(), "minecraft:brand");
+        assert_eq!(get_string(&mut body, 32767).unwrap(), brand);
+        assert!(body.is_empty());
+    }
+}
+
+#[test]
 fn loads_registry_ids_and_defaults_from_prepared_data() {
     let dir = tempfile::tempdir().unwrap();
     fixture(dir.path());
@@ -381,6 +393,14 @@ fn export_vanilla_decoder_fixtures() {
     let chunk = zerqon_world::Chunk::flat(-3, 5, data.flat);
     let mut fixtures = vec![
         ("known_packs".to_owned(), packets::known_packs()),
+        (
+            "brand_default".into(),
+            packets::configuration_brand("zerqon"),
+        ),
+        (
+            "brand_unicode".into(),
+            packets::configuration_brand("teighto Привет 😀"),
+        ),
         (
             "login".into(),
             packets::login(7, 20, 4, data.overworld_dimension),

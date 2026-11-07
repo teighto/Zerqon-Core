@@ -26,10 +26,13 @@ pub struct Settings {
     pub world_threads: usize,
     pub max_connections: usize,
     pub max_packet_bytes: usize,
+    pub packet_memory_mib: usize,
+    pub connection_packet_memory_mib: usize,
     pub connection_timeout_seconds: u64,
     pub chunk_cache_capacity: usize,
     pub work_queue_capacity: usize,
     pub data_directory: String,
+    pub server_brand: String,
     pub plugin_fuel: u64,
     pub plugin_memory_mib: usize,
     pub java_plugins: bool,
@@ -53,10 +56,13 @@ impl Default for Settings {
             world_threads: cpus.saturating_sub(2).clamp(1, 8),
             max_connections: 128,
             max_packet_bytes: 2_097_151,
+            packet_memory_mib: 64,
+            connection_packet_memory_mib: 2,
             connection_timeout_seconds: 30,
             chunk_cache_capacity: 256,
             work_queue_capacity: 128,
             data_directory: ".cache/vanilla/26.3".into(),
+            server_brand: "zerqon".into(),
             plugin_fuel: 1_000_000,
             plugin_memory_mib: 16,
             java_plugins: true,
@@ -91,6 +97,13 @@ impl Settings {
             ("world_threads", self.world_threads, 1, 128),
             ("max_connections", self.max_connections, 1, 65536),
             ("max_packet_bytes", self.max_packet_bytes, 1024, 2_097_151),
+            ("packet_memory_mib", self.packet_memory_mib, 1, 4096),
+            (
+                "connection_packet_memory_mib",
+                self.connection_packet_memory_mib,
+                1,
+                64,
+            ),
             ("chunk_cache_capacity", self.chunk_cache_capacity, 1, 65536),
             ("work_queue_capacity", self.work_queue_capacity, 1, 65536),
             ("plugin_memory_mib", self.plugin_memory_mib, 1, 256),
@@ -102,11 +115,26 @@ impl Settings {
                 )));
             }
         }
+        if self.connection_packet_memory_mib > self.packet_memory_mib {
+            return Err(ConfigError::Invalid(
+                "connection_packet_memory_mib must not exceed packet_memory_mib".into(),
+            ));
+        }
         if !(1..=300).contains(&self.connection_timeout_seconds)
             || !(1000..=100_000_000).contains(&self.plugin_fuel)
         {
             return Err(ConfigError::Invalid(
                 "timeout or plugin fuel outside allowed range".into(),
+            ));
+        }
+        if self.server_brand.trim().is_empty()
+            || self.server_brand.encode_utf16().take(129).count() > 128
+            || self.server_brand.chars().any(|character| {
+                character.is_control() || matches!(character, '\u{2028}' | '\u{2029}')
+            })
+        {
+            return Err(ConfigError::Invalid(
+                "server_brand must be nonempty text of at most 128 UTF-16 units without line breaks or control characters".into(),
             ));
         }
         for (name, value) in [
@@ -388,6 +416,82 @@ fn create_new(path: &Path, content: &str) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_brand_defaults_to_lowercase_zerqon_in_existing_settings() {
+        let settings: Settings = toml::from_str("network_threads=2\n").unwrap();
+        let saved: toml::Value = toml::from_str(&toml::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(
+            saved.get("server_brand").and_then(toml::Value::as_str),
+            Some("zerqon")
+        );
+    }
+
+    #[test]
+    fn server_brand_accepts_custom_unicode_text_and_rejects_invalid_labels() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("server.settings");
+        for (brand, accepted) in [
+            ("teighto • тест 🚀".to_owned(), true),
+            ("a".repeat(128), true),
+            ("🚀".repeat(64), true),
+            ("".to_owned(), false),
+            ("   ".to_owned(), false),
+            ("a".repeat(129), false),
+            ("🚀".repeat(65), false),
+            ("one\ntwo".to_owned(), false),
+            ("one\u{1b}two".to_owned(), false),
+            ("one\u{2028}two".to_owned(), false),
+        ] {
+            let value = toml::Table::from_iter([(
+                "server_brand".into(),
+                toml::Value::String(brand.clone()),
+            )]);
+            fs::write(&path, toml::to_string(&value).unwrap()).unwrap();
+            assert_eq!(Settings::load(&path).is_ok(), accepted, "brand {brand:?}");
+        }
+    }
+
+    #[test]
+    fn packet_memory_limits_have_defaults_for_existing_settings() {
+        let settings: Settings = toml::from_str("network_threads=2\n").unwrap();
+        settings.validate().unwrap();
+        let saved: toml::Value = toml::from_str(&toml::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(
+            saved
+                .get("packet_memory_mib")
+                .and_then(toml::Value::as_integer),
+            Some(64)
+        );
+        assert_eq!(
+            saved
+                .get("connection_packet_memory_mib")
+                .and_then(toml::Value::as_integer),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn packet_memory_limits_accept_consistent_budgets_and_reject_zero_or_excessive_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("server.settings");
+        for (global, connection) in [(1, 1), (64, 2), (4096, 64)] {
+            fs::write(
+                &path,
+                format!("packet_memory_mib={global}\nconnection_packet_memory_mib={connection}\n"),
+            )
+            .unwrap();
+            assert!(Settings::load(&path).is_ok(), "{global}/{connection}");
+        }
+        for (global, connection) in [(0, 1), (4097, 1), (64, 0), (64, 65), (1, 2)] {
+            fs::write(
+                &path,
+                format!("packet_memory_mib={global}\nconnection_packet_memory_mib={connection}\n"),
+            )
+            .unwrap();
+            assert!(Settings::load(&path).is_err(), "{global}/{connection}");
+        }
+    }
 
     #[test]
     fn client_profile_flags_roundtrip_independently_including_closed_admission() {

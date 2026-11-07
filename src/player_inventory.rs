@@ -326,12 +326,27 @@ impl InventoryHandle {
         })
         .await?
     }
-    pub async fn apply_packet(
+    pub async fn apply_inbound_packet(
         &self,
         id: i32,
-        body: &[u8],
+        packet: zerqon_protocol::inbound::InboundPacket,
+        body_offset: usize,
         policy: InventoryPolicy,
     ) -> Result<PacketBatch, InventoryServiceError> {
+        self.apply_owned_packet(id, packet, body_offset, policy)
+            .await
+    }
+
+    async fn apply_owned_packet<B: std::ops::Deref<Target = [u8]> + Send + 'static>(
+        &self,
+        id: i32,
+        packet: B,
+        body_offset: usize,
+        policy: InventoryPolicy,
+    ) -> Result<PacketBatch, InventoryServiceError> {
+        let body = packet
+            .get(body_offset..)
+            .ok_or(InventoryServiceError::Limit("inventory packet offset"))?;
         if body.len() > 65_536 {
             return Err(InventoryServiceError::Limit("inventory packet bytes"));
         }
@@ -340,16 +355,17 @@ impl InventoryHandle {
                 "unsupported inventory packet",
             ));
         }
-        let body = body.to_vec();
         self.service
             .change(Arc::clone(&self.session), move |inventory, catalog| {
+                let body = packet
+                    .get(body_offset..)
+                    .ok_or(InventoryServiceError::Limit("inventory packet offset"))?;
                 if !policy.can_interact {
                     return Err(zerqon_inventory::InventoryError::InteractionDenied.into());
                 }
                 match id {
                     57 => {
-                        let request =
-                            decode_creative_slot(&body, catalog, DecodeLimits::default())?;
+                        let request = decode_creative_slot(body, catalog, DecodeLimits::default())?;
                         inventory.creative_set(
                             catalog,
                             &request,
@@ -360,10 +376,10 @@ impl InventoryHandle {
                         )?;
                     }
                     54 => {
-                        inventory.select_hotbar(i16::from(decode_carried_slot(&body)?))?;
+                        inventory.select_hotbar(i16::from(decode_carried_slot(body)?))?;
                     }
                     18 => {
-                        let request = decode_click(&body, catalog, DecodeLimits::default())?;
+                        let request = decode_click(body, catalog, DecodeLimits::default())?;
                         inventory.click(
                             catalog,
                             &request,
@@ -530,6 +546,17 @@ mod tests {
         PlayerInventory, ValidatedPatch, encode_creative_slot_body,
     };
 
+    impl InventoryHandle {
+        async fn apply_packet(
+            &self,
+            id: i32,
+            body: &[u8],
+            policy: InventoryPolicy,
+        ) -> Result<PacketBatch, InventoryServiceError> {
+            self.apply_owned_packet(id, body.to_vec(), 0, policy).await
+        }
+    }
+
     fn catalog() -> Arc<ItemCatalog> {
         Arc::new(
             ItemCatalog::from_definitions(
@@ -588,6 +615,136 @@ mod tests {
             can_interact: true,
             allow_drops: false,
         }
+    }
+
+    #[tokio::test]
+    async fn rejected_inventory_frames_release_memory_without_changing_saved_data() {
+        use zerqon_protocol::{
+            codec::write_frame,
+            inbound::{PacketBudget, read_frame_budgeted},
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let uuid = Uuid::from_u128(29);
+        let players = Players::new(2, 64.0, 159, Arc::new(EntityIds::default()));
+        let (player, _receiver) = reserve(&players, uuid);
+        let service = InventoryService::new(
+            directory.path().into(),
+            catalog(),
+            players,
+            2,
+            Arc::new(RwLock::new(())),
+        )
+        .unwrap();
+        let handle = service.open(uuid, player.id()).await.unwrap();
+        let global = PacketBudget::new(64).unwrap();
+        let account = global.connection(64).unwrap();
+        for (id, offset, selected, allowed) in [
+            (255, 1, 3, true),
+            (54, 4, 3, true),
+            (54, 1, 9, true),
+            (54, 1, 3, false),
+        ] {
+            let mut wire = Vec::new();
+            write_frame(&mut wire, &[54, 0, selected], None)
+                .await
+                .unwrap();
+            let packet = read_frame_budgeted(&mut wire.as_slice(), 64, None, &account)
+                .await
+                .unwrap();
+            assert_eq!(account.snapshot().used_bytes, 3);
+            let policy = InventoryPolicy {
+                can_interact: allowed,
+                ..policy()
+            };
+            assert!(
+                handle
+                    .apply_inbound_packet(id, packet, offset, policy)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(account.snapshot().used_bytes, 0);
+            assert_eq!(global.snapshot().used_bytes, 0);
+            assert!(!directory.path().join(format!("{uuid}.zinv")).exists());
+            assert_eq!(
+                handle
+                    .session
+                    .inventory
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .selected(),
+                0
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_inventory_work_keeps_inbound_memory_after_its_caller_is_cancelled() {
+        use zerqon_protocol::{
+            codec::write_frame,
+            inbound::{PacketBudget, read_frame_budgeted},
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let uuid = Uuid::from_u128(27);
+        let players = Players::new(2, 64.0, 159, Arc::new(EntityIds::default()));
+        let (player, _receiver) = reserve(&players, uuid);
+        let service = InventoryService::new(
+            directory.path().into(),
+            catalog(),
+            players,
+            2,
+            Arc::new(RwLock::new(())),
+        )
+        .unwrap();
+        let handle = Arc::new(service.open(uuid, player.id()).await.unwrap());
+        let global = PacketBudget::new(64).unwrap();
+        let account = global.connection(64).unwrap();
+        let mut wire = Vec::new();
+        write_frame(&mut wire, &[54, 0, 3], None).await.unwrap();
+        let packet = read_frame_budgeted(&mut wire.as_slice(), 64, None, &account)
+            .await
+            .unwrap();
+        let stripes = Arc::clone(&service.stripes);
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _guard = stripes[stripe(uuid)].lock().unwrap();
+            held_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_secs(5));
+        });
+        held_rx.await.unwrap();
+        let pending_handle = Arc::clone(&handle);
+        let pending = tokio::spawn(async move {
+            pending_handle
+                .apply_inbound_packet(54, packet, 1, policy())
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while service.inflight.available_permits() == 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        pending.abort();
+        assert!(pending.await.unwrap_err().is_cancelled());
+        let retained_bytes = account.snapshot().used_bytes;
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while service.inflight.available_permits() != 2 || account.snapshot().used_bytes != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(service.store.load(uuid).unwrap().selected(), 3);
+        assert_eq!(
+            retained_bytes, 3,
+            "accepted worker lost the inbound packet reservation"
+        );
+        assert_eq!(global.snapshot().used_bytes, 0);
     }
 
     #[tokio::test]

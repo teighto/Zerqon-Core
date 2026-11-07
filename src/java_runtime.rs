@@ -283,15 +283,28 @@ async fn validated_cached_runtime(
     runtime: &Path,
     asset: Asset,
 ) -> Result<PathBuf, JavaRuntimeError> {
+    let (java, ()) = validated_cached_runtime_with_owner(runtime, asset, ()).await?;
+    Ok(java)
+}
+
+async fn validated_cached_runtime_with_owner<T: Send + 'static>(
+    runtime: &Path,
+    asset: Asset,
+    owner: T,
+) -> Result<(PathBuf, T), JavaRuntimeError> {
     let checked = runtime.to_owned();
-    tokio::task::spawn_blocking(move || validate_cached_files(&checked, asset)).await??;
+    let owner = tokio::task::spawn_blocking(move || {
+        validate_cached_files(&checked, asset)?;
+        Ok::<_, JavaRuntimeError>(owner)
+    })
+    .await??;
     let binary = runtime.join("bin").join(asset.platform.executable());
     reject_runtime_links(&binary)?;
     let binary = binary.canonicalize()?;
     if !binary.starts_with(runtime.canonicalize()?) {
         return Err(invalid("managed Java binary is outside the runtime cache"));
     }
-    let resolved = probe_java(&binary).await?;
+    let (resolved, owner) = probe_java_with_owner(&binary, owner).await?;
     if !resolved
         .canonicalize()?
         .starts_with(runtime.canonicalize()?)
@@ -300,7 +313,7 @@ async fn validated_cached_runtime(
             "managed Java executable resolved outside its cache",
         ));
     }
-    Ok(resolved)
+    Ok((resolved, owner))
 }
 
 fn validate_cached_files(runtime: &Path, asset: Asset) -> Result<(), JavaRuntimeError> {
@@ -340,7 +353,8 @@ async fn install_managed(cache: &Path, asset: Asset) -> Result<PathBuf, JavaRunt
     acquire_install_lock(&lock, Duration::from_secs(600)).await?;
     let runtime = directory.join(ARCHIVE_ROOT);
     if runtime.try_exists()? {
-        return validated_cached_runtime(&runtime, asset).await;
+        let (java, _lock) = validated_cached_runtime_with_owner(&runtime, asset, lock).await?;
+        return Ok(java);
     }
     tracing::info!(
         "Downloading Eclipse Temurin Java 25.0.5+8 for {} into the local cache",
@@ -356,15 +370,41 @@ async fn install_managed(cache: &Path, asset: Asset) -> Result<PathBuf, JavaRunt
         .tempdir_in(&directory)?;
     let output = staging.path().join("runtime");
     fs::create_dir(&output)?;
-    let archive_path = archive.path().to_owned();
-    let output_path = output.clone();
-    tokio::task::spawn_blocking(move || {
-        extract_archive(&archive_path, &output_path, asset.platform)?;
-        validate_runtime_tree(&output_path, asset, false)
+    finish_installation(
+        Installation {
+            archive,
+            stage: staging,
+            runtime,
+            _lock: lock,
+        },
+        asset,
+        extract_archive,
+    )
+    .await
+}
+
+struct Installation {
+    archive: tempfile::NamedTempFile,
+    stage: tempfile::TempDir,
+    runtime: PathBuf,
+    _lock: File,
+}
+
+async fn finish_installation(
+    installation: Installation,
+    asset: Asset,
+    extract: impl FnOnce(&Path, &Path, Platform) -> Result<(), JavaRuntimeError> + Send + 'static,
+) -> Result<PathBuf, JavaRuntimeError> {
+    let installation = tokio::task::spawn_blocking(move || {
+        let output = installation.stage.path().join("runtime");
+        extract(installation.archive.path(), &output, asset.platform)?;
+        validate_runtime_tree(&output, asset, false)?;
+        Ok::<_, JavaRuntimeError>(installation)
     })
     .await??;
+    let output = installation.stage.path().join("runtime");
     let executable = output.join("bin").join(asset.platform.executable());
-    probe_java(&executable).await?;
+    let (_, installation) = probe_java_with_owner(&executable, installation).await?;
     let mut marker = fs::OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -372,15 +412,23 @@ async fn install_managed(cache: &Path, asset: Asset) -> Result<PathBuf, JavaRunt
     marker.write_all(&serde_json::to_vec_pretty(&json!({"release":RELEASE,"sha256":asset.sha256,"size":asset.size,"platform":asset.platform.cache_name(),"source":"Eclipse Adoptium"}))?)?;
     marker.sync_all()?;
     drop(marker);
-    if runtime.try_exists()? {
+    if installation.runtime.try_exists()? {
         return Err(invalid(
             "runtime destination appeared during installation; existing files were preserved",
         ));
     }
-    fs::rename(&output, &runtime)?;
+    fs::rename(&output, &installation.runtime)?;
     #[cfg(unix)]
-    File::open(&directory)?.sync_all()?;
-    let java = validated_cached_runtime(&runtime, asset).await?;
+    File::open(
+        installation
+            .runtime
+            .parent()
+            .ok_or_else(|| invalid("runtime destination has no parent"))?,
+    )?
+    .sync_all()?;
+    let runtime = installation.runtime.clone();
+    let (java, _installation) =
+        validated_cached_runtime_with_owner(&runtime, asset, installation).await?;
     tracing::info!("Managed Java 25 is ready at {}", java.display());
     Ok(java)
 }
@@ -1064,6 +1112,35 @@ fn parse_probe(text: &str) -> Result<PathBuf, JavaRuntimeError> {
         .join(if cfg!(windows) { "java.exe" } else { "java" }))
 }
 async fn probe_java(executable: &Path) -> Result<PathBuf, JavaRuntimeError> {
+    let (java, ()) = probe_java_with_owner(executable, ()).await?;
+    Ok(java)
+}
+
+async fn probe_java_with_owner<T: Send + 'static>(
+    executable: &Path,
+    owner: T,
+) -> Result<(PathBuf, T), JavaRuntimeError> {
+    let executable = executable.to_owned();
+    let (cancel, cancelled) = tokio::sync::oneshot::channel::<()>();
+    let task = tokio::spawn(async move {
+        let java = run_probe(&executable, cancelled).await?;
+        Ok::<_, JavaRuntimeError>((java, owner))
+    });
+    let result = task.await?;
+    drop(cancel);
+    result
+}
+
+async fn run_probe(
+    executable: &Path,
+    mut cancelled: tokio::sync::oneshot::Receiver<()>,
+) -> Result<PathBuf, JavaRuntimeError> {
+    if !matches!(
+        cancelled.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ) {
+        return Err(invalid("Java runtime probe cancelled"));
+    }
     let mut child = tokio::process::Command::new(executable)
         .args([
             "-Dfile.encoding=UTF-8",
@@ -1077,11 +1154,11 @@ async fn probe_java(executable: &Path) -> Result<PathBuf, JavaRuntimeError> {
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| invalid("Java probe has no stderr"))?;
-    let result = tokio::time::timeout(Duration::from_secs(15), async {
+    let run = async {
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| invalid("Java probe has no stderr"))?;
         let mut bytes = Vec::new();
         stderr.take(65537).read_to_end(&mut bytes).await?;
         if bytes.len() > 65536 {
@@ -1098,19 +1175,22 @@ async fn probe_java(executable: &Path) -> Result<PathBuf, JavaRuntimeError> {
             return Err(invalid("Java reported a nonexistent runtime executable"));
         }
         Ok(resolved)
-    })
-    .await;
-    match result {
-        Ok(Ok(path)) => Ok(path),
-        Ok(Err(error)) => {
-            let _ = child.kill().await;
-            Err(error)
-        }
-        Err(_) => {
-            child.kill().await?;
-            Err(invalid("Java runtime probe timed out"))
-        }
+    };
+    let result = tokio::select! {
+        biased;
+        _ = &mut cancelled => Err(invalid("Java runtime probe cancelled")),
+        result = tokio::time::timeout(Duration::from_secs(15), run) => {
+            result.unwrap_or_else(|_| Err(invalid("Java runtime probe timed out")))
+        },
+    };
+    if child.try_wait()?.is_none()
+        && let Err(error) = child.kill().await
+    {
+        tracing::warn!(kind = ?error.kind(), "Java probe termination failed; waiting for child exit");
+        child.wait().await?;
+        return Err(error.into());
     }
+    result
 }
 fn read_limited(path: &Path, limit: u64) -> Result<Vec<u8>, JavaRuntimeError> {
     let file = File::open(path)?;

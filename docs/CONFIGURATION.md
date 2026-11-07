@@ -57,10 +57,13 @@ This file uses TOML. Missing keys use defaults; unknown keys are errors.
 | `world_threads` | CPU count minus 2, clamped to 1–8 | 1–128 chunk workers |
 | `max_connections` | `128` | 1–65,536 accepted network connections; must be at least `max-players` |
 | `max_packet_bytes` | `2097151` | 1,024–2,097,151 frame/decompression bound |
+| `packet_memory_mib` | `64` | 1–4,096 MiB for received packet buffers across all connections |
+| `connection_packet_memory_mib` | `2` | 1–64 MiB for one connection; cannot exceed `packet_memory_mib` |
 | `connection_timeout_seconds` | `30` | 1–300 seconds |
 | `chunk_cache_capacity` | `256` | 1–65,536 cached chunks; the cache also has a 256 MiB byte bound |
 | `work_queue_capacity` | `128` | 1–65,536 queued world jobs |
 | `data_directory` | `.cache/vanilla/26.3` | Prepared official game data |
+| `server_brand` | `zerqon` | Server name shown in the client's F3 screen; nonempty text, at most 128 UTF-16 units, no line breaks or control characters |
 | `plugin_fuel` | `1000000` | 1,000–100,000,000 WASM fuel units per event |
 | `plugin_memory_mib` | `16` | 1–256 MiB WASM linear memory per plugin |
 | `java_plugins` | `true` | Enable the optional host when Java JAR plugins are present |
@@ -75,13 +78,15 @@ This file uses TOML. Missing keys use defaults; unknown keys are errors.
 
 Set the bind address and port in `server.properties`, and thread counts in `server.settings`. These values have no command-line overrides. WASM memory limits cover linear memory, and the chunk byte bound covers the cache; neither is a process-wide RAM cap. The optional Java plugin host has a separate 128 MiB heap limit.
 
+The packet-memory limits cover received buffers until those buffers are freed. Queued inventory decoding keeps its buffer counted even if the player disconnects. A connection closes when another packet would exceed either limit. These settings do not limit total process RAM. Incoming frames and decoded payloads are also limited to the smaller of `max_packet_bytes` and 64 KiB.
+
 The update checker runs in the background, starting with one check at startup. It uses no GitHub token, skips drafts and prereleases, and downloads no software. New-version notices appear once in the console and once per operator session and version, in English, with the GitHub release link. Failed checks back off; status-only mode never starts the checker. Set `update_check = false` to disable all update-check requests.
 
 ## Client connections
 
 Both client settings are enabled by default. Set `allow_java_clients = false` to require the Horizon connection profile, or `allow_horizon_clients = false` to refuse that profile. Setting both to `false` closes player admission; server-list status remains available.
 
-Horizon initially reports the same brand as vanilla, so Zerqon checks its supported configuration exchange before allowing entry. This identifies a connection profile, not the language or authenticity of the client. A modified client can imitate or hide the response. These settings do not grant permissions or replace `online-mode` account authentication. Zerqon's server brand stays unchanged.
+Horizon initially reports the same brand as vanilla, so Zerqon checks its supported configuration exchange before allowing entry. This identifies a connection profile, not the language or authenticity of the client. A modified client can imitate or hide the response. These settings do not grant permissions or replace `online-mode` account authentication. The F3 server name is set separately with `server_brand`.
 
 The exchange does not install or load mods. A Horizon response containing shared content mods is rejected because Zerqon does not support their additional registries. Server plugins stay in the existing Java and Rust plugin directories. Standard clients proceed at the usual configuration response, without an additional timeout wait.
 
@@ -113,9 +118,13 @@ Players currently use Creative mode. Ordinary blocks, logs, dry slabs and stairs
 
 ## Русский
 
+`server_brand = "zerqon"` задаёт название сервера в F3. Можно указать свой текст, например `server_brand = "teighto"`, и перезапустить сервер. Допускаются кириллица и эмодзи; пустая строка, переносы строк и управляющие символы запрещены. Предел длины, как в Java, составляет 128 единиц UTF-16.
+
+`packet_memory_mib = 64` ограничивает память входящих пакетов на весь сервер, `connection_packet_memory_mib = 2` задаёт лимит одного соединения. Значения указываются в МиБ; общий предел допускает 1–4096, предел соединения 1–64 и не может быть больше общего. Буфер учитывается до его освобождения. Отключение игрока не снимает учёт с буфера, который ещё ждёт разбора в очереди инвентаря. При превышении лимита соединение закрывается. Это не ограничение всей оперативной памяти процесса. Размер входящего пакета после распаковки также не превышает меньшее из `max_packet_bytes` и 64 КиБ.
+
 `allow_java_clients` и `allow_horizon_clients` по умолчанию включены. Первый разрешает обычный профиль подключения Java Edition, второй — профиль Horizon. Если выключить оба, вход игроков будет закрыт, но сервер останется виден в списке серверов.
 
-Horizon сначала сообщает тот же бренд, что и vanilla, поэтому сервер проверяет его ответ при подключении. Это проверка совместимого профиля: язык программы и подлинность клиента она не доказывает. Изменённый клиент может скрыть или повторить такой ответ. Права игроков и проверка аккаунта через `online-mode` от этих настроек не зависят; бренд Zerqon не меняется.
+Horizon сначала сообщает тот же бренд, что и vanilla, поэтому сервер проверяет его ответ при подключении. Это проверка совместимого профиля: язык программы и подлинность клиента она не доказывает. Изменённый клиент может скрыть или повторить такой ответ. Права игроков и проверка аккаунта через `online-mode` от этих настроек не зависят. Название для F3 задаётся отдельно в `server_brand`.
 
 Моды при этом не загружаются. Если Horizon сообщает о модах с общим игровым содержимым, подключение отклоняется: их дополнительные реестры пока не поддерживаются. Серверные плагины по-прежнему находятся в папках Java- и Rust-плагинов. Для обычного клиента дополнительного ожидания при входе нет.
 

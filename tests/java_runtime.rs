@@ -17,6 +17,12 @@ mod tests {
                 std::fs::write(home.join("executed"), b"yes").unwrap();
                 let mode = std::fs::read_to_string(home.join("probe-mode")).unwrap();
                 if mode == "exit" { std::process::exit(2); }
+                if mode == "wait" {
+                    let alive = std::fs::OpenOptions::new().create(true).truncate(false).read(true).write(true).open(home.join("alive.lock")).unwrap();
+                    alive.lock().unwrap();
+                    std::fs::write(home.join("probe.pid"), std::process::id().to_string()).unwrap();
+                    loop { std::thread::sleep(std::time::Duration::from_millis(10)); }
+                }
                 eprintln!("java.home = {}", home.display());
                 eprintln!("java.specification.version = {}", if mode == "old" { "21" } else { "25" });
             }"#).unwrap();
@@ -1070,5 +1076,359 @@ mod tests {
             .await
             .unwrap();
         release.await.unwrap();
+    }
+
+    fn installation_fixture(directory: &Path, archive_bytes: &[u8]) -> Installation {
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(directory.join("install.lock"))
+            .unwrap();
+        lock.try_lock().unwrap();
+        let mut archive = tempfile::NamedTempFile::new_in(directory).unwrap();
+        archive.write_all(archive_bytes).unwrap();
+        let stage = tempfile::Builder::new()
+            .prefix("install-")
+            .tempdir_in(directory)
+            .unwrap();
+        fs::create_dir(stage.path().join("runtime")).unwrap();
+        Installation {
+            archive,
+            stage,
+            runtime: directory.join(ARCHIVE_ROOT),
+            _lock: lock,
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_install_keeps_worker_files_and_lock_until_extraction_finishes() {
+        let directory = tempfile::tempdir().unwrap();
+        let installation = installation_fixture(directory.path(), b"invalid archive");
+        let archive = installation.archive.path().to_owned();
+        let stage = installation.stage.path().to_owned();
+        let runtime = installation.runtime.clone();
+        let waiter = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(directory.path().join("install.lock"))
+            .unwrap();
+        let (started, running) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let task = tokio::spawn(finish_installation(
+            installation,
+            current_asset().unwrap(),
+            move |archive, output, platform| {
+                started.send(()).unwrap();
+                released.recv_timeout(Duration::from_secs(5)).unwrap();
+                extract_archive(archive, output, platform)
+            },
+        ));
+        running.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let lock_held = matches!(waiter.try_lock(), Err(std::fs::TryLockError::WouldBlock));
+        let archive_retained = archive.is_file();
+        let stage_retained = stage.is_dir();
+        release.send(()).unwrap();
+        acquire_install_lock(&waiter, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(
+            lock_held,
+            "cancelled installer released an active worker's lock"
+        );
+        assert!(
+            archive_retained,
+            "cancelled installer removed the active archive"
+        );
+        assert!(
+            stage_retained,
+            "cancelled installer removed the active stage"
+        );
+        assert!(!archive.exists());
+        assert!(!stage.exists());
+        assert!(!runtime.exists());
+    }
+
+    #[test]
+    fn cancelled_queued_install_retains_its_guards_until_the_worker_exits() {
+        use std::future::Future;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        let (started, running) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let blocker = runtime.spawn_blocking(move || {
+            started.send(()).unwrap();
+            released.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        running.recv_timeout(Duration::from_secs(5)).unwrap();
+        runtime.block_on(async {
+            let directory = tempfile::tempdir().unwrap();
+            let installation = installation_fixture(directory.path(), b"invalid archive");
+            let archive = installation.archive.path().to_owned();
+            let stage = installation.stage.path().to_owned();
+            let waiter = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(directory.path().join("install.lock"))
+                .unwrap();
+            let mut task = Box::pin(finish_installation(
+                installation,
+                current_asset().unwrap(),
+                extract_archive,
+            ));
+            std::future::poll_fn(|cx| {
+                assert!(task.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            drop(task);
+            let lock_held = matches!(waiter.try_lock(), Err(std::fs::TryLockError::WouldBlock));
+            let inputs_retained = archive.is_file() && stage.is_dir();
+            release.send(()).unwrap();
+            blocker.await.unwrap();
+            acquire_install_lock(&waiter, Duration::from_secs(5))
+                .await
+                .unwrap();
+            assert!(lock_held, "queued installation lost its cache lock");
+            assert!(inputs_retained, "queued installation lost its input guards");
+            assert!(!archive.exists() && !stage.exists());
+            assert!(!directory.path().join(ARCHIVE_ROOT).exists());
+        });
+    }
+
+    fn official_installation(directory: &Path) -> Installation {
+        let asset = current_asset().unwrap();
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join(match asset.platform {
+            Platform::WindowsX64 => ".local/adoptium-windows25.zip",
+            Platform::LinuxX64 => ".local/adoptium-linux25.tar.gz",
+        });
+        let mut input = File::open(source).unwrap();
+        assert_eq!(input.metadata().unwrap().len(), asset.size);
+        let mut installation = installation_fixture(directory, b"");
+        let mut digest = Context::new(&SHA256);
+        let mut buffer = [0; 65_536];
+        loop {
+            let count = input.read(&mut buffer).unwrap();
+            if count == 0 {
+                break;
+            }
+            installation.archive.write_all(&buffer[..count]).unwrap();
+            digest.update(&buffer[..count]);
+        }
+        assert_eq!(hex(digest.finish().as_ref()), asset.sha256);
+        installation
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires the pinned official Windows/Linux JRE archive fixture"]
+    async fn cancelled_genuine_runtime_extraction_cleans_only_after_worker_completion() {
+        let directory = tempfile::tempdir().unwrap();
+        let installation = official_installation(directory.path());
+        let archive = installation.archive.path().to_owned();
+        let stage = installation.stage.path().to_owned();
+        let waiter = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(directory.path().join("install.lock"))
+            .unwrap();
+        let (started, running) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let (extracted, extraction) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(finish_installation(
+            installation,
+            current_asset().unwrap(),
+            move |archive, output, platform| {
+                started.send(()).unwrap();
+                released.recv_timeout(Duration::from_secs(5)).unwrap();
+                let result = extract_archive(archive, output, platform);
+                extracted.send(result.is_ok()).unwrap();
+                result
+            },
+        ));
+        running.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let held = matches!(waiter.try_lock(), Err(std::fs::TryLockError::WouldBlock));
+        let inputs_retained = archive.is_file() && stage.is_dir();
+        release.send(()).unwrap();
+        assert!(
+            extraction.await.unwrap(),
+            "genuine archive extraction failed after cancellation"
+        );
+        acquire_install_lock(&waiter, Duration::from_secs(15))
+            .await
+            .unwrap();
+        assert!(held && inputs_retained);
+        assert!(!archive.exists() && !stage.exists());
+        assert!(!directory.path().join(ARCHIVE_ROOT).exists());
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires the pinned official Windows/Linux JRE archive fixture"]
+    async fn genuine_runtime_installation_publishes_only_a_verified_cache() {
+        let directory = tempfile::tempdir().unwrap();
+        let installation = official_installation(directory.path());
+        let archive = installation.archive.path().to_owned();
+        let stage = installation.stage.path().to_owned();
+        let runtime = installation.runtime.clone();
+        let java = finish_installation(installation, current_asset().unwrap(), extract_archive)
+            .await
+            .unwrap();
+        assert!(
+            java.canonicalize()
+                .unwrap()
+                .starts_with(runtime.canonicalize().unwrap()),
+            "Java executable is outside the verified runtime: {}",
+            java.display()
+        );
+        validate_cached_files(&runtime, current_asset().unwrap()).unwrap();
+        assert!(!archive.exists() && !stage.exists());
+        let waiter = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(directory.path().join("install.lock"))
+            .unwrap();
+        waiter.try_lock().unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires the pinned official Windows/Linux JRE archive fixture"]
+    async fn installation_never_replaces_an_existing_verified_runtime() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = official_fixture(directory.path());
+        let marker = fs::read(runtime.join("zerqon-runtime.json")).unwrap();
+        let installation = official_installation(runtime.parent().unwrap());
+        let stage = installation.stage.path().to_owned();
+        let archive = installation.archive.path().to_owned();
+        let error = finish_installation(installation, current_asset().unwrap(), extract_archive)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("destination appeared"));
+        assert_eq!(
+            fs::read(runtime.join("zerqon-runtime.json")).unwrap(),
+            marker
+        );
+        validate_cached_files(&runtime, current_asset().unwrap()).unwrap();
+        assert!(!archive.exists() && !stage.exists());
+    }
+
+    #[test]
+    #[ignore = "Requires the pinned official Windows/Linux JRE archive fixture"]
+    fn cancelled_cached_install_retains_lock_until_queued_validation_finishes() {
+        use std::future::Future;
+        let directory = tempfile::tempdir().unwrap();
+        let cached = official_fixture(directory.path());
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        let (started, running) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let blocker = executor.spawn_blocking(move || {
+            started.send(()).unwrap();
+            released.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        running.recv_timeout(Duration::from_secs(5)).unwrap();
+        executor.block_on(async {
+            let mut task = Box::pin(install_managed(directory.path(), current_asset().unwrap()));
+            std::future::poll_fn(|cx| {
+                assert!(task.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            drop(task);
+            let waiter = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(cached.parent().unwrap().join("install.lock"))
+                .unwrap();
+            let held = matches!(waiter.try_lock(), Err(std::fs::TryLockError::WouldBlock));
+            release.send(()).unwrap();
+            blocker.await.unwrap();
+            acquire_install_lock(&waiter, Duration::from_secs(5))
+                .await
+                .unwrap();
+            assert!(
+                held,
+                "cancelled cache validation released its install lock while queued"
+            );
+        });
+        validate_cached_files(&cached, current_asset().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_probe_does_not_spawn_after_its_awaiter_is_gone() {
+        let directory = tempfile::tempdir().unwrap();
+        let (cancel, cancelled) = tokio::sync::oneshot::channel();
+        drop(cancel);
+        assert!(matches!(
+            run_probe(&directory.path().join("absent-java"), cancelled).await,
+            Err(JavaRuntimeError::Invalid(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancelled_java_probe_reaps_its_child_before_releasing_installation_resources() {
+        let directory = tempfile::tempdir().unwrap();
+        let fake = cached_probe_fixture(&directory.path().join("probe"), "wait");
+        let executable = fake
+            .join("bin")
+            .join(current_asset().unwrap().platform.executable());
+        let installation = installation_fixture(directory.path(), b"archive retained for probe");
+        let archive = installation.archive.path().to_owned();
+        let stage = installation.stage.path().to_owned();
+        let waiter = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(directory.path().join("install.lock"))
+            .unwrap();
+        let task =
+            tokio::spawn(async move { probe_java_with_owner(&executable, installation).await });
+        let pid: u32 = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(text) = fs::read_to_string(fake.join("probe.pid"))
+                    && let Ok(pid) = text.parse()
+                {
+                    break pid;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let child_lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(fake.join("alive.lock"))
+            .unwrap();
+        assert!(matches!(
+            child_lock.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        task.abort();
+        match task.await {
+            Err(error) => assert!(error.is_cancelled()),
+            Ok(_) => panic!("stalled Java probe completed before cancellation"),
+        }
+        acquire_install_lock(&waiter, Duration::from_secs(5))
+            .await
+            .unwrap();
+        child_lock.try_lock().unwrap();
+        #[cfg(target_os = "linux")]
+        assert!(
+            !Path::new("/proc").join(pid.to_string()).exists(),
+            "Java child was not reaped"
+        );
+        #[cfg(not(target_os = "linux"))]
+        let _ = pid;
+        assert!(!archive.exists() && !stage.exists());
+        assert!(!directory.path().join(ARCHIVE_ROOT).exists());
     }
 }

@@ -18,6 +18,13 @@ pub fn known_packs() -> Vec<u8> {
     out
 }
 
+pub fn configuration_brand(brand: &str) -> Vec<u8> {
+    let mut out = vec![1];
+    put_string("minecraft:brand", &mut out);
+    put_string(brand, &mut out);
+    out
+}
+
 pub fn login(entity_id: i32, max_players: i32, view_distance: i32, dimension_type: i32) -> Vec<u8> {
     let mut out = vec![50];
     out.extend_from_slice(&entity_id.to_be_bytes());

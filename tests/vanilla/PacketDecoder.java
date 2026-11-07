@@ -8,6 +8,7 @@ import io.netty.buffer.Unpooled;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import net.minecraft.SharedConstants;
 import net.minecraft.core.HolderLookup;
@@ -18,7 +19,10 @@ import net.minecraft.core.RegistryAccess;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.data.registries.VanillaRegistries;
 import net.minecraft.network.RegistryFriendlyByteBuf;
+import net.minecraft.network.FriendlyByteBuf;
 import net.minecraft.network.codec.StreamCodec;
+import net.minecraft.network.protocol.common.ClientboundCustomPayloadPacket;
+import net.minecraft.network.protocol.common.custom.BrandPayload;
 import net.minecraft.network.protocol.game.ClientboundLevelChunkWithLightPacket;
 import net.minecraft.network.protocol.game.ClientboundLoginPacket;
 import net.minecraft.network.protocol.game.ClientboundSystemChatPacket;
@@ -83,6 +87,10 @@ public final class PacketDecoder {
     }
 
     private static String packetClass(String name, int id) {
+        if (name.equals("brand_default") || name.equals("brand_unicode")) {
+            require(id == 1, "Configuration custom payload packet ID");
+            return "common.ClientboundCustomPayloadPacket";
+        }
         if (name.equals("known_packs")) return "configuration.ClientboundSelectKnownPacks";
         if (name.startsWith("configuration_")) return switch (id) {
             case 3 -> "configuration.ClientboundFinishConfigurationPacket";
@@ -150,13 +158,32 @@ public final class PacketDecoder {
         int checked = 0;
         for (var fixture : manifest) {
             String name = fixture.getAsString();
-            var buffer = new RegistryFriendlyByteBuf(Unpooled.wrappedBuffer(Files.readAllBytes(fixtures.resolve(name + ".bin"))), registries);
+            byte[] fixtureBytes = Files.readAllBytes(fixtures.resolve(name + ".bin"));
+            var buffer = new RegistryFriendlyByteBuf(Unpooled.wrappedBuffer(fixtureBytes), registries);
             try {
                 int id = buffer.readVarInt();
                 Class<?> type = Class.forName("net.minecraft.network.protocol." + packetClass(name, id));
-                var codec = (StreamCodec<RegistryFriendlyByteBuf, ?>) type.getField("STREAM_CODEC").get(null);
+                String codecField = name.startsWith("brand_") ? "CONFIG_STREAM_CODEC" : "STREAM_CODEC";
+                var codec = (StreamCodec<RegistryFriendlyByteBuf, ?>) type.getField(codecField).get(null);
                 Object packet = codec.decode(buffer);
                 require(!buffer.isReadable(), name + " has trailing bytes");
+                if (packet instanceof ClientboundCustomPayloadPacket custom) {
+                    require(custom.payload() instanceof BrandPayload, "Original codec must recognize the brand payload");
+                    BrandPayload brand = (BrandPayload) custom.payload();
+                    String expected = name.equals("brand_default") ? "zerqon" : "teighto Привет 😀";
+                    require(brand.type().id().toString().equals("minecraft:brand"), "Server brand channel");
+                    require(brand.brand().equals(expected), "Server brand text and case preservation");
+                    var encoded = new FriendlyByteBuf(Unpooled.buffer());
+                    try {
+                        encoded.writeVarInt(id);
+                        ClientboundCustomPayloadPacket.CONFIG_STREAM_CODEC.encode(encoded, custom);
+                        byte[] roundTrip = new byte[encoded.readableBytes()];
+                        encoded.readBytes(roundTrip);
+                        require(Arrays.equals(fixtureBytes, roundTrip), "Original brand codec byte-for-byte round trip");
+                    } finally {
+                        encoded.release();
+                    }
+                }
                 if (packet instanceof ClientboundLevelChunkWithLightPacket chunk) checkChunk(chunk, registries);
                 if (packet instanceof ClientboundLoginPacket login) {
                     require(login.playerId() == 7 && login.maxPlayers() == 20, "Login identity and capacity");

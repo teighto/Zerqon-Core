@@ -62,6 +62,7 @@ pub struct State {
     pub auth: Option<Authenticator>,
     pub players: Arc<Players>,
     pub queries: Arc<crate::server_queries::ServerQueries>,
+    pub packet_budget: zerqon_protocol::inbound::PacketBudget,
     pub slots: Arc<Semaphore>,
     pub plugins: Arc<Mutex<PluginManager>>,
     pub commands: Mutex<HashMap<String, (String, Option<String>)>>,
@@ -512,6 +513,9 @@ impl State {
             .unwrap_or_default();
         let state = Arc::new(Self {
             slots: Arc::new(Semaphore::new(properties.max_players)),
+            packet_budget: zerqon_protocol::inbound::PacketBudget::new(
+                settings.packet_memory_mib * 1024 * 1024,
+            )?,
             properties,
             settings,
             stats: Mutex::new(TickStats::new()),

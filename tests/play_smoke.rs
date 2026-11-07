@@ -5,7 +5,9 @@ use std::{
     time::Duration,
 };
 use tokio::net::TcpStream;
-use zerqon_protocol::codec::{get_varint, put_string, put_varint, read_frame, write_frame};
+use zerqon_protocol::codec::{
+    get_string, get_varint, put_string, put_varint, read_frame, write_frame,
+};
 
 struct Process(Child);
 impl Drop for Process {
@@ -18,6 +20,16 @@ impl Drop for Process {
 #[tokio::test]
 #[ignore = "requires official 26.3 reports: python scripts/prepare-data.py"]
 async fn offline_login_configuration_chunks_commands_and_shutdown() {
+    play_session(None, "zerqon").await;
+}
+
+#[tokio::test]
+#[ignore = "requires official 26.3 reports: python scripts/prepare-data.py"]
+async fn configured_server_brand_is_sent_during_login() {
+    play_session(Some("teighto • тест 🚀"), "teighto • тест 🚀").await;
+}
+
+async fn play_session(server_brand: Option<&str>, expected_brand: &str) {
     let data = Path::new(env!("CARGO_MANIFEST_DIR")).join(".cache/vanilla/26.3");
     assert!(data.join("prepared.json").exists(), "run prepare-data.py");
     let directory = tempfile::tempdir().unwrap();
@@ -30,9 +42,14 @@ async fn offline_login_configuration_chunks_commands_and_shutdown() {
             .success()
     );
     std::fs::write(directory.path().join("eula.txt"), "eula=true\n").unwrap();
+    let mut settings =
+        toml::Table::from_iter([("update_check".into(), toml::Value::Boolean(false))]);
+    if let Some(brand) = server_brand {
+        settings.insert("server_brand".into(), toml::Value::String(brand.into()));
+    }
     std::fs::write(
         directory.path().join("server.settings"),
-        "update_check=false\n",
+        toml::to_string(&settings).unwrap(),
     )
     .unwrap();
     std::fs::write(directory.path().join("server.properties"),"server-ip=127.0.0.1\nserver-port=0\nonline-mode=false\nview-distance=1\nnetwork-compression-threshold=256\n").unwrap();
@@ -102,6 +119,7 @@ async fn offline_login_configuration_chunks_commands_and_shutdown() {
         .await
         .unwrap();
     let mut registries = 0;
+    let mut server_brand = None;
     loop {
         let packet = read_frame(&mut socket, 2_097_151, Some(threshold))
             .await
@@ -109,11 +127,20 @@ async fn offline_login_configuration_chunks_commands_and_shutdown() {
         if packet[0] == 7 {
             registries += 1;
         }
+        if packet[0] == 1 {
+            let mut body = &packet[1..];
+            if get_string(&mut body, 32767).unwrap() == "minecraft:brand" {
+                assert!(server_brand.is_none(), "server sent its brand twice");
+                server_brand = Some(get_string(&mut body, 128).unwrap().to_owned());
+                assert!(body.is_empty());
+            }
+        }
         if packet[0] == 3 {
             break;
         }
     }
     assert!(registries >= 20);
+    assert_eq!(server_brand.as_deref(), Some(expected_brand));
     write_frame(&mut socket, &[3], Some(threshold))
         .await
         .unwrap();

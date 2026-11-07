@@ -17,13 +17,20 @@ use tokio::{
     time::{Instant, timeout},
 };
 use uuid::Uuid;
+#[cfg(test)]
+use zerqon_protocol::codec::read_frame;
 use zerqon_protocol::{
     MINECRAFT_VERSION, PROTOCOL_VERSION,
-    codec::{get_string, get_varint, put_string, put_varint, read_frame, take, write_frame},
+    codec::{get_string, get_varint, put_string, put_varint, take, write_frame},
+    inbound::{ConnectionBudget, InboundPacket, read_frame_budgeted},
 };
+
+#[cfg(test)]
+mod budget_wire_tests;
 
 struct Reader {
     io: Box<dyn AsyncRead + Unpin + Send>,
+    budget: ConnectionBudget,
     compression: Option<usize>,
     limit: usize,
     deadline: Duration,
@@ -36,11 +43,11 @@ struct Writer {
     shutdown: watch::Receiver<bool>,
 }
 impl Reader {
-    async fn packet(&mut self) -> Result<Vec<u8>> {
+    async fn packet(&mut self) -> Result<InboundPacket> {
         if *self.shutdown.borrow() {
             return Err("server stopping".into());
         }
-        tokio::select! {result=timeout(self.deadline,read_frame(&mut self.io,self.limit,self.compression))=>Ok(result??),_=self.shutdown.changed()=>Err("server stopping".into())}
+        tokio::select! {result=timeout(self.deadline,read_frame_budgeted(&mut self.io,self.limit,self.compression,&self.budget))=>Ok(result??),_=self.shutdown.changed()=>Err("server stopping".into())}
     }
 }
 impl Writer {
@@ -67,6 +74,9 @@ pub async fn handle(socket: TcpStream, state: Arc<State>) -> Result<()> {
     let deadline = Duration::from_secs(state.settings.connection_timeout_seconds);
     let mut reader = Reader {
         io: Box::new(read),
+        budget: state
+            .packet_budget
+            .connection(state.settings.connection_packet_memory_mib * 1024 * 1024)?,
         compression: None,
         limit: state.settings.max_packet_bytes.min(65536),
         deadline,
@@ -90,6 +100,7 @@ pub async fn handle(socket: TcpStream, state: Arc<State>) -> Result<()> {
     if !view.is_empty() {
         return Err("trailing handshake bytes".into());
     }
+    drop(packet);
     if intent == 1 {
         return status(&mut reader, &mut writer, &state).await;
     }
@@ -121,6 +132,7 @@ pub async fn handle(socket: TcpStream, state: Arc<State>) -> Result<()> {
     {
         return login_disconnect(&mut writer, "Invalid username").await;
     }
+    drop(hello);
     if !state.settings.allow_java_clients && !state.settings.allow_horizon_clients {
         return login_disconnect(
             &mut writer,
@@ -147,6 +159,7 @@ pub async fn handle(socket: TcpStream, state: Arc<State>) -> Result<()> {
             return Err("trailing encryption response".into());
         }
         let shared = authenticator.verify_response(secret, challenge, &token)?;
+        drop(response);
         reader.io = Box::new(CipherReader::new(reader.io, &shared));
         writer.io = Box::new(CipherWriter::new(writer.io, &shared));
         let hash = auth::session_hash(&shared, authenticator.public_key_der());
@@ -232,7 +245,7 @@ pub async fn handle(socket: TcpStream, state: Arc<State>) -> Result<()> {
     }
     success.extend_from_slice(Uuid::new_v4().as_bytes());
     writer.send(&success).await?;
-    if reader.packet().await? != [3] {
+    if reader.packet().await?.as_slice() != [3] {
         return Err("expected login acknowledgement".into());
     }
     let mut client_profile = crate::client_policy::Negotiation::new(
@@ -308,13 +321,19 @@ pub async fn handle(socket: TcpStream, state: Arc<State>) -> Result<()> {
         }
     }
     let data = state.data.as_ref().ok_or("game data unavailable")?;
+    configuration_send(
+        &mut writer,
+        &packets::configuration_brand(&state.settings.server_brand),
+        &client_profile,
+    )
+    .await?;
     for packet in data.configuration_packets() {
         configuration_send(&mut writer, packet, &client_profile).await?;
     }
     let mut finished = false;
     for _ in 0..32 {
         let packet = configuration_packet(&mut reader, &client_profile).await?;
-        if packet == [3] {
+        if packet.as_slice() == [3] {
             finished = true;
             break;
         }
@@ -364,7 +383,7 @@ pub async fn handle(socket: TcpStream, state: Arc<State>) -> Result<()> {
 async fn configuration_packet(
     reader: &mut Reader,
     profile: &crate::client_policy::Negotiation,
-) -> Result<Vec<u8>> {
+) -> Result<InboundPacket> {
     let deadline = configuration_deadline(profile)?;
     let packet = tokio::time::timeout_at(deadline, reader.packet())
         .await
@@ -395,7 +414,7 @@ fn configuration_deadline(profile: &crate::client_policy::Negotiation) -> Result
 }
 
 async fn status(reader: &mut Reader, writer: &mut Writer, state: &State) -> Result<()> {
-    if reader.packet().await? != [0] {
+    if reader.packet().await?.as_slice() != [0] {
         return Err("expected status request".into());
     }
     let status = serde_json::json!({"version":{"name":MINECRAFT_VERSION,"protocol":PROTOCOL_VERSION},"players":{"max":state.properties.max_players,"online":state.online()},"description":{"text":state.properties.motd},"enforcesSecureChat":false});
@@ -604,7 +623,8 @@ async fn play(
                     18|54|57=>{
                         inventory_count+=1;if inventory_count>64{if inventory_count==65{inventory_response(Err(crate::player_inventory::InventoryServiceError::RateLimited),inventory,&mut writer).await?;}continue;}
                         let policy=zerqon_inventory::InventoryPolicy {creative:true,can_interact:teleport_confirmed,allow_drops:false};
-                        inventory_response(inventory.apply_packet(id,view,policy).await,inventory,&mut writer).await?;
+                        let body_offset=packet.as_slice().len()-view.len();
+                        inventory_response(inventory.apply_inbound_packet(id,packet,body_offset,policy).await,inventory,&mut writer).await?;
                     },
                     66=>{
                         let request=zerqon_inventory::decode_use_on(view)?;
@@ -810,6 +830,71 @@ fn stream_chunks(
 }
 
 #[cfg(test)]
+mod inbound_budget_tests {
+    use super::*;
+    use zerqon_protocol::inbound::PacketBudget;
+
+    #[tokio::test]
+    async fn reader_keeps_packet_memory_until_the_handler_releases_it() {
+        let global = PacketBudget::new(8).unwrap();
+        let account = global.connection(4).unwrap();
+        let (shutdown, _) = watch::channel(false);
+        let mut reader = Reader {
+            io: Box::new(&b"\x04abcd\x04efgh"[..]),
+            budget: account.clone(),
+            compression: None,
+            limit: 1024,
+            deadline: Duration::from_secs(1),
+            shutdown: shutdown.subscribe(),
+        };
+        let packet = reader.packet().await.unwrap();
+        assert_eq!(packet.as_slice(), b"abcd");
+        assert_eq!(account.snapshot().used_bytes, 4);
+        assert_eq!(global.snapshot().used_bytes, 4);
+        assert!(reader.packet().await.is_err());
+        drop(packet);
+        assert_eq!(account.snapshot().used_bytes, 0);
+        assert_eq!(global.snapshot().used_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_releases_an_incomplete_inbound_frame_reservation() {
+        use tokio::io::AsyncWriteExt;
+        let global = PacketBudget::new(4096).unwrap();
+        let account = global.connection(2048).unwrap();
+        let (shutdown, _) = watch::channel(false);
+        let (input, mut peer) = tokio::io::duplex(32);
+        let mut reader = Reader {
+            io: Box::new(input),
+            budget: account.clone(),
+            compression: None,
+            limit: 1024,
+            deadline: Duration::from_secs(30),
+            shutdown: shutdown.subscribe(),
+        };
+        peer.write_all(&[0x80, 8, 1]).await.unwrap();
+        let pending = tokio::spawn(async move { reader.packet().await });
+        timeout(Duration::from_secs(2), async {
+            while account.snapshot().used_bytes == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("reader never reserved its incomplete frame");
+        shutdown.send_replace(true);
+        assert!(
+            timeout(Duration::from_secs(1), pending)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        assert_eq!(account.snapshot().used_bytes, 0);
+        assert_eq!(global.snapshot().used_bytes, 0);
+    }
+}
+
+#[cfg(test)]
 mod configuration_deadline_tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -827,6 +912,10 @@ mod configuration_deadline_tests {
             io: Box::new(input),
             compression: None,
             limit: 1024,
+            budget: zerqon_protocol::inbound::PacketBudget::new(4096)
+                .unwrap()
+                .connection(4096)
+                .unwrap(),
             deadline: Duration::from_secs(30),
             shutdown: shutdown.subscribe(),
         };
@@ -951,6 +1040,10 @@ mod configuration_deadline_tests {
             io: Box::new(input),
             compression: None,
             limit: 1024,
+            budget: zerqon_protocol::inbound::PacketBudget::new(4096)
+                .unwrap()
+                .connection(4096)
+                .unwrap(),
             deadline: Duration::from_secs(30),
             shutdown: shutdown.subscribe(),
         };
@@ -999,6 +1092,10 @@ mod configuration_deadline_tests {
             }),
             compression: None,
             limit: 1024,
+            budget: zerqon_protocol::inbound::PacketBudget::new(4096)
+                .unwrap()
+                .connection(4096)
+                .unwrap(),
             deadline: Duration::from_secs(30),
             shutdown: shutdown.subscribe(),
         };
@@ -1024,6 +1121,10 @@ mod shutdown_tests {
             io: Box::new(stream),
             compression: None,
             limit: 1024,
+            budget: zerqon_protocol::inbound::PacketBudget::new(4096)
+                .unwrap()
+                .connection(4096)
+                .unwrap(),
             deadline: Duration::from_secs(30),
             shutdown: shutdown.subscribe(),
         };
