@@ -8,7 +8,47 @@ use std::sync::{
 use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
 
-pub type PacketBatch = Vec<Bytes>;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InventoryRevision {
+    pub uuid: Uuid,
+    pub entity_id: i32,
+    pub generation: u64,
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PacketBatch {
+    packets: Vec<Bytes>,
+    inventory_revision: Option<InventoryRevision>,
+}
+impl PacketBatch {
+    pub fn inventory_revision(&self) -> Option<InventoryRevision> {
+        self.inventory_revision
+    }
+    pub fn with_inventory_revision(mut self, revision: InventoryRevision) -> Self {
+        self.inventory_revision = Some(revision);
+        self
+    }
+}
+impl From<Vec<Bytes>> for PacketBatch {
+    fn from(packets: Vec<Bytes>) -> Self {
+        Self {
+            packets,
+            inventory_revision: None,
+        }
+    }
+}
+impl std::ops::Deref for PacketBatch {
+    type Target = Vec<Bytes>;
+    fn deref(&self) -> &Self::Target {
+        &self.packets
+    }
+}
+impl IntoIterator for PacketBatch {
+    type Item = Bytes;
+    type IntoIter = std::vec::IntoIter<Bytes>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.packets.into_iter()
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct PlayerSnapshot {
@@ -84,6 +124,7 @@ struct Player {
     active: bool,
     outbound: mpsc::Sender<PacketBatch>,
     disconnect: watch::Sender<bool>,
+    equipment: Option<Bytes>,
 }
 pub struct Players {
     inner: Mutex<BTreeMap<Uuid, Player>>,
@@ -99,6 +140,36 @@ pub struct PlayerHandle {
 }
 
 impl Players {
+    pub fn set_equipment(&self, uuid: Uuid, id: i32, packet: Bytes) -> Result<(), PlayerError> {
+        let mut inner = self.inner.lock().map_err(|_| PlayerError::Unavailable)?;
+        let Some(player) = inner.get_mut(&uuid).filter(|player| player.id == id) else {
+            return Ok(());
+        };
+        let mut header = packet.as_ref();
+        if zerqon_protocol::codec::get_varint(&mut header).ok() != Some(104)
+            || zerqon_protocol::codec::get_varint(&mut header).ok() != Some(id)
+            || packet.len() > 256 * 1024
+        {
+            return Err(PlayerError::Invalid);
+        }
+        if player.equipment.as_ref() == Some(&packet) {
+            return Ok(());
+        }
+        player.equipment = Some(packet.clone());
+        let position = player.position;
+        if !player.active {
+            return Ok(());
+        }
+        for other in inner
+            .values()
+            .filter(|other| other.active && other.identity.uuid != uuid)
+        {
+            if self.visible(position, other.position) {
+                enqueue(other, vec![packet.clone()]);
+            }
+        }
+        Ok(())
+    }
     pub fn snapshots(&self) -> Result<Vec<PlayerSnapshot>, PlayerError> {
         let inner = self.inner.lock().map_err(|_| PlayerError::Unavailable)?;
         Ok(inner
@@ -112,12 +183,13 @@ impl Players {
             })
             .collect())
     }
-    pub fn dispatch_batches(
+    pub fn dispatch_batches<B: Into<PacketBatch>>(
         &self,
-        batches: Vec<(Uuid, i32, PacketBatch)>,
+        batches: Vec<(Uuid, i32, B)>,
     ) -> Result<(), PlayerError> {
         let inner = self.inner.lock().map_err(|_| PlayerError::Unavailable)?;
         for (uuid, id, packets) in batches {
+            let packets = packets.into();
             if packets.is_empty() {
                 continue;
             }
@@ -178,6 +250,7 @@ impl Players {
                 active: false,
                 outbound,
                 disconnect,
+                equipment: None,
             },
         );
         Ok(PlayerHandle {
@@ -343,8 +416,8 @@ impl Drop for PlayerHandle {
         }
     }
 }
-fn enqueue(player: &Player, batch: PacketBatch) {
-    if player.outbound.try_send(batch).is_err() {
+fn enqueue(player: &Player, batch: impl Into<PacketBatch>) {
+    if player.outbound.try_send(batch.into()).is_err() {
         let _ = player.disconnect.send(true);
     }
 }
@@ -361,7 +434,7 @@ fn profile_packet(identity: &Identity) -> Bytes {
         .into()
 }
 fn spawn_packets(player: &Player, kind: i32) -> PacketBatch {
-    vec![
+    let mut packets = vec![
         entity_packets::add_entity(
             player.id,
             player.identity.uuid,
@@ -372,7 +445,11 @@ fn spawn_packets(player: &Player, kind: i32) -> PacketBatch {
         )
         .into(),
         entity_packets::player_metadata(player.id, 127).into(),
-    ]
+    ];
+    if let Some(equipment) = &player.equipment {
+        packets.push(equipment.clone());
+    }
+    packets.into()
 }
 
 #[cfg(test)]
@@ -406,6 +483,35 @@ mod tests {
             packets.extend(batch);
         }
         packets
+    }
+
+    #[test]
+    fn equipment_cache_is_applied_before_activation_and_on_visibility_reentry() {
+        let players = Players::new(20, 32.0, 159, Arc::new(EntityIds::default()));
+        let (first, mut first_rx, _) = connect(&players, 1, "One");
+        let equipment = Bytes::from(vec![104, first.id() as u8, 0x80, 0, 1, 0]);
+        players
+            .set_equipment(Uuid::from_u128(1), first.id(), equipment.clone())
+            .unwrap();
+        first.activate().unwrap();
+        drain(&mut first_rx);
+        let (second, mut second_rx, _) = connect(&players, 2, "Two");
+        second.activate().unwrap();
+        assert!(drain(&mut second_rx).contains(&equipment));
+        second
+            .move_to(Position {
+                xyz: [100.0, 64.0, 0.0],
+                ..Position::default()
+            })
+            .unwrap();
+        drain(&mut second_rx);
+        second.move_to(Position::default()).unwrap();
+        assert!(drain(&mut second_rx).contains(&equipment));
+        let wrong = Bytes::from_static(&[104, 0]);
+        players
+            .set_equipment(Uuid::from_u128(1), first.id() + 100, wrong.clone())
+            .unwrap();
+        assert!(!drain(&mut second_rx).contains(&wrong));
     }
 
     #[test]

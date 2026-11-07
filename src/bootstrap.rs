@@ -65,6 +65,8 @@ pub enum BootstrapError {
     #[error(transparent)]
     Zip(#[from] zip::result::ZipError),
     #[error(transparent)]
+    JavaLaunch(#[from] crate::java_launch::JavaLaunchError),
+    #[error(transparent)]
     Task(#[from] tokio::task::JoinError),
 }
 pub struct PreparedData {
@@ -80,12 +82,14 @@ impl Bootstrap {
     pub async fn prepare(directory: &Path, java: &Path) -> Result<PreparedData, BootstrapError> {
         let directory = checked_cache_directory(directory)?;
         reject_cache_links(&directory.join("prepare.lock"))?;
-        let lock = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(directory.join("prepare.lock"))?;
+        let lock = std::sync::Arc::new(
+            fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(directory.join("prepare.lock"))?,
+        );
         acquire_prepare_lock(&lock, Duration::from_secs(600)).await?;
         let jar = directory.join("server.jar");
         let verify_path = jar.clone();
@@ -112,18 +116,26 @@ impl Bootstrap {
         }
         tracing::info!("Preparing Minecraft 26.3 registries and protocol reports");
         let java = java_runtime(java).await?;
-        let stage = tempfile::Builder::new()
-            .prefix("prepare-")
-            .tempdir_in(&directory)?;
-        generate_reports(&java, &jar, stage.path()).await?;
-        let stage_path = stage.path().to_owned();
+        let stage = std::sync::Arc::new(
+            tempfile::Builder::new()
+                .prefix("prepare-")
+                .tempdir_in(&directory)?,
+        );
+        generate_reports(&java, &jar, std::sync::Arc::clone(&stage)).await?;
         let jar_path = jar.clone();
-        let prepared =
-            tokio::task::spawn_blocking(move || prepare_payloads(&jar_path, &stage_path)).await??;
-        let stage_path = stage.path().to_owned();
+        let prepared = preparation_task(
+            std::sync::Arc::clone(&stage),
+            std::sync::Arc::clone(&lock),
+            move |stage| prepare_payloads(&jar_path, stage),
+        )
+        .await?;
         let destination = directory.clone();
-        tokio::task::spawn_blocking(move || install_prepared(&stage_path, &destination, &prepared))
-            .await??;
+        preparation_task(
+            std::sync::Arc::clone(&stage),
+            std::sync::Arc::clone(&lock),
+            move |stage| install_prepared(stage, &destination, &prepared),
+        )
+        .await?;
         if !cache_ready(&directory)? {
             return Err(invalid("prepared data failed final validation"));
         }
@@ -133,6 +145,18 @@ impl Bootstrap {
             reused: false,
         })
     }
+}
+
+async fn preparation_task<T: Send + 'static>(
+    stage: std::sync::Arc<tempfile::TempDir>,
+    lock: std::sync::Arc<File>,
+    work: impl FnOnce(&Path) -> Result<T, BootstrapError> + Send + 'static,
+) -> Result<T, BootstrapError> {
+    tokio::task::spawn_blocking(move || {
+        let _lock = lock;
+        work(stage.path())
+    })
+    .await?
 }
 
 async fn acquire_prepare_lock(lock: &File, timeout: Duration) -> Result<(), BootstrapError> {
@@ -233,6 +257,10 @@ async fn download(
 }
 
 fn read_json(path: &Path, limit: u64) -> Result<Value, BootstrapError> {
+    reject_cache_links(path)?;
+    if !fs::symlink_metadata(path)?.is_file() {
+        return Err(invalid("JSON path must be a regular file"));
+    }
     let file = File::open(path)?;
     if !file.metadata()?.is_file() || file.metadata()?.len() > limit {
         return Err(invalid(format!(
@@ -249,6 +277,7 @@ fn read_json(path: &Path, limit: u64) -> Result<Value, BootstrapError> {
 }
 
 fn cache_ready(directory: &Path) -> Result<bool, BootstrapError> {
+    reject_cache_links(&directory.join("prepared.json"))?;
     if !directory.join("prepared.json").is_file() {
         return Ok(false);
     }
@@ -265,6 +294,7 @@ fn cache_ready(directory: &Path) -> Result<bool, BootstrapError> {
         return Ok(false);
     }
     for report in REPORTS {
+        reject_cache_links(&directory.join("generated/reports").join(report))?;
         let value = match read_json(
             &directory.join("generated/reports").join(report),
             16 * 1024 * 1024,
@@ -298,6 +328,39 @@ fn cache_ready(directory: &Path) -> Result<bool, BootstrapError> {
         if !valid {
             return Ok(false);
         }
+    }
+    let item_reports = match item_report_paths(directory) {
+        Ok(paths) => paths,
+        Err(_) => return Ok(false),
+    };
+    let mut item_bytes = 0u64;
+    let mut checked_parents = HashSet::new();
+    for report in item_reports {
+        let path = directory.join(report);
+        let parent = path
+            .parent()
+            .ok_or_else(|| invalid("missing item report parent"))?;
+        if checked_parents.insert(parent.to_owned()) {
+            reject_cache_links(parent)?;
+        }
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        if is_cache_link(&metadata) {
+            return Err(invalid("item report is a link or reparse point"));
+        }
+        if !metadata.is_file() || metadata.len() > 1024 * 1024 {
+            return Ok(false);
+        }
+        item_bytes += metadata.len();
+        if item_bytes > 32 * 1024 * 1024 {
+            return Ok(false);
+        }
+    }
+    if zerqon_inventory::ItemCatalog::load(directory).is_err() {
+        return Ok(false);
     }
     let registries = match read_json(&directory.join("registries-sync.json"), 16 * 1024 * 1024) {
         Ok(value) => value,
@@ -377,6 +440,43 @@ fn cache_ready(directory: &Path) -> Result<bool, BootstrapError> {
     Ok(identity["tags"].as_u64() == Some(count as u64))
 }
 
+fn item_report_paths(directory: &Path) -> Result<Vec<PathBuf>, BootstrapError> {
+    let registries = read_json(
+        &directory.join("generated/reports/registries.json"),
+        8 * 1024 * 1024,
+    )?;
+    let items = registries["minecraft:item"]["entries"]
+        .as_object()
+        .filter(|items| !items.is_empty() && items.len() <= 65_536)
+        .ok_or_else(|| invalid("missing or oversized item registry"))?;
+    items
+        .keys()
+        .map(|key| {
+            let (namespace, name) = key
+                .split_once(':')
+                .filter(|(namespace, name)| {
+                    key.len() <= 256
+                        && !namespace.is_empty()
+                        && !name.is_empty()
+                        && namespace.bytes().all(|byte| {
+                            byte.is_ascii_lowercase()
+                                || byte.is_ascii_digit()
+                                || b"_.-".contains(&byte)
+                        })
+                        && name.bytes().all(|byte| {
+                            byte.is_ascii_lowercase()
+                                || byte.is_ascii_digit()
+                                || b"/_.-".contains(&byte)
+                        })
+                })
+                .ok_or_else(|| invalid("invalid item registry key"))?;
+            let relative = format!("generated/reports/{namespace}/components/item/{name}.json");
+            safe_archive_path(&relative)?;
+            Ok(PathBuf::from(relative))
+        })
+        .collect()
+}
+
 async fn java_runtime(java: &Path) -> Result<PathBuf, BootstrapError> {
     let mut child=tokio::process::Command::new(java).args(["-Dfile.encoding=UTF-8","-Dsun.stdout.encoding=UTF-8","-Dsun.stderr.encoding=UTF-8","-XshowSettings:properties","-version"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).kill_on_drop(true).spawn().map_err(|error|invalid(format!("Java 25+ is required once to prepare official reports; set java_executable to its java binary ({error})")))?;
     let stderr = child
@@ -425,37 +525,72 @@ async fn java_runtime(java: &Path) -> Result<PathBuf, BootstrapError> {
     }
 }
 
-async fn generate_reports(java: &Path, jar: &Path, stage: &Path) -> Result<(), BootstrapError> {
+fn generator_main_class(jar: &Path) -> Result<String, BootstrapError> {
+    let file = File::open(jar)?;
+    if file.metadata()?.len() > SERVER_BYTES {
+        return Err(invalid("generator JAR exceeds its size limit"));
+    }
+    let mut archive = zip::ZipArchive::new(file)?;
+    let entry = archive.by_name("META-INF/MANIFEST.MF")?;
+    if entry.size() > 65_536 {
+        return Err(invalid("generator manifest exceeds 64 KiB"));
+    }
+    let mut bytes = Vec::new();
+    entry.take(65_537).read_to_end(&mut bytes)?;
+    if bytes.len() > 65_536 {
+        return Err(invalid("generator manifest grew beyond its size limit"));
+    }
+    let text =
+        std::str::from_utf8(&bytes).map_err(|_| invalid("generator manifest is not UTF-8"))?;
+    let mut attributes: Vec<String> = Vec::new();
+    for line in text.lines() {
+        if line.is_empty() {
+            break;
+        }
+        if let Some(continuation) = line.strip_prefix(' ') {
+            attributes
+                .last_mut()
+                .ok_or_else(|| invalid("generator manifest starts with a continuation"))?
+                .push_str(continuation);
+        } else {
+            attributes.push(line.to_owned());
+        }
+    }
+    let mut main_class = None;
+    for attribute in attributes {
+        let (key, value) = attribute
+            .split_once(": ")
+            .ok_or_else(|| invalid("invalid generator manifest attribute"))?;
+        if key.eq_ignore_ascii_case("Main-Class") && main_class.replace(value.to_owned()).is_some()
+        {
+            return Err(invalid("duplicate generator Main-Class"));
+        }
+    }
+    main_class.ok_or_else(|| invalid("generator manifest has no Main-Class"))
+}
+
+struct ReportCancellation(Option<tokio::sync::oneshot::Sender<()>>);
+
+impl Drop for ReportCancellation {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.0.take() {
+            let _ = cancel.send(());
+        }
+    }
+}
+
+async fn generate_reports(
+    java: &Path,
+    jar: &Path,
+    stage: std::sync::Arc<tempfile::TempDir>,
+) -> Result<(), BootstrapError> {
     let source_jar = jar.to_owned();
-    let output_stage = stage.to_owned();
-    let jar_argument = tokio::task::spawn_blocking(move || {
-        let parent = source_jar
-            .parent()
-            .ok_or_else(|| invalid("generator JAR has no parent"))?
-            .canonicalize()?;
-        let stage_parent = output_stage
-            .parent()
-            .ok_or_else(|| invalid("generator stage has no parent"))?
-            .canonicalize()?;
-        let name = source_jar
-            .file_name()
-            .ok_or_else(|| invalid("generator JAR has no file name"))?;
-        if parent == stage_parent && name.to_str().is_some_and(str::is_ascii) {
-            return Ok::<_, BootstrapError>(PathBuf::from("..").join(name));
-        }
-        let input = File::open(&source_jar)?;
-        if input.metadata()?.len() > SERVER_BYTES {
-            return Err(invalid("generator JAR exceeds its size limit"));
-        }
-        let mut copied = fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(output_stage.join("generator-input.jar"))?;
-        if std::io::copy(&mut input.take(SERVER_BYTES + 1), &mut copied)? > SERVER_BYTES {
-            return Err(invalid("generator JAR grew beyond its size limit"));
-        }
-        copied.sync_all()?;
-        Ok(PathBuf::from("generator-input.jar"))
+    let launch = tokio::task::spawn_blocking(move || {
+        let main_class = generator_main_class(&source_jar)?;
+        Ok::<_, BootstrapError>(crate::java_launch::manifest_jar(
+            &[source_jar.canonicalize()?],
+            Some(&main_class),
+        )?)
     })
     .await??;
     let mut child = tokio::process::Command::new(java)
@@ -468,11 +603,11 @@ async fn generate_reports(java: &Path, jar: &Path, stage: &Path) -> Result<(), B
             "-DbundlerMainClass=net.minecraft.data.Main",
             "-jar",
         ])
-        .arg(jar_argument)
+        .arg(&launch.argument)
         .arg("--reports")
         .arg("--output")
         .arg("generated")
-        .current_dir(stage)
+        .current_dir(stage.path())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -486,25 +621,37 @@ async fn generate_reports(java: &Path, jar: &Path, stage: &Path) -> Result<(), B
         .stderr
         .take()
         .ok_or_else(|| invalid("missing data generator stderr"))?;
-    let run = async {
-        let (out, err, status) =
-            tokio::join!(drain_output(stdout), drain_output(stderr), child.wait());
-        out?;
-        err?;
-        if !status?.success() {
-            return Err(invalid(
-                "Mojang report generator failed; inspect preparation logs",
-            ));
+    let (cancel, cancelled) = tokio::sync::oneshot::channel();
+    let _cancellation = ReportCancellation(Some(cancel));
+    tokio::spawn(async move {
+        let _stage = stage;
+        let _launch = launch;
+        let run = async {
+            let (out, err, status) =
+                tokio::join!(drain_output(stdout), drain_output(stderr), child.wait());
+            out?;
+            err?;
+            if !status?.success() {
+                return Err(invalid(
+                    "Mojang report generator failed; inspect preparation logs",
+                ));
+            }
+            Ok(())
+        };
+        let result = tokio::select! {
+            result = tokio::time::timeout(Duration::from_secs(180), run) => {
+                result.unwrap_or_else(|_| Err(invalid("Mojang report generation exceeded 180 seconds")))
+            }
+            _ = cancelled => Err(invalid("Mojang report generation cancelled")),
+        };
+        if child.try_wait()?.is_none() {
+            tokio::time::timeout(Duration::from_secs(2), child.kill())
+                .await
+                .map_err(|_| invalid("Mojang report generator termination timed out"))??;
         }
-        Ok(())
-    };
-    match tokio::time::timeout(Duration::from_secs(180), run).await {
-        Ok(result) => result,
-        Err(_) => {
-            child.kill().await?;
-            Err(invalid("Mojang report generation exceeded 180 seconds"))
-        }
-    }
+        result
+    })
+    .await?
 }
 async fn drain_output(mut output: impl tokio::io::AsyncRead + Unpin) -> Result<(), BootstrapError> {
     let mut bytes = [0; 4096];
@@ -840,6 +987,10 @@ fn install_prepared(
     destination: &Path,
     prepared: &Value,
 ) -> Result<(), BootstrapError> {
+    if !cache_ready(stage)? || read_json(&stage.join("prepared.json"), 65536)? != *prepared {
+        return Err(invalid("staged data changed before installation"));
+    }
+    let item_reports = item_report_paths(stage)?;
     let destination = checked_cache_directory(destination)?;
     fn preflight(source: &Path, destination: &Path) -> Result<(), BootstrapError> {
         reject_cache_links(destination)?;
@@ -871,6 +1022,9 @@ fn install_prepared(
     for report in REPORTS {
         reject_cache_links(&destination.join("generated/reports").join(report))?;
     }
+    for report in &item_reports {
+        reject_cache_links(&destination.join(report))?;
+    }
     fn copy_tree(source: &Path, destination: &Path) -> Result<(), BootstrapError> {
         checked_cache_directory(destination)?;
         for entry in fs::read_dir(source)? {
@@ -892,6 +1046,15 @@ fn install_prepared(
             &stage.join("generated/reports").join(report),
             &destination.join("generated/reports").join(report),
         )?;
+    }
+    for report in item_reports {
+        let target = destination.join(&report);
+        checked_cache_directory(
+            target
+                .parent()
+                .ok_or_else(|| invalid("missing item report parent"))?,
+        )?;
+        atomic_copy(&stage.join(report), &target)?;
     }
     for file in ["registries-sync.json", "tags-sync.json"] {
         atomic_copy(&stage.join(file), &destination.join(file))?;

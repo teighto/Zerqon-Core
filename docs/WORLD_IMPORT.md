@@ -1,39 +1,99 @@
 # Vanilla world import
 
-Zerqon's native Rust importer reads **Minecraft Java Edition 26.3, DataVersion 5023** Anvil region files and transfers the block states of completed overworld chunks into a new `.zqc` world. This is a block import stage toward full world compatibility. It is **not a complete world migration**: entities, mobs, block-entity contents such as chests, player inventories, dimensions, game rules, biome data, lighting, scheduled ticks, structures and other world metadata are not yet restored in Zerqon.
+Zerqon imports completed overworld block states and source metadata from **Minecraft Java Edition 26.3, DataVersion 5023** into a new native world. The original spawn, source identity and generator description are recorded in `world-metadata.json`. A new UUID identifies the Zerqon world; vanilla does not provide that UUID.
 
-The original world is read without modification. Stop its server and retain a backup before importing. The destination must not exist and must be outside the source directory. The importer recognizes `region/` and the 26.3 layout `dimensions/minecraft/overworld/region/`; ambiguity is rejected.
+This is **not a complete world migration**. Source game mode, difficulty, game time, rules, clocks and generator are retained, not activated. Vanilla entities, player inventories, chest contents, other dimensions, biomes, lighting, scheduled ticks and datapack behavior are not yet restored. `full_world_import` remains `false`.
 
-Supported region compression is gzip (1), zlib (2), and uncompressed NBT (3). External `.mcc` chunks, LZ4, different DataVersions, unknown block names/properties, incomplete/corrupt sectors and overlapping sector allocations fail explicitly. Unfinished vanilla generation chunks are counted and skipped; completed chunks are never silently replaced with generated terrain. The importer accepts the 26.3 string/compound/mixed block palettes and packed long arrays.
+## Source and destination
+
+Stop the source server and retain a backup. The destination must not exist and must be outside the source world. Import requires valid gzip NBT `level.dat` and `data/minecraft/world_gen_settings.dat`, both for 26.3 / 5023. It recognizes `region/` and the modern `dimensions/minecraft/overworld/region/` layout; ambiguity is rejected.
+
+Only an overworld spawn with the standard `minecraft:overworld` dimension type is currently supported. Its original block position, yaw and pitch are preserved. Non-finite rotations, unsupported dimensions and out-of-bounds coordinates fail explicitly. Bounded summaries of available namespaced game rules, clocks, weather, overworld border and chunk tickets are read as source metadata; their behavior is not implemented by that parsing.
+
+Source links, reparse points and special files are rejected. An existing `session.lock` is checked and held without rewriting its contents. Unix additionally uses a Java-compatible POSIX record lock; a hard-linked session.lock is rejected because closing an alias could release that lock. Stop external editors as well: size/timestamp changes during copying are errors, but this is not a live-filesystem snapshot mechanism.
+
+## Raw data retention
+
+The importer keeps an inert source snapshot:
+
+```text
+world-metadata.json
+import-report.json
+source-data/manifest.json
+source-data/files/level.dat
+source-data/files/data/minecraft/world_gen_settings.dat
+source-data/files/dimensions/minecraft/overworld/region/...
+```
+
+Other regular files and directories, including player data, other dimensions, datapacks, unknown files and unsupported payloads inside MCA, are retained there as well. `session.lock` is operational and is not copied. No `level.dat` is placed at the native root, which remains protected by the foreign-world guard.
+
+The manifest records original relative paths, byte sizes and SHA-256 digests. Native metadata records the manifest digest and source identity hashes. Terrain is read from this retained snapshot after copying. Data is not executed or silently converted into supported behavior. Preserving a chest's NBT does not make its inventory available in the game.
+
+`import-report.json` separates `applied`, `retained` and `not_supported`. Applied entries describe native blocks, stored identity/spawn metadata and generation policy. Retention records the snapshot location, file count and bytes. Existing counts of omitted block entities, ticks, biome/light sections and unfinished chunks remain available.
+
+Failed imports retain `IMPORT_INCOMPLETE`; opening such a destination fails. Metadata and the final report are published atomically, and the marker is removed only after successful completion. Retry into a new directory after correcting the error. Source files are never deleted.
+
+## No substitute terrain
+
+Imported worlds use `GenerationPolicy::ExistingOnly`. Loading an absent chunk returns `WorldError::MissingImportedChunk { x, z }`; saving a new chunk outside the imported set also fails. Missing or skipped source terrain must never silently become Zerqon's flat generator.
+
+The runtime starts players at the stored spawn, including yaw and pitch, and validates that its chunk is present and readable before starting. Chunk streaming skips absent imported chunks and counts only the packets actually sent. It propagates corruption and I/O errors instead of treating them as missing terrain.
+
+The bounded per-connection chunk queue stores coordinates. The socket writer requests the current chunk snapshot immediately before sending it, so an older queued snapshot cannot overwrite a newer block change already delivered to that client.
+
+Players can move within delivered imported terrain. A movement whose swept horizontal footprint reaches an absent or unloading chunk is corrected to the last accepted position; it does not generate substitute terrain or routinely disconnect the player. The check uses bounded in-memory chunk sets, accepts at most 64 blocks per horizontal axis per movement packet, and gates interactions until the client acknowledges the correction. It is a terrain-availability guard, not vanilla collision, physics or anti-cheat.
+
+Legacy native `.zqc` worlds without import metadata retain `NativeFlat`. Old imports without the new metadata are rejected; reimport the source into a new directory instead of guessing its spawn or generator.
+
+## Formats and limits
+
+Region compression supports gzip (1), zlib (2), and uncompressed NBT (3). External `.mcc`, LZ4, other DataVersions and unknown block states still fail explicitly. Unfinished generation chunks are counted and skipped. Current 26.3 string/compound/mixed palettes and packed long arrays are supported.
+
+| Input | Bound |
+|---|---:|
+| Compressed and decompressed level/saved-data NBT | 8 MiB each |
+| Decompressed chunk NBT | 8 MiB |
+| NBT nesting / tag count | 64 levels / 65,536 tags |
+| Native metadata JSON | 1 MiB |
+| Retained snapshot manifest | 16 MiB |
+| Source regular files / directories | 16,384 each |
+| One source file / total snapshot bytes | 2 GiB / 64 GiB |
+| Directory depth / relative path | 32 levels / 1,024 UTF-8 bytes |
+| Declared source dimensions | 64 |
+
+Retention streams files through a fixed buffer. It adds disk usage without loading an entire source world into RAM. Limit errors preserve the source and do not mark the destination complete.
 
 ## Rust API
 
-`zerqon_world::anvil::import_world_blocks(source, destination, &resolver)` returns `ImportReport`. The resolver receives a Minecraft block name and its property map and must return the matching 26.3 global state ID. A bare block name denotes its registry-defined default state; supplied properties must be checked against the block's registered values. Unknown names or property values must return `None`, never air or an arbitrary default. The server's generated `reports/blocks.json` is the authoritative mapping.
+`zerqon_world::anvil::import_world_blocks(source, destination, &resolver)` returns `ImportReport`. The resolver maps a block name and validated properties to its exact 26.3 state ID. A bare name means the registry-defined default. Unknown names/properties return `None`, never air or an arbitrary fallback.
 
-`RegionReader::open(path, region_x, region_z)` and `read_chunk(local_x, local_z, &resolver)` provide streaming access without loading a whole region. The caller supplies region coordinates, while every chunk's NBT coordinates must match its slot.
-
-Each decompressed chunk is limited to 8 MiB. Before deserialization, NBT structure, duplicate keys, sequence sizes, nesting (64 levels) and tag count (65,536) are validated. Region headers are checked before chunk reads. Worlds are limited to 65,536 region files per import.
-
-`import-report.json` records the imported regions/chunks, skipped unfinished chunks, omitted biome/light sections, block-entity/tick counts, and unsupported world fields/artifacts. `full_world_import` remains `false`. Failed imports retain `IMPORT_INCOMPLETE`; Zerqon refuses to open such a destination. Retry into another new directory after correcting the source or mapping. Source data is never deleted and unsupported source files are not rewritten.
+`WorldStore::metadata()` exposes `WorldMetadata`, including `spawn.position`, `spawn.dimension`, `spawn.yaw`, `spawn.pitch`, `world_id` and retained source settings. `WorldStore::generation_policy()` exposes the enforced policy. `RegionReader` provides bounded low-level access to individual chunks.
 
 ## Verification
 
 ```sh
 cargo test -p zerqon-world --locked
-python scripts/generate-test-world.py --server-jar .cache/vanilla/26.3/server.jar --directory .local/vanilla-world-filled --accept-eula
+cargo clippy -p zerqon-world --all-targets --locked -- -D warnings
 cargo test -p zerqon-world --test anvil -- --ignored --nocapture
+cargo test --test imported_world_live -- --ignored --nocapture
 ```
 
-Read the [Minecraft EULA](https://aka.ms/MinecraftEULA) before using the fixture generator. It requires Java 25 and an independently verified official 26.3 server JAR. It creates a new private localhost world, forces two chunks, places identifiable blocks, saves and stops the server. Existing directories are rejected. Generated Minecraft worlds/assets stay outside Git. The real-world regression resolves states from prepared 26.3 reports and checks positive and negative coordinates after conversion and reopening.
+The ignored tests need prepared 26.3 reports and the generated fixture. The world generator requires Java 25. After reading the [Minecraft EULA](https://aka.ms/MinecraftEULA), create a new isolated fixture with:
 
-Default tests use small independently generated Python NBT/MCA fixtures (`crates/zerqon-world/tests/fixtures/generate_anvil.py`) and include malformed allocations, compression, decompression limits, invalid NBT, wrong versions, unknown states, source preservation, and failed-import handling.
+```sh
+python scripts/generate-test-world.py --server-jar .cache/vanilla/26.3/server.jar --directory .local/vanilla-world-filled --accept-eula
+```
 
-Implementation dependencies: [fastnbt deserialization](https://docs.rs/fastnbt/latest/fastnbt/) and [flate2 bounded decompression](https://docs.rs/flate2/latest/flate2/bufread/index.html). These libraries handle NBT and compression; world storage and import validation are Zerqon Rust code.
+The generator refuses existing directories, listens only on localhost, saves identifiable blocks and stops cleanly. Generated Minecraft worlds/assets stay outside Git. Tests use independently encoded Python NBT fixtures, verify the actual vanilla spawn `(0,-60,0)`, compare original/retained bytes, test negative coordinates and malformed metadata, and prove that absent imported chunks cannot become flat terrain. A Java `FileChannel` fixture checks source-lock interoperability.
+
+The wire integration test imports a temporary copy of that world with nonzero spawn rotation, joins twice across a server restart, checks actual chunk coordinates and batch counts, attempts boundary and distant-island movement, acknowledges corrective teleports and executes `/tps`. It compares the original source, retained files and native chunk bytes after the session.
 
 ## По-русски
 
-Импортёр переносит состояния блоков завершённых чанков обычного мира из Anvil Minecraft 26.3 / DataVersion 5023 в новый мир Zerqon. Это проверенный этап импорта блоков, **не полный перенос мира**. Мобы, сущности, содержимое сундуков, инвентари игроков, остальные измерения, биомы, освещение, отложенные обновления и настройки мира пока не восстанавливаются.
+Импорт переносит блоки завершённых чанков overworld и сохраняет исходную точку появления в `world-metadata.json`. UUID нового мира создаёт Zerqon. В `source-data/files/` остаются исходные файлы с манифестом SHA-256; `level.dat` не помещается в корень native-мира. Исходник не изменяется, неподдержанные данные не исполняются.
 
-Оригинал не изменяется. Исходный сервер необходимо остановить; каталог назначения должен быть новым и находиться вне исходного мира. Неизвестные версии/блоки/свойства и повреждённые файлы вызывают ошибку. Неполные чанки генерации учитываются отдельно. Отчёт перечисляет перенесённое и пропущенное; незавершённый импорт помечается `IMPORT_INCOMPLETE`, и такой мир нельзя запустить в Zerqon.
+Нужны корректные `level.dat` и `data/minecraft/world_gen_settings.dat` версии 26.3 / 5023. Поддержан стандартный overworld. Неизвестное измерение spawn, повреждения, ссылки и превышение лимитов вызывают явную ошибку. Исходный сервер нужно остановить до импорта.
 
-Проверки включают собственные небольшие NBT/MCA-примеры и настоящий мир, созданный официальным сервером 26.3: после импорта и повторного открытия сверяются поставленные блоки на положительных и отрицательных координатах. Полная совместимость миров и восстановление всех игровых данных остаются обязательными последующими этапами.
+Политика `ExistingOnly` запрещает создавать flat-чанки вместо отсутствующего импортированного ландшафта. Игрок появляется в исходной точке с сохранённым направлением взгляда. Отсутствующие чанки пропускаются при отправке; попытка пересечь край доступной территории возвращает игрока в последнюю принятую позицию. Это проверка доступности территории, а не полноценная физика или античит. Чанк spawn проверяется при запуске. Ошибка импорта оставляет `IMPORT_INCOMPLETE`, и такой каталог нельзя открыть. Старые native-миры сохраняют прежний режим; старый импорт без метаданных требуется повторить в новый каталог.
+
+Сохранение сущностей, сундуков, playerdata, правил, времени и режима игры не означает восстановления их поведения. Отчёт разделяет применённые поля, сохранённые оригиналы и неподдержанные возможности. Полный импорт миров и его игровая совместимость остаются последующими этапами.

@@ -1,0 +1,579 @@
+{
+  "version": "26.3",
+  "protocol": 777,
+  "fixtures": [
+    {
+      "name": "creative_empty",
+      "kind": "creative_slot",
+      "body_hex": "002400",
+      "expected": {
+        "slot": 36,
+        "stack": null
+      }
+    },
+    {
+      "name": "server_empty",
+      "kind": "server_stack",
+      "body_hex": "00",
+      "expected": null
+    },
+    {
+      "name": "creative_stone64",
+      "kind": "creative_slot",
+      "body_hex": "002440010000",
+      "expected": {
+        "slot": 36,
+        "stack": {
+          "item": "minecraft:stone",
+          "count": 64,
+          "added": {},
+          "removed": []
+        }
+      }
+    },
+    {
+      "name": "server_stone64",
+      "kind": "server_stack",
+      "body_hex": "40010000",
+      "expected": {
+        "item": "minecraft:stone",
+        "count": 64,
+        "added": {},
+        "removed": []
+      }
+    },
+    {
+      "name": "creative_custom_name",
+      "kind": "creative_slot",
+      "body_hex": "002401010100060708000453616665",
+      "expected": {
+        "slot": 36,
+        "stack": {
+          "item": "minecraft:stone",
+          "count": 1,
+          "added": {
+            "minecraft:custom_name": "Safe"
+          },
+          "removed": []
+        }
+      }
+    },
+    {
+      "name": "server_custom_name",
+      "kind": "server_stack",
+      "body_hex": "010101000608000453616665",
+      "expected": {
+        "item": "minecraft:stone",
+        "count": 1,
+        "added": {
+          "minecraft:custom_name": "Safe"
+        },
+        "removed": []
+      }
+    },
+    {
+      "name": "creative_unicode_custom_name",
+      "kind": "creative_slot",
+      "body_hex": "0024010101000616080013d09fd180d0b8d0b2d0b5d18220eda0bdedb880",
+      "expected": {
+        "slot": 36,
+        "stack": {
+          "item": "minecraft:stone",
+          "count": 1,
+          "added": {
+            "minecraft:custom_name": "Привет 😀"
+          },
+          "removed": []
+        }
+      }
+    },
+    {
+      "name": "server_unicode_custom_name",
+      "kind": "server_stack",
+      "body_hex": "0101010006080013d09fd180d0b8d0b2d0b5d18220eda0bdedb880",
+      "expected": {
+        "item": "minecraft:stone",
+        "count": 1,
+        "added": {
+          "minecraft:custom_name": "Привет 😀"
+        },
+        "removed": []
+      }
+    },
+    {
+      "name": "creative_item_name",
+      "kind": "creative_slot",
+      "body_hex": "00240101010009070800044e616d65",
+      "expected": {
+        "slot": 36,
+        "stack": {
+          "item": "minecraft:stone",
+          "count": 1,
+          "added": {
+            "minecraft:item_name": "Name"
+          },
+          "removed": []
+        }
+      }
+    },
+    {
+      "name": "server_item_name",
+      "kind": "server_stack",
+      "body_hex": "01010100090800044e616d65",
+      "expected": {
+        "item": "minecraft:stone",
+        "count": 1,
+        "added": {
+          "minecraft:item_name": "Name"
+        },
+        "removed": []
+      }
+    },
+    {
+      "name": "creative_max_stack99",
+      "kind": "creative_slot",
+      "body_hex": "002463010100010163",
+      "expected": {
+        "slot": 36,
+        "stack": {
+          "item": "minecraft:stone",
+          "count": 99,
+          "added": {
+            "minecraft:max_stack_size": 99
+          },
+          "removed": []
+        }
+      }
+    },
+    {
+      "name": "server_max_stack99",
+      "kind": "server_stack",
+      "body_hex": "630101000163",
+      "expected": {
+        "item": "minecraft:stone",
+        "count": 99,
+        "added": {
+          "minecraft:max_stack_size": 99
+        },
+        "removed": []
+      }
+    },
+    {
+      "name": "creative_max_damage1000",
+      "kind": "creative_slot",
+      "body_hex": "0024019a0801000202e807",
+      "expected": {
+        "slot": 36,
+        "stack": {
+          "item": "minecraft:diamond_sword",
+          "count": 1,
+          "added": {
+            "minecraft:max_damage": 1000
+          },
+          "removed": []
+        }
+      }
+    },
+    {
+      "name": "server_max_damage1000",
+      "kind": "server_stack",
+      "body_hex": "019a08010002e807",
+      "expected": {
+        "item": "minecraft:diamond_sword",
+        "count": 1,
+        "added": {
+          "minecraft:max_damage": 1000
+        },
+        "removed": []
+      }
+    },
+    {
+      "name": "creative_damage7",
+      "kind": "creative_slot",
+      "body_hex": "0024019a080100030107",
+      "expected": {
+        "slot": 36,
+        "stack": {
+          "item": "minecraft:diamond_sword",
+          "count": 1,
+          "added": {
+            "minecraft:damage": 7
+          },
+          "removed": []
+        }
+      }
+    },
+    {
+      "name": "server_damage7",
+      "kind": "server_stack",
+      "body_hex": "019a0801000307",
+      "expected": {
+        "item": "minecraft:diamond_sword",
+        "count": 1,
+        "added": {
+          "minecraft:damage": 7
+        },
+        "removed": []
+      }
+    },
+    {
+      "name": "creative_repair_cost12",
+      "kind": "creative_slot",
+      "body_hex": "0024019a08010013010c",
+      "expected": {
+        "slot": 36,
+        "stack": {
+          "item": "minecraft:diamond_sword",
+          "count": 1,
+          "added": {
+            "minecraft:repair_cost": 12
+          },
+          "removed": []
+        }
+      }
+    },
+    {
+      "name": "server_repair_cost12",
+      "kind": "server_stack",
+      "body_hex": "019a080100130c",
+      "expected": {
+        "item": "minecraft:diamond_sword",
+        "count": 1,
+        "added": {
+          "minecraft:repair_cost": 12
+        },
+        "removed": []
+      }
+    },
+    {
+      "name": "creative_block_state",
+      "kind": "creative_slot",
+      "body_hex": "002401a30101004e080104617869730178",
+      "expected": {
+        "slot": 36,
+        "stack": {
+          "item": "minecraft:oak_log",
+          "count": 1,
+          "added": {
+            "minecraft:block_state": {
+              "axis": "x"
+            }
+          },
+          "removed": []
+        }
+      }
+    },
+    {
+      "name": "server_block_state",
+      "kind": "server_stack",
+      "body_hex": "01a30101004e0104617869730178",
+      "expected": {
+        "item": "minecraft:oak_log",
+        "count": 1,
+        "added": {
+          "minecraft:block_state": {
+            "axis": "x"
+          }
+        },
+        "removed": []
+      }
+    },
+    {
+      "name": "creative_item_model",
+      "kind": "creative_slot",
+      "body_hex": "0024010101000a12116d696e6563726166743a6469616d6f6e64",
+      "expected": {
+        "slot": 36,
+        "stack": {
+          "item": "minecraft:stone",
+          "count": 1,
+          "added": {
+            "minecraft:item_model": "minecraft:diamond"
+          },
+          "removed": []
+        }
+      }
+    },
+    {
+      "name": "server_item_model",
+      "kind": "server_stack",
+      "body_hex": "010101000a116d696e6563726166743a6469616d6f6e64",
+      "expected": {
+        "item": "minecraft:stone",
+        "count": 1,
+        "added": {
+          "minecraft:item_model": "minecraft:diamond"
+        },
+        "removed": []
+      }
+    },
+    {
+      "name": "creative_rarity_epic",
+      "kind": "creative_slot",
+      "body_hex": "0024010101000c0103",
+      "expected": {
+        "slot": 36,
+        "stack": {
+          "item": "minecraft:stone",
+          "count": 1,
+          "added": {
+            "minecraft:rarity": "epic"
+          },
+          "removed": []
+        }
+      }
+    },
+    {
+      "name": "server_rarity_epic",
+      "kind": "server_stack",
+      "body_hex": "010101000c03",
+      "expected": {
+        "item": "minecraft:stone",
+        "count": 1,
+        "added": {
+          "minecraft:rarity": "epic"
+        },
+        "removed": []
+      }
+    },
+    {
+      "name": "creative_removed_repair_cost",
+      "kind": "creative_slot",
+      "body_hex": "00240101000113",
+      "expected": {
+        "slot": 36,
+        "stack": {
+          "item": "minecraft:stone",
+          "count": 1,
+          "added": {},
+          "removed": [
+            "minecraft:repair_cost"
+          ]
+        }
+      }
+    },
+    {
+      "name": "server_removed_repair_cost",
+      "kind": "server_stack",
+      "body_hex": "0101000113",
+      "expected": {
+        "item": "minecraft:stone",
+        "count": 1,
+        "added": {},
+        "removed": [
+          "minecraft:repair_cost"
+        ]
+      }
+    },
+    {
+      "name": "slot_named",
+      "kind": "slot",
+      "body_hex": "00070024010101000608000453616665",
+      "expected": {
+        "container_id": 0,
+        "state_id": 7,
+        "slot": 36,
+        "stack": {
+          "item": "minecraft:stone",
+          "count": 1,
+          "added": {
+            "minecraft:custom_name": "Safe"
+          },
+          "removed": []
+        }
+      }
+    },
+    {
+      "name": "content",
+      "kind": "content",
+      "body_hex": "0007024001000000010101000608000453616665",
+      "expected": {
+        "container_id": 0,
+        "state_id": 7,
+        "items": [
+          {
+            "item": "minecraft:stone",
+            "count": 64,
+            "added": {},
+            "removed": []
+          },
+          null
+        ],
+        "carried": {
+          "item": "minecraft:stone",
+          "count": 1,
+          "added": {
+            "minecraft:custom_name": "Safe"
+          },
+          "removed": []
+        }
+      }
+    },
+    {
+      "name": "cursor",
+      "kind": "cursor",
+      "body_hex": "010101000608000453616665",
+      "expected": {
+        "stack": {
+          "item": "minecraft:stone",
+          "count": 1,
+          "added": {
+            "minecraft:custom_name": "Safe"
+          },
+          "removed": []
+        }
+      }
+    },
+    {
+      "name": "player_inventory",
+      "kind": "player_inventory",
+      "body_hex": "0040010000",
+      "expected": {
+        "slot": 0,
+        "stack": {
+          "item": "minecraft:stone",
+          "count": 64,
+          "added": {},
+          "removed": []
+        }
+      }
+    },
+    {
+      "name": "carried8",
+      "kind": "carried_slot",
+      "body_hex": "0008",
+      "expected": {
+        "slot": 8
+      }
+    },
+    {
+      "name": "held8",
+      "kind": "held_slot",
+      "body_hex": "08",
+      "expected": {
+        "slot": 8
+      }
+    },
+    {
+      "name": "use_on",
+      "kind": "use_item_on",
+      "body_hex": "00000000bfffffd040013e8000003f0000003f400000000011",
+      "expected": {
+        "hand": 0,
+        "position": [
+          2,
+          64,
+          -3
+        ],
+        "face": 1,
+        "hit": [
+          0.25,
+          0.5,
+          0.75
+        ],
+        "inside": false,
+        "world_border_hit": false,
+        "sequence": 17
+      }
+    },
+    {
+      "name": "click_hashed",
+      "kind": "container_click",
+      "body_hex": "000700240000010024010140010112345678010600",
+      "expected": {
+        "container_id": 0,
+        "state_id": 7,
+        "slot": 36,
+        "button": 0,
+        "mode": 0,
+        "changed_slots": [
+          {
+            "slot": 36,
+            "stack": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "added": {
+                "minecraft:max_stack_size": 305419896
+              },
+              "removed": [
+                "minecraft:custom_name"
+              ]
+            }
+          }
+        ],
+        "carried": null
+      }
+    },
+    {
+      "name": "creative_count100_rejected",
+      "kind": "creative_slot",
+      "body_hex": "002464010000",
+      "expect_error": true
+    },
+    {
+      "name": "creative_unknown_component_rejected",
+      "kind": "creative_slot",
+      "body_hex": "0024010101007a0100",
+      "expect_error": true
+    },
+    {
+      "name": "creative_truncated_component_rejected",
+      "kind": "creative_slot",
+      "body_hex": "00240101010006070800045361",
+      "expect_error": true
+    },
+    {
+      "name": "creative_negative_count_vanilla_empty",
+      "kind": "creative_slot",
+      "body_hex": "0024ffffffff0f",
+      "expected": {
+        "slot": 36,
+        "stack": null
+      },
+      "rust_reject": true,
+      "note": "Vanilla normalizes negative count to empty; Rust may require canonical zero."
+    },
+    {
+      "name": "creative_inner_trailing_byte_vanilla_accepts",
+      "kind": "creative_slot",
+      "body_hex": "00240101010006080800045361666500",
+      "expected": {
+        "slot": 36,
+        "stack": {
+          "item": "minecraft:stone",
+          "count": 1,
+          "added": {
+            "minecraft:custom_name": "Safe"
+          },
+          "removed": []
+        }
+      },
+      "rust_reject": true,
+      "note": "Vanilla skips unused bytes within a delimited component. Rust deliberately requires exact component consumption."
+    },
+    {
+      "name": "equipment_empty_hands",
+      "kind": "equipment",
+      "body_hex": "0780000100",
+      "expected": {"entity_id": 7, "slots": [{"slot": 0, "stack": null}, {"slot": 1, "stack": null}]}
+    },
+    {
+      "name": "equipment_main_stone",
+      "kind": "equipment",
+      "body_hex": "070040010000",
+      "expected": {"entity_id": 7, "slots": [{"slot": 0, "stack": {"item": "minecraft:stone", "count": 64, "added": {}, "removed": []}}]}
+    },
+    {
+      "name": "equipment_off_named",
+      "kind": "equipment",
+      "body_hex": "0701010101000608000453616665",
+      "expected": {"entity_id": 7, "slots": [{"slot": 1, "stack": {"item": "minecraft:stone", "count": 1, "added": {"minecraft:custom_name": "Safe"}, "removed": []}}]}
+    },
+    {
+      "name": "equipment_empty_list_is_truncated",
+      "kind": "equipment",
+      "body_hex": "07",
+      "expect_error": true
+    }
+  ]
+}

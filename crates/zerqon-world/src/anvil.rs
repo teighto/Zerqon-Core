@@ -27,6 +27,10 @@ pub struct ImportReport {
     pub unsupported_root_fields: std::collections::BTreeSet<String>,
     pub source_artifacts_not_imported: Vec<String>,
     pub full_world_import: bool,
+    pub world_id: Option<uuid::Uuid>,
+    pub applied: Vec<String>,
+    pub retained: Option<crate::metadata::RetainedSource>,
+    pub not_supported: Vec<String>,
 }
 
 pub fn import_world_blocks(
@@ -34,22 +38,21 @@ pub fn import_world_blocks(
     destination: &Path,
     resolver: &impl Fn(&str, &BTreeMap<String, String>) -> Option<u32>,
 ) -> Result<ImportReport, ImportError> {
-    let source = source.canonicalize()?;
-    if !source.is_dir() {
-        return Err(invalid("source world must be a directory"));
-    }
+    let snapshot = crate::source_data::SourceSnapshot::open(source)?;
+    let source = snapshot.root().to_owned();
+    let mut world_metadata = crate::WorldMetadata::from_vanilla(&source)?;
+    crate::metadata::reject_links(destination)?;
     if destination.try_exists()? || std::fs::symlink_metadata(destination).is_ok() {
         return Err(invalid("destination must not already exist"));
     }
     let parent = destination
         .parent()
         .ok_or_else(|| invalid("destination needs a parent directory"))?;
-    let parent = if parent.as_os_str().is_empty() {
+    let parent = crate::metadata::source_root(if parent.as_os_str().is_empty() {
         Path::new(".")
     } else {
         parent
-    }
-    .canonicalize()?;
+    })?;
     if parent.starts_with(&source) {
         return Err(invalid("destination must be outside the source world"));
     }
@@ -107,16 +110,59 @@ pub fn import_world_blocks(
         return Err(invalid("duplicate region coordinates"));
     }
     std::fs::create_dir(destination)?;
-    let store = crate::WorldStore::open(destination)?;
     let marker = destination.join("IMPORT_INCOMPLETE");
-    std::fs::write(
-        &marker,
-        "Block-only import in progress. Do not run this world unless import-report.json exists and this marker is absent. Original world is untouched.\n",
-    )?;
+    use std::io::Write;
+    let mut marker_file = match std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&marker)
+    {
+        Ok(file) => file,
+        Err(error) => {
+            if let Err(cleanup) = std::fs::remove_dir(destination) {
+                return Err(invalid(format!(
+                    "cannot create import marker ({error}); empty destination cleanup failed ({cleanup})"
+                )));
+            }
+            return Err(error.into());
+        }
+    };
+    marker_file.write_all(b"World import in progress; do not remove this marker. Original source data is unchanged.\n")?;
+    marker_file.sync_all()?;
+    drop(marker_file);
+    #[cfg(unix)]
+    {
+        File::open(destination)?.sync_all()?;
+        File::open(&parent)?.sync_all()?;
+    }
+    let store = crate::WorldStore::open_import(destination)?;
+    world_metadata.retained_source = Some(snapshot.retain_into(destination, &world_metadata)?);
+    let retained_root = destination.join("source-data/files");
     let mut report = ImportReport {
         minecraft_version: "26.3".into(),
         data_version: DATA_VERSION,
         full_world_import: false,
+        world_id: Some(world_metadata.world_id),
+        applied: vec![
+            "chunk.block_states".into(),
+            "world_metadata.identity".into(),
+            "world_metadata.spawn".into(),
+            "generation_policy.existing_only".into(),
+        ],
+        retained: world_metadata.retained_source.clone(),
+        not_supported: vec![
+            "source_game_mode_execution".into(),
+            "source_game_time_execution".into(),
+            "source_difficulty_execution".into(),
+            "source_game_rules_and_clocks_execution".into(),
+            "source_generator_execution".into(),
+            "non_overworld_chunks".into(),
+            "biomes_and_lighting".into(),
+            "block_entity_behavior_and_inventories".into(),
+            "scheduled_ticks".into(),
+            "vanilla_entities_and_playerdata".into(),
+            "datapack_execution".into(),
+        ],
         ..ImportReport::default()
     };
     for artifact in [
@@ -183,7 +229,10 @@ pub fn import_world_blocks(
         }
     }
     for (x, z, path) in files {
-        let mut region = RegionReader::open(&path, x, z)?;
+        let relative = path
+            .strip_prefix(&source)
+            .map_err(|_| invalid("region escaped source world"))?;
+        let mut region = RegionReader::open(&retained_root.join(relative), x, z)?;
         for local_z in 0..32 {
             for local_x in 0..32 {
                 let imported = match region.read_chunk(local_x, local_z, resolver) {
@@ -214,16 +263,18 @@ pub fn import_world_blocks(
     if report.chunks == 0 {
         return Err(invalid("source contains no completed overworld chunks"));
     }
+    world_metadata.write_new(destination)?;
     let bytes = serde_json::to_vec_pretty(&report)
         .map_err(|error| invalid(format!("report serialization: {error}")))?;
-    use std::io::Write;
-    let mut report_file = std::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(destination.join("import-report.json"))?;
+    let mut report_file = tempfile::NamedTempFile::new_in(destination)?;
     report_file.write_all(&bytes)?;
-    report_file.sync_all()?;
+    report_file.as_file().sync_all()?;
+    report_file
+        .persist_noclobber(destination.join("import-report.json"))
+        .map_err(|error| error.error)?;
     std::fs::remove_file(marker)?;
+    #[cfg(unix)]
+    File::open(destination)?.sync_all()?;
     Ok(report)
 }
 
@@ -580,7 +631,7 @@ fn palette_entry(value: fastnbt::Value) -> Result<PaletteEntry, ImportError> {
     }
 }
 
-fn validate_nbt(data: &[u8]) -> Result<Vec<String>, ImportError> {
+pub(crate) fn validate_nbt(data: &[u8]) -> Result<Vec<String>, ImportError> {
     if data.len() > MAX_NBT {
         return Err(invalid("NBT exceeds 8 MiB"));
     }

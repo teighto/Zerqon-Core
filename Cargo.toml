@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/zerqon-protocol", "crates/zerqon-world", "crates/zerqon-plugin-api", "crates/zerqon-plugins", "crates/zerqon-entities", "crates/zerqon-profiler", "examples/hello-plugin"]
+members = [".", "crates/zerqon-protocol", "crates/zerqon-world", "crates/zerqon-plugin-api", "crates/zerqon-plugins", "crates/zerqon-entities", "crates/zerqon-profiler", "crates/zerqon-inventory", "examples/hello-plugin"]
 resolver = "3"
 
 [workspace.package]
@@ -36,6 +36,7 @@ zerqon-protocol = { path = "crates/zerqon-protocol" }
 zerqon-world = { path = "crates/zerqon-world" }
 zerqon-entities = { path = "crates/zerqon-entities" }
 zerqon-profiler = { path = "crates/zerqon-profiler" }
+zerqon-inventory = { path = "crates/zerqon-inventory" }
 zerqon-plugins = { path = "crates/zerqon-plugins" }
 zerqon-plugin-api = { path = "crates/zerqon-plugin-api" }
 tokio.workspace = true

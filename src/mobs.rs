@@ -365,7 +365,7 @@ impl LiveMobs {
             }
             self.visible.insert(observer, current);
             if !batch.is_empty() {
-                dispatch.push((player.uuid, player.id, batch));
+                dispatch.push((player.uuid, player.id, batch.into()));
             }
         }
         self.last_yaw = mobs.iter().map(|mob| (mob.id, mob.yaw)).collect();
@@ -400,7 +400,8 @@ fn spawn_packets(mob: &Mob, data: &GameData) -> Result<PacketBatch> {
     Ok(vec![
         entity_packets::add_entity(mob.id, mob.uuid, kind, mob.position, mob.yaw, mob.pitch).into(),
         entity_packets::mob_health(mob.id, mob.health).into(),
-    ])
+    ]
+    .into())
 }
 
 struct ChunkView {

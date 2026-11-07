@@ -1,6 +1,6 @@
 # Zerqon implementation plan
 
-Target: Minecraft Java Edition **26.3**, wire protocol **777**. The engine is written from scratch in Rust. Java is permitted for the optional JAR launcher and plugin compatibility host, not for world simulation. Version 0.0.1 is a development milestone until the acceptance gates below pass.
+Target: Minecraft Java Edition **26.3**, wire protocol **777**. The engine is written from scratch in Rust. Java runs optional server plugins and prepares the initial game data. World simulation runs in Rust. Version 0.0.1 is a development milestone until the acceptance gates below pass.
 
 ## Delivery gates
 
@@ -10,12 +10,12 @@ Target: Minecraft Java Edition **26.3**, wire protocol **777**. The engine is wr
 4. **Playable world**: block interactions, inventories, entities, combat, survival, crafting, fluids, lighting, redstone, dimensions, generation, commands, permissions and datapacks. Track vanilla parity with executable differential tests, not advertised API names.
 5. **Rust plugins**: versioned sandboxed ABI, lifecycle, commands, events, scheduling, permissions and world operations; SDK, examples and failure isolation. Verify real compiled Rust plugins, time/memory limits and restart behavior.
 6. **Java/Paper plugins**: optional JVM bridge, classloading, lifecycle, configuration, commands/events/scheduler, inventory/world/entity APIs and services. Maintain a method-level support matrix. Unsupported methods fail explicitly. Verify real third-party plugins; never substitute successful no-ops. Preserve Paper's synchronous execution contract through an ownership barrier.
-7. **Operations**: useful console and in-game commands, /tps, /tpsbar, profiling, spark integration, monitoring, backups, resource limits and secure defaults. Rust metrics and spark JVM samples must be identified separately.
+7. **Operations**: useful console and in-game commands, /tps, /tpsbar, profiling, spark integration, monitoring, backups, resource limits and secure defaults. Profiles must identify the runtime and threads actually sampled.
 8. **Production gate**: full integration suite, vanilla/Horizon compatibility, realistic multi-client soak, memory/CPU profiles, crash recovery, security review and documented limitations. Publish measured results and only then designate a production release.
 
 ## Publication
 
-Keep source, tests, essential documentation, reproducible build scripts and genuine screenshots. Exclude generated worlds, credentials, downloaded game assets, tool caches, local reports and binaries from Git. Release archives may contain compiled binaries and the JAR launcher. Preserve dependency licenses. Commit author: teighto. Release notes must describe only verified capabilities.
+Keep source, tests, essential documentation, reproducible build scripts and genuine screenshots. Exclude generated worlds, credentials, downloaded game assets, tool caches, local reports and binaries from Git. Release archives contain the native server and its plugin libraries. Preserve dependency licenses. Commit author: teighto. Release notes must describe only verified capabilities.
 
 ## План на русском
 

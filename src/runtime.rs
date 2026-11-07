@@ -5,6 +5,7 @@ use crate::{
     game_data::GameData,
     java_plugins::{JavaPluginConfig, JavaPlugins},
     mobs::{MobConfig, Mobs},
+    player_inventory::InventoryService,
     players::{EntityIds, Players},
     server::TickStats,
 };
@@ -16,9 +17,10 @@ use std::{
 };
 use tokio::sync::{Semaphore, watch};
 use uuid::Uuid;
+use zerqon_inventory::ItemCatalog;
 use zerqon_plugin_api::{Action, Event, LogLevel, SenderKind};
 use zerqon_plugins::{Limits, PluginManager};
-use zerqon_world::{Chunk, ChunkCache, ChunkWorkers, WorldStore};
+use zerqon_world::{Chunk, ChunkCache, ChunkWorkers, GenerationPolicy, SpawnPoint, WorldStore};
 
 #[derive(Clone, Copy)]
 pub enum CommandSource<'a> {
@@ -40,6 +42,8 @@ pub struct State {
     pub stats: Mutex<TickStats>,
     pub data: Option<Arc<GameData>>,
     pub world: Option<Arc<World>>,
+    pub items: Option<Arc<ItemCatalog>>,
+    pub inventories: Option<Arc<InventoryService>>,
     pub mobs: Option<Arc<Mobs>>,
     pub auth: Option<Authenticator>,
     pub players: Arc<Players>,
@@ -81,6 +85,14 @@ impl State {
             })
             .transpose()?
             .map(Arc::new);
+        let items = if status_only {
+            None
+        } else {
+            let path = directory.join(&settings.data_directory);
+            Some(Arc::new(
+                tokio::task::spawn_blocking(move || ItemCatalog::load(&path)).await??,
+            ))
+        };
         let auth = if properties.online_mode && !status_only {
             Some(Authenticator::new().await?)
         } else {
@@ -141,6 +153,17 @@ impl State {
                 .unwrap_or(0),
             Arc::clone(&entity_ids),
         );
+        let inventories = items
+            .as_ref()
+            .map(|catalog| {
+                InventoryService::new(
+                    directory.join(&properties.level_name).join("playerdata"),
+                    Arc::clone(catalog),
+                    Arc::clone(&players),
+                    properties.max_players,
+                )
+            })
+            .transpose()?;
         let mobs = match (&world, &data) {
             (Some(world), Some(data)) => Some(
                 Mobs::open(
@@ -166,6 +189,8 @@ impl State {
             stats: Mutex::new(TickStats::new()),
             data,
             world,
+            items,
+            inventories,
             mobs,
             auth,
             players,
@@ -181,6 +206,13 @@ impl State {
             updates,
             plugin_slots: Arc::new(Semaphore::new(32)),
         });
+        if let Some(items) = &state.items {
+            tracing::info!(
+                items = items.item_count(),
+                components = items.component_count(),
+                "Loaded item catalog"
+            );
+        }
         for loaded in loaded {
             let name = loaded
                 .path
@@ -369,7 +401,7 @@ impl State {
             "spark"=>Ok(self.profiler.execute(&args,level>=4).await?),
             "list"=>Ok(vec![format!("Players ({}): {}",self.online(),self.players.names().join(", "))]),
             "version"=>Ok(vec![format!("Zerqon {} | Minecraft 26.3 | teighto",env!("CARGO_PKG_VERSION"))]),
-            "help"=>Ok(vec!["Commands: /help /version /tps /tpsbar /plugins; operator: /summon pig|cow|zombie [x y z], /setblock x y z state, /stop".into()]),
+            "help"=>Ok(vec!["Commands: /help /version /tps /tpsbar /plugins; operator: /give player item [count], /summon pig|cow|zombie [x y z], /setblock x y z state, /stop".into()]),
             "plugins"=>{let rust=self.plugins.lock().map_err(|_|"plugin lock poisoned")?.list().iter().map(|plugin|format!("{} ({})",plugin.name,if plugin.enabled{"enabled"}else{"disabled"})).collect::<Vec<_>>().join(", ");let java=if let Some(java)=&self.java{java.list().await?.iter().map(|plugin|format!("{} ({})",plugin.name,if plugin.enabled{"enabled"}else{"disabled"})).collect::<Vec<_>>().join(", ")}else{"disabled".into()};Ok(vec![format!("Rust: {rust}; Java: {java}")])},
             "stop"=>{if level<4{return Ok(vec!["Permission denied".into()]);}let _=self.shutdown.send(true);Ok(vec!["Stopping Zerqon".into()])},
             "setblock"=>{
@@ -380,6 +412,14 @@ impl State {
                 world.set_block(x,y,z,block).await?;
                 self.broadcast(block_update(x,y,z,block));
                 Ok(vec![format!("Block set at {x} {y} {z}")])
+            },
+            "give"=>{
+                if level<2{return Ok(vec!["Permission denied".into()]);}
+                if !(2..=3).contains(&args.len()){return Ok(vec!["Usage: /give player minecraft:item [count 1..4096]".into()]);}
+                let count=if args.len()==3{args[2].parse::<u32>()?}else{1};
+                let player=self.players.snapshots()?.into_iter().find(|player|player.name.eq_ignore_ascii_case(&args[0])).ok_or("Player is not connected")?;
+                self.inventories.as_ref().ok_or("Inventory service unavailable")?.give(player.uuid,player.id,&args[1],count).await?;
+                Ok(vec![format!("Gave {count} {} to {}",args[1],player.name)])
             },
             "summon"=>{
                 if level<2{return Ok(vec!["Permission denied".into()]);}
@@ -418,6 +458,7 @@ fn is_builtin(name: &str) -> bool {
             | "setblock"
             | "spark"
             | "summon"
+            | "give"
             | "op"
             | "deop"
     )
@@ -442,6 +483,26 @@ pub struct World {
     stripes: Arc<[Mutex<()>; 64]>,
 }
 impl World {
+    pub fn spawn(&self) -> SpawnPoint {
+        self.store.metadata().map_or_else(
+            || SpawnPoint {
+                dimension: "minecraft:overworld".into(),
+                position: [0, 64, 0],
+                yaw: 0.0,
+                pitch: 0.0,
+            },
+            |metadata| metadata.spawn.clone(),
+        )
+    }
+    pub fn existing_only(&self) -> bool {
+        self.store.generation_policy() == GenerationPolicy::ExistingOnly
+    }
+    pub fn missing_imported_chunk(error: &(dyn std::error::Error + 'static)) -> bool {
+        matches!(
+            error.downcast_ref::<zerqon_world::WorldError>(),
+            Some(zerqon_world::WorldError::MissingImportedChunk { .. })
+        )
+    }
     pub async fn execute<T: Send + 'static>(
         &self,
         job: impl FnOnce() -> Result<T> + Send + 'static,
@@ -489,8 +550,16 @@ impl World {
         .await
     }
     fn new(path: &Path, settings: &Settings, data: Arc<GameData>) -> Result<Self> {
+        let store = WorldStore::open(path)?;
+        if let Some(metadata) = store.metadata() {
+            let [x, _, z] = metadata.spawn.position;
+            let spawn = store
+                .load(x.div_euclid(16), z.div_euclid(16))?
+                .ok_or("imported spawn chunk is unavailable")?;
+            validate_chunk(&spawn, &data)?;
+        }
         Ok(Self {
-            store: Arc::new(WorldStore::open(path)?),
+            store: Arc::new(store),
             cache: Arc::new(Mutex::new(ChunkCache::with_limits(
                 settings.chunk_cache_capacity,
                 256 * 1024 * 1024,

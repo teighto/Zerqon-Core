@@ -1,6 +1,26 @@
 use std::collections::BTreeMap;
 use zerqon_world::anvil::RegionReader;
 use zerqon_world::anvil::{ImportError, import_world_blocks};
+use zerqon_world::{GenerationPolicy, WorldError};
+
+fn source_metadata(root: &std::path::Path) {
+    std::fs::create_dir_all(root.join("data/minecraft")).unwrap();
+    std::fs::write(
+        root.join("level.dat"),
+        include_bytes!("fixtures/metadata-level.dat"),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("data/minecraft/world_gen_settings.dat"),
+        include_bytes!("fixtures/metadata-world-gen-settings.dat"),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("data/minecraft/game_rules.dat"),
+        include_bytes!("fixtures/metadata-game-rules.dat"),
+    )
+    .unwrap();
+}
 
 fn resolve(name: &str, properties: &BTreeMap<String, String>) -> Option<u32> {
     match (
@@ -135,12 +155,30 @@ fn block_import_preserves_original_and_reports_unimported_world_data() {
     let path = source.join("dimensions/minecraft/overworld/region/r.-1.-2.mca");
     let original = std::fs::read(fixture_path()).unwrap();
     std::fs::write(&path, &original).unwrap();
-    std::fs::write(source.join("level.dat"), "preserve me").unwrap();
+    source_metadata(&source);
+    std::fs::create_dir_all(source.join("data/custom")).unwrap();
+    std::fs::write(source.join("data/custom/opaque.dat"), [255, 0, 1, 2, 3]).unwrap();
     let destination = root.path().join("new-world");
     let report = import_world_blocks(&source, &destination, &resolve).unwrap();
     assert_eq!(report.chunks, 1);
     assert_eq!(report.block_entities_not_imported, 1);
     assert!(!report.full_world_import);
+    assert!(report.applied.contains(&"world_metadata.spawn".into()));
+    assert!(
+        report
+            .not_supported
+            .contains(&"source_game_mode_execution".into())
+    );
+    assert_eq!(report.retained.as_ref().unwrap().files, 5);
+    assert_eq!(
+        std::fs::read(destination.join("source-data/files/level.dat")).unwrap(),
+        include_bytes!("fixtures/metadata-level.dat")
+    );
+    assert_eq!(
+        std::fs::read(destination.join("source-data/files/data/custom/opaque.dat")).unwrap(),
+        [255, 0, 1, 2, 3]
+    );
+    assert!(!destination.join("level.dat").exists());
     assert!(
         report
             .source_artifacts_not_imported
@@ -148,14 +186,45 @@ fn block_import_preserves_original_and_reports_unimported_world_data() {
     );
     assert!(!destination.join("IMPORT_INCOMPLETE").exists());
     let store = zerqon_world::WorldStore::open(&destination).unwrap();
+    assert_eq!(store.generation_policy(), GenerationPolicy::ExistingOnly);
+    let metadata = store.metadata().unwrap();
+    assert_eq!(metadata.spawn.position, [-1, -60, -513]);
+    assert_eq!(Some(metadata.world_id), report.world_id);
+    assert!(matches!(
+        store.load(0, 0),
+        Err(WorldError::MissingImportedChunk { x: 0, z: 0 })
+    ));
+    let flat = zerqon_world::Chunk::flat(
+        0,
+        0,
+        zerqon_world::FlatPalette {
+            air: 0,
+            bedrock: 77,
+            stone: 77,
+            dirt: 77,
+            grass: 77,
+        },
+    );
+    assert!(matches!(
+        store.save(&flat),
+        Err(WorldError::MissingImportedChunk { x: 0, z: 0 })
+    ));
+    assert!(!destination.join("c.0.0.zqc").exists());
     assert_eq!(
         store.load(-1, -33).unwrap().unwrap().get_block(15, -64, 0),
         Some(101)
     );
     assert_eq!(std::fs::read(&path).unwrap(), original);
     assert_eq!(
-        std::fs::read_to_string(source.join("level.dat")).unwrap(),
-        "preserve me"
+        std::fs::read(source.join("level.dat")).unwrap(),
+        include_bytes!("fixtures/metadata-level.dat")
+    );
+    assert_eq!(
+        std::fs::read(
+            destination.join("source-data/files/dimensions/minecraft/overworld/region/r.-1.-2.mca")
+        )
+        .unwrap(),
+        original
     );
     assert!(import_world_blocks(&source, &destination, &resolve).is_err());
     assert!(import_world_blocks(&source, &source.join("nested"), &resolve).is_err());
@@ -167,11 +236,210 @@ fn failed_import_keeps_an_explicit_incomplete_marker() {
     let source = root.path().join("source");
     std::fs::create_dir_all(source.join("region")).unwrap();
     std::fs::copy(fixture_path(), source.join("region/r.-1.-2.mca")).unwrap();
+    source_metadata(&source);
     let destination = root.path().join("failed");
     assert!(import_world_blocks(&source, &destination, &|_, _| None).is_err());
     assert!(destination.join("IMPORT_INCOMPLETE").is_file());
     assert!(!destination.join("import-report.json").exists());
     assert!(zerqon_world::WorldStore::open(&destination).is_err());
+}
+
+#[test]
+fn active_source_lock_rejects_import_before_creating_destination() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    std::fs::create_dir_all(source.join("region")).unwrap();
+    source_metadata(&source);
+    std::fs::copy(fixture_path(), source.join("region/r.-1.-2.mca")).unwrap();
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(source.join("session.lock"))
+        .unwrap();
+    lock.try_lock().unwrap();
+    let destination = root.path().join("new");
+    assert!(import_world_blocks(&source, &destination, &resolve).is_err());
+    assert!(!destination.exists());
+    lock.unlock().unwrap();
+    drop(lock);
+    let report = import_world_blocks(&source, &destination, &resolve).unwrap();
+    assert_eq!(report.chunks, 1);
+    assert!(!destination.join("source-data/files/session.lock").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn hardlinked_session_lock_is_rejected_before_retaining_any_alias() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    std::fs::create_dir_all(source.join("region")).unwrap();
+    source_metadata(&source);
+    std::fs::copy(fixture_path(), source.join("region/r.-1.-2.mca")).unwrap();
+    std::fs::write(source.join("session.lock"), b"original").unwrap();
+    std::fs::hard_link(source.join("session.lock"), source.join("opaque-alias.dat")).unwrap();
+    let destination = root.path().join("new");
+    assert!(import_world_blocks(&source, &destination, &resolve).is_err());
+    assert!(!destination.exists());
+    assert_eq!(
+        std::fs::read(source.join("session.lock")).unwrap(),
+        b"original"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn fifo_session_lock_is_rejected_without_waiting_for_a_writer() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    std::fs::create_dir_all(&source).unwrap();
+    let fifo = source.join("session.lock");
+    rustix::fs::mkfifoat(
+        rustix::fs::CWD,
+        &fifo,
+        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+    )
+    .unwrap();
+    let destination = root.path().join("new");
+    let target = destination.clone();
+    let (send, receive) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let _ = send.send(import_world_blocks(&source, &target, &resolve));
+    });
+    let timely = receive.recv_timeout(std::time::Duration::from_secs(1));
+    if timely.is_err() {
+        let _writer = rustix::fs::open(
+            &fifo,
+            rustix::fs::OFlags::WRONLY | rustix::fs::OFlags::NONBLOCK,
+            rustix::fs::Mode::empty(),
+        )
+        .unwrap();
+        receive
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap()
+            .unwrap_err();
+    }
+    worker.join().unwrap();
+    assert!(
+        timely.is_ok(),
+        "opening a FIFO session.lock blocked before type validation"
+    );
+    assert!(timely.unwrap().is_err());
+    assert!(!destination.exists());
+}
+
+#[test]
+fn raw_manifest_corruption_is_not_accepted_on_reopen() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    std::fs::create_dir_all(source.join("region")).unwrap();
+    source_metadata(&source);
+    std::fs::copy(fixture_path(), source.join("region/r.-1.-2.mca")).unwrap();
+    let destination = root.path().join("new");
+    import_world_blocks(&source, &destination, &resolve).unwrap();
+    std::fs::write(destination.join("source-data/manifest.json"), b"{}").unwrap();
+    assert!(zerqon_world::WorldStore::open(&destination).is_err());
+}
+
+#[test]
+fn source_directory_links_cannot_copy_unrelated_files_into_the_snapshot() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    let outside = root.path().join("outside");
+    std::fs::create_dir_all(source.join("region")).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("private.txt"), b"preserve outside").unwrap();
+    source_metadata(&source);
+    std::fs::copy(fixture_path(), source.join("region/r.-1.-2.mca")).unwrap();
+    let link = source.join("unrelated");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let script = format!(
+            "New-Item -ItemType Junction -Path '{}' -Target '{}' | Out-Null",
+            link.display().to_string().replace('\'', "''"),
+            outside.display().to_string().replace('\'', "''")
+        );
+        let output = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .creation_flags(0x08000000)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside, &link).unwrap();
+    let destination = root.path().join("new");
+    assert!(import_world_blocks(&source, &destination, &resolve).is_err());
+    assert!(!destination.exists());
+    assert_eq!(
+        std::fs::read(outside.join("private.txt")).unwrap(),
+        b"preserve outside"
+    );
+}
+
+#[test]
+#[ignore = "Requires Java25; checks source lock interoperability with vanilla FileChannel semantics"]
+fn java_file_channel_lock_blocks_import_without_modifying_source() {
+    use std::io::{BufRead, Write};
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+    struct Process(std::process::Child);
+    impl Drop for Process {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    std::fs::create_dir_all(source.join("region")).unwrap();
+    source_metadata(&source);
+    std::fs::copy(fixture_path(), source.join("region/r.-1.-2.mca")).unwrap();
+    std::fs::write(source.join("session.lock"), b"original lock bytes").unwrap();
+    let oracle =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/SessionLock.java");
+    let mut process = Process(
+        Command::new("java")
+            .arg("--source")
+            .arg("25")
+            .arg(oracle)
+            .arg(source.join("session.lock"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    let stdout = process.0.stdout.take().unwrap();
+    let (send, receive) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let result = std::io::BufReader::new(stdout).read_line(&mut line);
+        let _ = send.send((result, line));
+    });
+    let (result, line) = receive.recv_timeout(Duration::from_secs(15)).unwrap();
+    result.unwrap();
+    assert_eq!(line.trim(), "locked");
+    let destination = root.path().join("new");
+    let result = import_world_blocks(&source, &destination, &resolve);
+    process.0.stdin.as_mut().unwrap().write_all(b"\n").unwrap();
+    let started = Instant::now();
+    loop {
+        if let Some(status) = process.0.try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        assert!(started.elapsed() < Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(result.is_err());
+    assert!(!destination.exists());
+    assert_eq!(
+        std::fs::read(source.join("session.lock")).unwrap(),
+        b"original lock bytes"
+    );
 }
 
 #[test]
@@ -224,6 +492,17 @@ fn imports_real_vanilla_263_world_and_preserves_explicit_blocks() {
         report.light_sections_not_imported
     );
     let store = zerqon_world::WorldStore::open(&world).unwrap();
+    assert_eq!(store.metadata().unwrap().spawn.position, [0, -60, 0]);
+    assert_eq!(store.metadata().unwrap().source.data_version, 5023);
+    assert_eq!(store.generation_policy(), GenerationPolicy::ExistingOnly);
+    assert_eq!(
+        std::fs::read(world.join("source-data/files/level.dat")).unwrap(),
+        std::fs::read(root.join(".local/vanilla-world-filled/world/level.dat")).unwrap()
+    );
+    assert!(matches!(
+        store.load(2000, 2000),
+        Err(WorldError::MissingImportedChunk { .. })
+    ));
     assert_eq!(
         store.load(0, 0).unwrap().unwrap().get_block(0, 70, 0),
         resolver("minecraft:diamond_block", &BTreeMap::new())

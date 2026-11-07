@@ -11,7 +11,7 @@ Zerqon is a Minecraft 26.3 server written in Rust by teighto. The project focuse
 
 The server keeps the familiar folder layout: worlds, logs, configuration files and a plugins folder. Java and Rust plugins can run on the same server, while players connect with their usual client.
 
-Version 0.0.1 is in development. The test world has players and mobs, and Java and Rust plugins run together. Survival, complete world transfers and full Paper support still need work.
+Version 0.0.1 is in development. Players can join, see each other and mobs, and keep their inventory between restarts. Java and Rust plugins run together. Existing worlds can be imported for testing, with their original spawn point. Survival, complete world transfers and full Paper support still need work.
 
 ### Paper and Zerqon
 
@@ -86,7 +86,7 @@ world/
 
 `server.properties` contains the address, port, MOTD and Minecraft settings. `server.settings` contains thread counts, cache limits and plugin settings. Start with the defaults, then adjust the values for your server.
 
-Put Rust `.wasm` plugins in `plugins/rust-plugins/` and Java `.jar` plugins in `plugins/java-plugins/`. Java plugins currently use Zerqon's own API. Players do not need to install them.
+Put Rust `.wasm` plugins in `plugins/rust-plugins/` and Java `.jar` plugins in `plugins/java-plugins/`. Java plugins can use Zerqon's own API; some Paper features also work through the experimental bridge. Check the [compatibility list](docs/JAVA_COMPATIBILITY.md) before moving a plugin. Players do not need to install server plugins.
 
 [Configuration](docs/CONFIGURATION.md) · [Rust plugin development](docs/RUST_PLUGINS.md) · [Java plugin development](docs/JAVA_PLUGINS.md) · [Paper compatibility](docs/JAVA_COMPATIBILITY.md)
 
@@ -97,7 +97,7 @@ Zerqon, сервер Minecraft 26.3 на Rust от teighto. Работа над 
 
 Папки остаются привычными: миры, логи, настройки и плагины. На одном сервере можно использовать Java- и Rust-плагины. Игроки подключаются обычным клиентом.
 
-Версия 0.0.1 в разработке. В тестовом мире видны игроки и мобы, Java- и Rust-плагины работают вместе. Выживание, полный перенос миров и совместимость со всем Paper API ещё дорабатываются.
+Версия 0.0.1 в разработке. Игроки видят друг друга и мобов, инвентарь сохраняется между запусками. Java- и Rust-плагины работают вместе. Готовый мир можно импортировать для проверки: исходная точка появления сохраняется. Выживание, полный перенос миров и совместимость со всем Paper API ещё дорабатываются.
 
 ### Paper и Zerqon
 
@@ -155,7 +155,7 @@ cargo run --release
 
 Адрес, порт, MOTD и настройки Minecraft находятся в `server.properties`. Потоки, кеш и настройки плагинов находятся в `server.settings`. Все значения по умолчанию создаются при первом запуске.
 
-Rust-плагины `.wasm` кладутся в `plugins/rust-plugins/`, Java-плагины `.jar` в `plugins/java-plugins/`. Сейчас Java-плагины используют собственный API Zerqon. Игрокам устанавливать плагины не нужно.
+Rust-плагины `.wasm` кладутся в `plugins/rust-plugins/`, Java-плагины `.jar` в `plugins/java-plugins/`. Для Java есть собственный API Zerqon и экспериментальная поддержка части Paper. Перед переносом плагина проверьте [список совместимости](docs/JAVA_COMPATIBILITY.md). Игрокам устанавливать серверные плагины не нужно.
 
 [Настройки](docs/CONFIGURATION.md) · [Разработка на Rust](docs/RUST_PLUGINS.md) · [Разработка на Java](docs/JAVA_PLUGINS.md) · [Совместимость с Paper](docs/JAVA_COMPATIBILITY.md)
 

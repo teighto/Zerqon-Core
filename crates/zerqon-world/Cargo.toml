@@ -16,6 +16,11 @@ fastnbt = "2.6.3"
 flate2 = "1"
 serde.workspace = true
 serde_json.workspace = true
+uuid.workspace = true
+sha2 = "0.11"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1", features = ["fs"] }
 
 [dev-dependencies]
 proptest = "1"

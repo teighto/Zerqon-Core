@@ -21,6 +21,7 @@ server/
 ├── config/                # reserved configuration directory
 ├── logs/latest.log
 └── world/                 # Zerqon chunk storage
+    └── playerdata/        # inventories saved by player UUID
 ```
 
 `--directory PATH` selects the server directory. Relative `data_directory` paths resolve from it. Game data is prepared automatically inside `.cache/vanilla/26.3`. Keep the Java plugin libraries from the distribution in that server directory's `libraries/` folder.
@@ -90,11 +91,15 @@ When running through Cargo, place operational flags after `--`, for example `car
 
 Use `help`, `version`, `tps`, `plugins` and `stop` in the console. `op NAME` grants access to a connected player by UUID. `deop NAME` or `deop UUID` removes it. Names in `ops.json` are labels; matching a name does not grant access. Old name-only files are rejected. In-game `/tpsbar` toggles a boss bar; `/setblock X Y Z STATE-ID` changes and saves a block. Core commands use operator levels. A full permission-provider API is still being developed.
 
+`/give PLAYER minecraft:ITEM [COUNT]` gives items to a connected player and requires operator level 2. The default count is 1; the limit is 4,096. If the full amount does not fit, nothing is added. Inventories are saved under the world's `playerdata/` directory and restored by UUID. Item dropping, crafting and special container behavior are still being developed.
+
 `/tps` reports the recent coordinator tick rate and average measured tick work. The built-in Rust CPU profiler uses `/spark profiler start` and `/spark profiler stop` on Linux. It saves reports in `profiles/`; see [Profiling](PROFILING.md). The append-only `logs/latest.log` is not automatically rotated. `RUST_LOG` selects log verbosity, for example `info` or `zerqon=debug`.
 
 ## Русский
 
 Обычный запуск из исходников — `cargo run --release`, без флагов. Нативная сборка запускается через `./zerqon` или `.\zerqon.exe`. Первый запуск создаёт недостающие конфиги; перед запуском сервера нужно принять Minecraft EULA.
+
+Команда `/give ИГРОК minecraft:ПРЕДМЕТ [КОЛИЧЕСТВО]` выдаёт предметы подключённому игроку; нужен второй уровень оператора. По умолчанию выдаётся один предмет, максимум — 4 096. Если места не хватает на всё количество, команда ничего не добавляет. Инвентарь сохраняется по UUID в `world/playerdata/`. Выбрасывание предметов, крафт и работа специальных контейнеров ещё дорабатываются.
 
 `cargo run --release -- --init` создаёт конфиги и завершает работу, `cargo run --release -- --check-config` проверяет значения без запуска сети. Настройки применяются после перезапуска. `server.properties` содержит адрес, порт, MOTD, онлайн-проверку аккаунтов и параметры Minecraft. `server.settings` — TOML с настройками потоков, кеша, очередей и плагинов. Неизвестные и повторяющиеся ключи отвергаются.
 

@@ -1,4 +1,6 @@
-use crate::{Chunk, SECTION_COUNT, SECTION_VOLUME, Section, WorldError};
+use crate::{
+    Chunk, GenerationPolicy, SECTION_COUNT, SECTION_VOLUME, Section, WorldError, WorldMetadata,
+};
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -13,42 +15,81 @@ pub struct WorldStore {
     root: PathBuf,
     _lock: File,
     stripes: [RwLock<()>; 64],
+    metadata: Option<WorldMetadata>,
 }
 
 impl WorldStore {
     pub fn open(root: impl AsRef<Path>) -> Result<Self, WorldError> {
+        Self::open_inner(root.as_ref(), false)
+    }
+    pub(crate) fn open_import(root: &Path) -> Result<Self, WorldError> {
+        Self::open_inner(root, true)
+    }
+    fn open_inner(root: &Path, importing: bool) -> Result<Self, WorldError> {
+        crate::metadata::reject_links(root)?;
         for marker in [
             "level.dat",
             "level.dat_old",
             "region",
             "dimensions/minecraft/overworld/region",
         ] {
-            match std::fs::symlink_metadata(root.as_ref().join(marker)) {
+            match std::fs::symlink_metadata(root.join(marker)) {
                 Ok(_) => return Err(WorldError::ForeignWorld),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
             }
         }
-        if root.as_ref().join("IMPORT_INCOMPLETE").try_exists()? {
+        let incomplete = root.join("IMPORT_INCOMPLETE").try_exists()?;
+        if incomplete && !importing {
             return Err(WorldError::Corrupt(
                 "world import is incomplete; import again into a new destination",
             ));
         }
-        std::fs::create_dir_all(root.as_ref())?;
+        if importing && !incomplete {
+            return Err(WorldError::Corrupt(
+                "import store requires an incomplete marker",
+            ));
+        }
+        std::fs::create_dir_all(root)?;
+        crate::metadata::reject_links(&root.join("world.lock"))?;
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(root.as_ref().join("world.lock"))?;
+            .open(root.join("world.lock"))?;
         lock.try_lock().map_err(|error| match error {
             TryLockError::WouldBlock => WorldError::Locked,
             TryLockError::Error(error) => WorldError::Io(error),
         })?;
+        let metadata = if importing {
+            None
+        } else {
+            WorldMetadata::load(root)?
+        };
+        if !importing
+            && metadata.is_none()
+            && (root.join("import-report.json").try_exists()?
+                || root.join("source-data").try_exists()?)
+        {
+            return Err(WorldError::Metadata(
+                "imported world metadata is missing; reimport the source into a new directory"
+                    .into(),
+            ));
+        }
+        if metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.retained_source.is_none())
+        {
+            return Err(WorldError::Metadata(
+                "imported world has no retained source snapshot".into(),
+            ));
+        }
         Ok(Self {
-            root: root.as_ref().to_owned(),
+            root: root.to_owned(),
             _lock: lock,
             stripes: std::array::from_fn(|_| RwLock::new(())),
+            metadata,
         })
     }
 
@@ -62,7 +103,13 @@ impl WorldStore {
     fn load_unlocked(&self, x: i32, z: i32) -> Result<Option<Chunk>, WorldError> {
         let file = match File::open(self.chunk_path(x, z)) {
             Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return if self.generation_policy() == GenerationPolicy::ExistingOnly {
+                    Err(WorldError::MissingImportedChunk { x, z })
+                } else {
+                    Ok(None)
+                };
+            }
             Err(error) => return Err(error.into()),
         };
         if file.metadata()?.len() > MAX_FILE_BYTES as u64 {
@@ -98,6 +145,16 @@ impl WorldStore {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+    pub fn metadata(&self) -> Option<&WorldMetadata> {
+        self.metadata.as_ref()
+    }
+    pub fn generation_policy(&self) -> GenerationPolicy {
+        self.metadata
+            .as_ref()
+            .map_or(GenerationPolicy::NativeFlat, |metadata| {
+                metadata.generation_policy
+            })
     }
     fn chunk_path(&self, x: i32, z: i32) -> PathBuf {
         self.root.join(format!("c.{x}.{z}.zqc"))

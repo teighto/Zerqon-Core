@@ -4,6 +4,7 @@ mod config;
 mod connection;
 mod entity_packets;
 mod game_data;
+mod java_launch;
 mod java_plugins;
 mod java_runtime;
 mod mob_store;
@@ -11,11 +12,14 @@ mod mobs;
 mod operator_store;
 mod packets;
 mod paper_libraries;
+mod player_inventory;
+mod player_store;
 mod players;
 mod profiling;
 mod runtime;
 mod server;
 mod updates;
+mod world_view;
 
 use clap::Parser;
 use std::{

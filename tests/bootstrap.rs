@@ -1,9 +1,251 @@
+#[path = "../src/java_launch.rs"]
+#[allow(dead_code)]
+pub mod java_launch;
 include!("../src/bootstrap.rs");
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generator_manifest_requires_one_main_section_entrypoint_with_bounded_size() {
+        let directory = tempfile::tempdir().unwrap();
+        let jar = directory.path().join("generator.jar");
+        for (manifest, expected) in [
+            (
+                "Manifest-Version: 1.0\r\nMain-Class: teighto.\r\n Generator\r\n\r\n",
+                Some("teighto.Generator"),
+            ),
+            (
+                "Manifest-Version: 1.0\nmain-class: Generator\n\n",
+                Some("Generator"),
+            ),
+            (
+                "Manifest-Version: 1.0\n\nName: section\nMain-Class: Nested\n",
+                None,
+            ),
+            ("Main-Class: First\nMAIN-CLASS: Second\n\n", None),
+            (" continuation\nMain-Class: Generator\n", None),
+        ] {
+            let mut archive = zip::ZipWriter::new(File::create(&jar).unwrap());
+            archive
+                .start_file(
+                    "META-INF/MANIFEST.MF",
+                    zip::write::SimpleFileOptions::default(),
+                )
+                .unwrap();
+            archive.write_all(manifest.as_bytes()).unwrap();
+            archive.finish().unwrap();
+            assert_eq!(generator_main_class(&jar).ok().as_deref(), expected);
+        }
+        let mut archive = zip::ZipWriter::new(File::create(&jar).unwrap());
+        archive
+            .start_file(
+                "META-INF/MANIFEST.MF",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        archive.write_all(&vec![b'x'; 65_537]).unwrap();
+        archive.finish().unwrap();
+        assert!(
+            generator_main_class(&jar)
+                .unwrap_err()
+                .to_string()
+                .contains("64 KiB")
+        );
+    }
     use serde_json::json;
+
+    fn inventory_cache(directory: &Path) -> Value {
+        let reports = directory.join("generated/reports");
+        fs::create_dir_all(reports.join("minecraft/components/item")).unwrap();
+        fs::create_dir_all(directory.join("data")).unwrap();
+        let files = [
+            (
+                "packets.json",
+                json!({"handshake":{"serverbound":{"minecraft:intention":{"protocol_id":0}}},"login":{"clientbound":{"minecraft:login_finished":{"protocol_id":2}}},"play":{"clientbound":{"minecraft:login":{"protocol_id":50}}}}),
+            ),
+            (
+                "blocks.json",
+                json!({"minecraft:air":{"states":[{"id":0,"default":true}]}}),
+            ),
+            (
+                "registries.json",
+                json!({"minecraft:entity_type":{"entries":{"minecraft:player":{"protocol_id":1}}},"minecraft:item":{"entries":{"minecraft:stone":{"protocol_id":1}}},"minecraft:data_component_type":{"entries":{"minecraft:max_stack_size":{"protocol_id":0}}}}),
+            ),
+            (
+                "minecraft/components/item/stone.json",
+                json!({"components":{"minecraft:max_stack_size":64}}),
+            ),
+        ];
+        for (name, value) in files {
+            fs::write(reports.join(name), serde_json::to_vec(&value).unwrap()).unwrap();
+        }
+        fs::write(directory.join("registries-sync.json"), serde_json::to_vec(&json!({"version":VERSION,"protocol":PROTOCOL,"registries":REGISTRIES.iter().map(|name|json!({"name":format!("minecraft:{name}"),"entries":[{"id":"minecraft:test","data":{}}]})).collect::<Vec<_>>()})).unwrap()).unwrap();
+        fs::write(directory.join("tags-sync.json"), br#"{"registries":[{"name":"minecraft:item","tags":[{"name":"minecraft:test","ids":[1]}]}]}"#).unwrap();
+        fs::write(directory.join("data/unchanged.json"), b"staged payload").unwrap();
+        let prepared = json!({"version":VERSION,"protocol":PROTOCOL,"server_sha1":SERVER_SHA1,"world_version":5023,"java_major":25,"registries":REGISTRIES.len(),"entries":REGISTRIES.len(),"tag_registries":1,"tags":1});
+        fs::write(
+            directory.join("prepared.json"),
+            serde_json::to_vec(&prepared).unwrap(),
+        )
+        .unwrap();
+        prepared
+    }
+
+    #[test]
+    fn prepared_cache_requires_every_item_default_report() {
+        let directory = tempfile::tempdir().unwrap();
+        inventory_cache(directory.path());
+        assert!(cache_ready(directory.path()).unwrap());
+        fs::remove_file(
+            directory
+                .path()
+                .join("generated/reports/minecraft/components/item/stone.json"),
+        )
+        .unwrap();
+        assert!(!cache_ready(directory.path()).unwrap());
+    }
+
+    #[test]
+    fn install_publishes_item_defaults_before_the_ready_marker() {
+        let directory = tempfile::tempdir().unwrap();
+        let stage = directory.path().join("stage");
+        let destination = directory.path().join("cache");
+        let prepared = inventory_cache(&stage);
+        install_prepared(&stage, &destination, &prepared).unwrap();
+        let catalog = zerqon_inventory::ItemCatalog::load(&destination).unwrap();
+        let stone = catalog.item_id("minecraft:stone").unwrap();
+        assert_eq!(catalog.item(stone).unwrap().max_stack, 64);
+        assert!(cache_ready(&destination).unwrap());
+    }
+
+    #[test]
+    fn corrupt_staged_item_report_cannot_replace_existing_cache_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let stage = directory.path().join("stage");
+        let destination = directory.path().join("cache");
+        let prepared = inventory_cache(&stage);
+        inventory_cache(&destination);
+        fs::write(destination.join("data/unchanged.json"), b"original payload").unwrap();
+        fs::write(
+            stage.join("generated/reports/minecraft/components/item/stone.json"),
+            br#"{"components":{"minecraft:max_stack_size":0}}"#,
+        )
+        .unwrap();
+        assert!(!cache_ready(&stage).unwrap());
+        assert!(install_prepared(&stage, &destination, &prepared).is_err());
+        assert_eq!(
+            fs::read(destination.join("data/unchanged.json")).unwrap(),
+            b"original payload"
+        );
+        assert!(cache_ready(&destination).unwrap());
+    }
+
+    fn directory_link(target: &Path, link: &Path) {
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            let script = format!(
+                "New-Item -ItemType Junction -Path '{}' -Target '{}' | Out-Null",
+                link.display().to_string().replace('\'', "''"),
+                target.display().to_string().replace('\'', "''")
+            );
+            let result = std::process::Command::new("powershell")
+                .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+                .creation_flags(0x08000000)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+    }
+
+    #[test]
+    fn linked_item_reports_are_rejected_before_cache_writes() {
+        for linked_stage in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let stage = directory.path().join("stage");
+            let destination = directory.path().join("cache");
+            let outside = directory.path().join("outside");
+            let prepared = inventory_cache(&stage);
+            inventory_cache(&destination);
+            fs::write(destination.join("data/unchanged.json"), b"original payload").unwrap();
+            fs::create_dir(&outside).unwrap();
+            let linked_root = if linked_stage { &stage } else { &destination };
+            let items = linked_root.join("generated/reports/minecraft/components/item");
+            fs::rename(items.join("stone.json"), outside.join("stone.json")).unwrap();
+            let original = fs::read(outside.join("stone.json")).unwrap();
+            fs::remove_dir(&items).unwrap();
+            directory_link(&outside, &items);
+            assert!(cache_ready(linked_root).is_err());
+            assert!(install_prepared(&stage, &destination, &prepared).is_err());
+            assert_eq!(
+                fs::read(destination.join("data/unchanged.json")).unwrap(),
+                b"original payload"
+            );
+            assert_eq!(fs::read(outside.join("stone.json")).unwrap(), original);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn item_file_links_are_rejected_in_a_regular_validated_parent() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = directory.path().join("cache");
+        inventory_cache(&cache);
+        let item = cache.join("generated/reports/minecraft/components/item/stone.json");
+        let outside = directory.path().join("outside.json");
+        fs::rename(&item, &outside).unwrap();
+        let original = fs::read(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, &item).unwrap();
+        assert!(cache_ready(&cache).is_err());
+        assert_eq!(fs::read(outside).unwrap(), original);
+    }
+
+    #[test]
+    fn invalid_item_keys_cannot_select_files_outside_the_report_directory() {
+        for key in [
+            "../:stone",
+            "..:stone",
+            "minecraft:../stone",
+            "minecraft:folder/../../stone",
+            "minecraft:stone/",
+            "minecraft:con",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            inventory_cache(directory.path());
+            let path = directory.path().join("generated/reports/registries.json");
+            let mut registries = read_json(&path, 1024 * 1024).unwrap();
+            registries["minecraft:item"]["entries"] = json!({key:{"protocol_id":1}});
+            fs::write(path, serde_json::to_vec(&registries).unwrap()).unwrap();
+            assert!(!cache_ready(directory.path()).unwrap(), "{key}");
+        }
+    }
+
+    #[test]
+    fn valid_stage_cannot_publish_through_a_data_directory_link() {
+        let directory = tempfile::tempdir().unwrap();
+        let stage = directory.path().join("stage");
+        let destination = directory.path().join("cache");
+        let outside = directory.path().join("outside");
+        let prepared = inventory_cache(&stage);
+        fs::create_dir(&destination).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("unchanged.json"), b"original payload").unwrap();
+        directory_link(&outside, &destination.join("data"));
+        assert!(install_prepared(&stage, &destination, &prepared).is_err());
+        assert_eq!(
+            fs::read(outside.join("unchanged.json")).unwrap(),
+            b"original payload"
+        );
+        assert!(!destination.join("prepared.json").exists());
+    }
     #[test]
     fn pinned_download_verification_checks_length_and_content() {
         let directory = tempfile::tempdir().unwrap();
@@ -193,6 +435,17 @@ mod tests {
                 "{name}"
             );
         }
+        let catalog = zerqon_inventory::ItemCatalog::load(directory.path()).unwrap();
+        assert_eq!(catalog.item_count(), 1658);
+        assert_eq!(catalog.component_count(), 122);
+        for report in item_report_paths(&reference).unwrap() {
+            assert_eq!(
+                read_json(&directory.path().join(&report), 1024 * 1024).unwrap(),
+                read_json(&reference.join(&report), 1024 * 1024).unwrap(),
+                "{}",
+                report.display()
+            );
+        }
         let reused = Bootstrap::prepare(directory.path(), Path::new("nonexistent-java-runtime"))
             .await
             .unwrap();
@@ -263,18 +516,68 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn report_generator_runs_with_utf8_stdout_stderr_and_unicode_output_path() {
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter("bootstrap=debug")
-            .with_test_writer()
-            .try_init();
+    async fn cancelled_preparation_keeps_stage_and_exclusive_lock_until_blocking_work_finishes() {
+        let directory = tempfile::tempdir().unwrap();
+        let lock_path = directory.path().join("prepare.lock");
+        let lock = std::sync::Arc::new(
+            fs::OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .write(true)
+                .open(&lock_path)
+                .unwrap(),
+        );
+        lock.try_lock().unwrap();
+        let second = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(lock_path)
+            .unwrap();
+        let stage = std::sync::Arc::new(tempfile::tempdir_in(directory.path()).unwrap());
+        let stage_path = stage.path().to_owned();
+        let (started, running) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let (completed, completion) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(preparation_task(stage, lock, move |stage| {
+            started.send(()).unwrap();
+            released.recv_timeout(Duration::from_secs(5)).unwrap();
+            let result = fs::write(stage.join("late-install.txt"), b"committed");
+            completed.send(result.is_ok()).unwrap();
+            result.map_err(BootstrapError::from)
+        }));
+        running.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(stage_path.is_dir());
+        assert!(matches!(
+            second.try_lock(),
+            Err(fs::TryLockError::WouldBlock)
+        ));
+        release.send(()).unwrap();
+        assert!(completion.await.unwrap());
+        let finished = tokio::time::Instant::now();
+        while stage_path.exists() {
+            assert!(finished.elapsed() < Duration::from_secs(3));
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        acquire_prepare_lock(&second, Duration::from_secs(3))
+            .await
+            .unwrap();
+    }
+
+    async fn generator_fixture(main_class: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
         let directory = tempfile::tempdir().unwrap();
         let java = java_runtime(Path::new("java")).await.unwrap();
         let bin = java.parent().unwrap();
         let classes = directory.path().join("classes");
         fs::create_dir(&classes).unwrap();
-        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/java-bootstrap/ReportCharsetProbe.java");
+        let source = directory.path().join(format!("{main_class}.java"));
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(format!("tests/fixtures/java-bootstrap/{main_class}.java")),
+            &source,
+        )
+        .unwrap();
         let compiled =
             std::process::Command::new(bin.join(if cfg!(windows) { "javac.exe" } else { "javac" }))
                 .args(["--release", "25", "-encoding", "UTF-8", "-d"])
@@ -292,7 +595,7 @@ mod tests {
             std::process::Command::new(bin.join(if cfg!(windows) { "jar.exe" } else { "jar" }))
                 .args(["--create", "--file"])
                 .arg(&jar)
-                .args(["--main-class", "ReportCharsetProbe", "-C"])
+                .args(["--main-class", main_class, "-C"])
                 .arg(classes)
                 .arg(".")
                 .output()
@@ -302,16 +605,89 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&packaged.stderr)
         );
-        let unicode_jar = directory.path().join("генератор.jar");
+        (directory, java, jar)
+    }
+
+    #[tokio::test]
+    async fn report_generator_runs_with_utf8_stdout_stderr_and_unicode_output_path() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("bootstrap=debug")
+            .with_test_writer()
+            .try_init();
+        let (directory, java, jar) = generator_fixture("ReportCharsetProbe").await;
+        let unicode_jar = directory.path().join("генератор-中文😀.jar");
         fs::copy(&jar, &unicode_jar).unwrap();
         for (index, jar) in [jar, unicode_jar].iter().enumerate() {
-            let stage = directory.path().join(format!("данные-Minecraft-{index}"));
-            fs::create_dir(&stage).unwrap();
-            generate_reports(&java, jar, &stage).await.unwrap();
+            let stage = std::sync::Arc::new(
+                tempfile::Builder::new()
+                    .prefix(&format!("данные-中文😀-Minecraft-{index}"))
+                    .tempdir_in(directory.path())
+                    .unwrap(),
+            );
+            generate_reports(&java, jar, std::sync::Arc::clone(&stage))
+                .await
+                .unwrap();
             assert_eq!(
-                fs::read_to_string(stage.join("generated/charset-result.txt")).unwrap(),
+                fs::read_to_string(stage.path().join("generated/charset-result.txt")).unwrap(),
                 "Привет из генератора"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_report_generation_reaps_jvm_before_removing_manifest() {
+        let (directory, java, jar) = generator_fixture("ReportCancellationProbe").await;
+        let output = std::sync::Arc::new(
+            tempfile::Builder::new()
+                .prefix("cancelled-中文😀")
+                .tempdir_in(directory.path())
+                .unwrap(),
+        );
+        let stage = output.path().to_owned();
+        let task = tokio::spawn(async move { generate_reports(&java, &jar, output).await });
+        let started = tokio::time::Instant::now();
+        while !stage.join("generator.ready").is_file() {
+            assert!(
+                !task.is_finished() && started.elapsed() < Duration::from_secs(15),
+                "generator did not start"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let pid: u32 = fs::read_to_string(stage.join("generator.pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let manifest =
+            PathBuf::from(fs::read_to_string(stage.join("generator.classpath")).unwrap());
+        assert!(manifest.is_file());
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let cancelled = tokio::time::Instant::now();
+        loop {
+            let alive = if cfg!(windows) {
+                let output = std::process::Command::new("tasklist")
+                    .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+                    .output()
+                    .unwrap();
+                String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\""))
+            } else {
+                std::process::Command::new("kill")
+                    .args(["-0", &pid.to_string()])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .unwrap()
+                    .success()
+            };
+            if !alive && !manifest.exists() && !stage.exists() {
+                break;
+            }
+            assert!(
+                cancelled.elapsed() < Duration::from_secs(3),
+                "cancelled generator survived or retained manifest: pid={pid}, alive={alive}, manifest={}",
+                manifest.display()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
 }

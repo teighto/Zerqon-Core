@@ -1,3 +1,4 @@
+use crate::java_launch::{JavaLaunchError, JavaLaunchPath};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -54,11 +55,13 @@ pub enum JavaPluginError {
     Rejected,
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Launch(#[from] JavaLaunchError),
 }
 
 pub struct JavaPlugins {
     sender: mpsc::Sender<Request>,
-    task: JoinHandle<()>,
+    cancel: Option<oneshot::Sender<()>>,
     sequence: AtomicU64,
     request_timeout: Duration,
     startup_results: Vec<JavaPluginResult>,
@@ -139,7 +142,7 @@ impl JavaPlugins {
                 "-Xmx128M",
                 "-cp",
             ])
-            .arg(classpath)
+            .arg(&classpath.argument)
             .arg("io.github.teighto.zerqon.host.PluginHost")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -159,14 +162,19 @@ impl JavaPlugins {
             .take()
             .ok_or(JavaPluginError::Protocol("missing host stderr"))?;
         let (sender, receiver) = mpsc::channel(config.queue_capacity);
-        let task = tokio::spawn(async move {
+        let (cancel, cancelled) = oneshot::channel();
+        tokio::spawn(async move {
+            let _classpath = classpath;
             let stderr_task = StderrTask(tokio::spawn(drain_stderr(stderr)));
-            run_host(child, stdin, stdout, receiver).await;
+            tokio::select! {
+                () = run_host(&mut child, stdin, stdout, receiver) => {}
+                _ = cancelled => terminate(&mut child).await,
+            }
             drop(stderr_task);
         });
         let mut plugins = Self {
             sender,
-            task,
+            cancel: Some(cancel),
             sequence: AtomicU64::new(1),
             request_timeout: config.request_timeout,
             startup_results: Vec::new(),
@@ -243,7 +251,7 @@ impl JavaPlugins {
     }
 }
 
-fn java_classpath(config: &JavaPluginConfig) -> Result<std::ffi::OsString, JavaPluginError> {
+fn java_classpath(config: &JavaPluginConfig) -> Result<JavaLaunchPath, JavaPluginError> {
     if config.extra_classpath.len() > 64 {
         return Err(JavaPluginError::Configuration(
             "extra classpath exceeds 64 JARs",
@@ -273,12 +281,14 @@ fn java_classpath(config: &JavaPluginConfig) -> Result<std::ffi::OsString, JavaP
         }
         paths.push(canonical);
     }
-    std::env::join_paths(paths).map_err(|_| JavaPluginError::Configuration("invalid classpath"))
+    Ok(crate::java_launch::classpath(&paths)?)
 }
 
 impl Drop for JavaPlugins {
     fn drop(&mut self) {
-        self.task.abort();
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.send(());
+        }
     }
 }
 
@@ -290,7 +300,7 @@ impl Drop for StderrTask {
 }
 
 async fn run_host(
-    mut child: Child,
+    child: &mut Child,
     mut stdin: ChildStdin,
     stdout: ChildStdout,
     mut receiver: mpsc::Receiver<Request>,
@@ -316,7 +326,7 @@ async fn run_host(
         .unwrap_or(Err(JavaPluginError::Timeout));
         let fatal = matches!(result, Err(ref error) if !matches!(error, JavaPluginError::Rejected));
         if fatal {
-            terminate(&mut child).await;
+            terminate(child).await;
             let _ = request.reply.send(result);
             return;
         }
@@ -327,7 +337,7 @@ async fn run_host(
                 Ok(Ok(_)) => Err(JavaPluginError::Protocol("host exited unsuccessfully")),
                 Ok(Err(error)) => Err(error.into()),
                 Err(_) => {
-                    terminate(&mut child).await;
+                    terminate(child).await;
                     Err(JavaPluginError::Timeout)
                 }
             };
@@ -336,7 +346,7 @@ async fn run_host(
         }
         let _ = request.reply.send(result);
     }
-    terminate(&mut child).await;
+    terminate(child).await;
 }
 
 async fn terminate(child: &mut Child) {

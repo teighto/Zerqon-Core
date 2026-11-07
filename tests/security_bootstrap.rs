@@ -1,3 +1,6 @@
+#[path = "../src/java_launch.rs"]
+#[allow(dead_code)]
+pub mod java_launch;
 pub mod bootstrap_under_review {
     include!("../src/bootstrap.rs");
     pub fn install_fixture(

@@ -1,8 +1,12 @@
+#[path = "../src/java_launch.rs"]
+mod java_launch;
+
 include!("../src/java_plugins.rs");
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::java_launch::classpath_manifest;
     use std::sync::OnceLock;
     use tokio::io::BufReader;
 
@@ -62,13 +66,19 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             let classes = root.path().join("classes");
             std::fs::create_dir(&classes).unwrap();
-            let status = std::process::Command::new("javac")
-                .args(["--release", "25", "-d"])
-                .arg(&classes)
-                .arg(concat!(
+            let source = root.path().join("PluginHost.java");
+            std::fs::copy(
+                concat!(
                     env!("CARGO_MANIFEST_DIR"),
                     "/tests/fixtures/java-host/PluginHost.java"
-                ))
+                ),
+                &source,
+            )
+            .unwrap();
+            let status = std::process::Command::new("javac")
+                .args(["--release", "25", "-encoding", "UTF-8", "-d"])
+                .arg(&classes)
+                .arg(source)
                 .status()
                 .unwrap();
             assert!(status.success());
@@ -115,6 +125,43 @@ mod tests {
         }
     }
 
+    fn classpath_artifacts(host: &std::path::Path) -> Vec<PathBuf> {
+        let host = std::fs::canonicalize(host).unwrap();
+        let url = reqwest::Url::from_file_path(&host).unwrap();
+        let probe = java_launch::manifest_jar(&[host], None).unwrap();
+        let directory = std::path::Path::new(&probe.argument)
+            .parent()
+            .unwrap()
+            .to_owned();
+        drop(probe);
+        std::fs::read_dir(directory)
+            .unwrap()
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                if !entry.file_type().ok()?.is_file()
+                    || !entry
+                        .file_name()
+                        .to_str()?
+                        .starts_with("zerqon-java-classpath-")
+                {
+                    return None;
+                }
+                let mut archive =
+                    zip::ZipArchive::new(std::fs::File::open(entry.path()).ok()?).ok()?;
+                let manifest = archive.by_name("META-INF/MANIFEST.MF").ok()?;
+                let mut text = String::new();
+                std::io::Read::read_to_string(
+                    &mut std::io::Read::take(manifest, 131_072),
+                    &mut text,
+                )
+                .ok()?;
+                text.replace("\r\n ", "")
+                    .contains(url.as_str())
+                    .then(|| entry.path())
+            })
+            .collect()
+    }
+
     #[tokio::test]
     async fn java_subprocess_loads_dispatches_and_shuts_down() {
         let directory = tempfile::tempdir().unwrap();
@@ -148,6 +195,200 @@ mod tests {
         assert!(plugins.list().await.unwrap()[0].enabled);
         assert!(!plugins.shutdown().await.unwrap()[0].enabled);
         assert!(plugins.list().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn java_host_loads_from_chinese_classpath_and_plugin_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let libraries = root.path().join("目录 空间😀");
+        std::fs::create_dir(&libraries).unwrap();
+        let host = libraries.join("主机.jar");
+        let dependency = libraries.join("依赖.jar");
+        std::fs::copy(fixture_jar().join("fixture.jar"), &host).unwrap();
+        std::fs::copy(fixture_jar().join("fixture.jar"), &dependency).unwrap();
+        let mut settings = config("echo", &root.path().join("插件目录"));
+        settings.host_jar = host;
+        settings.gson_jar = dependency.clone();
+        settings.extra_classpath = vec![dependency];
+        let mut plugins = JavaPlugins::spawn(settings).await.unwrap();
+        assert!(plugins.take_startup_results()[0].enabled);
+        let response = plugins
+            .dispatch(Event::Tick { tick: 1 }, Some("fixture".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            response[0].actions,
+            [Action::Reply {
+                message: "received".into()
+            }]
+        );
+        assert!(!plugins.shutdown().await.unwrap()[0].enabled);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires built Java25 host and hello plugin: python scripts/build-java-plugins.py"]
+    async fn real_host_and_plugin_load_under_chinese_paths_with_unicode_replies() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let directory = tempfile::tempdir().unwrap();
+        let base = directory.path().join("目录 空间😀");
+        let plugins = base.join("插件");
+        std::fs::create_dir_all(&plugins).unwrap();
+        let host = base.join("主机.jar");
+        let gson = base.join("依赖.jar");
+        std::fs::copy(root.join("libraries/zerqon-java-host-0.0.1.jar"), &host).unwrap();
+        std::fs::copy(root.join("libraries/gson-2.13.2.jar"), &gson).unwrap();
+        std::fs::copy(
+            root.join("dist/hello-java-plugin-0.0.1.jar"),
+            plugins.join("hello.jar"),
+        )
+        .unwrap();
+        let settings = JavaPluginConfig {
+            java: "java".into(),
+            host_jar: host,
+            gson_jar: gson,
+            extra_classpath: Vec::new(),
+            directory: plugins,
+            server_version: "0.0.1".into(),
+            request_timeout: Duration::from_secs(5),
+            startup_timeout: Duration::from_secs(15),
+            queue_capacity: 4,
+        };
+        let mut host = JavaPlugins::spawn(settings).await.unwrap();
+        assert!(host.take_startup_results()[0].enabled);
+        let result = host
+            .dispatch(
+                Event::Command {
+                    sender: "你好😀".into(),
+                    sender_kind: zerqon_plugin_api::SenderKind::Player,
+                    operator: false,
+                    command: "jhello".into(),
+                    args: Vec::new(),
+                },
+                Some("hello".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result[0].actions,
+            [Action::Reply {
+                message: "Hello, 你好😀! This plugin uses the Zerqon Java API.".into()
+            }]
+        );
+        host.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn manifest_classpath_escapes_unicode_and_header_characters_preserving_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("目录 # 空间.jar");
+        let second = directory.path().join("two%.jar");
+        std::fs::write(&first, []).unwrap();
+        std::fs::write(&second, []).unwrap();
+        let paths = [
+            std::fs::canonicalize(first).unwrap(),
+            std::fs::canonicalize(second).unwrap(),
+        ];
+        let bytes = classpath_manifest(&paths, None).unwrap();
+        assert!(bytes.is_ascii());
+        let folded = String::from_utf8(bytes).unwrap();
+        assert!(folded.split("\r\n").all(|line| line.len() <= 70));
+        let joined = folded.replace("\r\n ", "");
+        let value = joined
+            .lines()
+            .find_map(|line| line.strip_prefix("Class-Path: "))
+            .unwrap();
+        let urls: Vec<_> = value
+            .split(' ')
+            .map(|url| reqwest::Url::parse(url).unwrap())
+            .collect();
+        assert_eq!(urls.len(), 2);
+        for (index, url) in urls.iter().enumerate() {
+            assert_eq!(
+                std::fs::canonicalize(url.to_file_path().unwrap()).unwrap(),
+                paths[index]
+            );
+        }
+        assert!(value.contains("%23") && value.contains("%25") && value.contains("%E7"));
+    }
+
+    #[test]
+    fn manifest_classpath_rejects_relative_paths_and_oversized_headers() {
+        assert!(matches!(
+            classpath_manifest(&[PathBuf::from("relative.jar")], None),
+            Err(JavaLaunchError::Configuration(_))
+        ));
+        let directory = tempfile::tempdir().unwrap();
+        let oversized = directory.path().join(format!("{}.jar", "a".repeat(65_536)));
+        assert!(matches!(
+            classpath_manifest(&[oversized], None),
+            Err(JavaLaunchError::Configuration(
+                "classpath manifest exceeds 64 KiB"
+            ))
+        ));
+    }
+
+    #[test]
+    fn executable_manifest_rejects_header_injection_and_folds_main_class() {
+        for value in [
+            "",
+            "1Main",
+            "a..Main",
+            ".Main",
+            "a/Main",
+            "Main\r\nClass-Path: evil.jar",
+        ] {
+            assert!(matches!(
+                classpath_manifest(&[], Some(value)),
+                Err(JavaLaunchError::Configuration("invalid main class"))
+            ));
+        }
+        let main = format!("org.example.{}$Nested", "LongMain".repeat(20));
+        let manifest = String::from_utf8(classpath_manifest(&[], Some(&main)).unwrap()).unwrap();
+        assert!(manifest.split("\r\n").all(|line| line.len() <= 70));
+        assert!(
+            manifest
+                .replace("\r\n ", "")
+                .contains(&format!("Main-Class: {main}\r\n"))
+        );
+    }
+
+    #[test]
+    fn manifest_classpath_artifact_is_valid_and_removed_when_guard_drops() {
+        let directory = tempfile::tempdir().unwrap();
+        let base = directory.path().join(if cfg!(windows) {
+            "separator;path"
+        } else {
+            "separator:path"
+        });
+        std::fs::create_dir(&base).unwrap();
+        let jar = base.join("host.jar");
+        std::fs::write(&jar, []).unwrap();
+        let settings = JavaPluginConfig {
+            java: "java".into(),
+            host_jar: jar.clone(),
+            gson_jar: jar,
+            extra_classpath: Vec::new(),
+            directory: base,
+            server_version: "0.0.1".into(),
+            request_timeout: Duration::from_secs(5),
+            startup_timeout: Duration::from_secs(15),
+            queue_capacity: 4,
+        };
+        let classpath = java_classpath(&settings).unwrap();
+        let artifact = PathBuf::from(&classpath.argument);
+        assert!(artifact.is_file());
+        {
+            let mut archive =
+                zip::ZipArchive::new(std::fs::File::open(&artifact).unwrap()).unwrap();
+            assert_eq!(archive.len(), 1);
+            let mut manifest = archive.by_name("META-INF/MANIFEST.MF").unwrap();
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(&mut manifest, &mut bytes).unwrap();
+            assert!(bytes.starts_with(b"Manifest-Version: 1.0\r\nClass-Path: file:"));
+            assert!(bytes.ends_with(b"\r\n\r\n"));
+        }
+        drop(classpath);
+        assert!(!artifact.exists());
     }
 
     #[tokio::test]
@@ -224,6 +465,9 @@ mod tests {
     async fn startup_timeout_is_enforced_before_host_is_exposed() {
         let directory = tempfile::tempdir().unwrap();
         let mut settings = config("startup_timeout", directory.path());
+        let unicode_host = directory.path().join("主机😀.jar");
+        std::fs::copy(&settings.host_jar, &unicode_host).unwrap();
+        settings.host_jar = unicode_host.clone();
         settings.startup_timeout = Duration::from_millis(500);
         let started = Instant::now();
         assert!(matches!(
@@ -231,14 +475,25 @@ mod tests {
             Err(JavaPluginError::Timeout)
         ));
         assert!(started.elapsed() < Duration::from_secs(3));
+        while !classpath_artifacts(&unicode_host).is_empty() {
+            assert!(
+                started.elapsed() < Duration::from_secs(3),
+                "manifest survived startup timeout"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     #[tokio::test]
     async fn dropping_bridge_terminates_the_actual_jvm() {
         let directory = tempfile::tempdir().unwrap();
-        let plugins = JavaPlugins::spawn(config("pid", directory.path()))
-            .await
-            .unwrap();
+        let mut settings = config("pid", directory.path());
+        let unicode_host = directory.path().join("主机😀.jar");
+        std::fs::copy(&settings.host_jar, &unicode_host).unwrap();
+        settings.host_jar = unicode_host.clone();
+        let plugins = JavaPlugins::spawn(settings).await.unwrap();
+        let artifacts = classpath_artifacts(&unicode_host);
+        assert_eq!(artifacts.len(), 1);
         let result = plugins
             .dispatch(Event::Tick { tick: 1 }, None)
             .await
@@ -265,12 +520,43 @@ mod tests {
                     .unwrap()
                     .success()
             };
-            if !alive {
+            if !alive && artifacts.iter().all(|path| !path.exists()) {
                 break;
             }
             assert!(
                 started.elapsed() < Duration::from_secs(3),
                 "JVM {pid} survived bridge drop"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_bridge_cancels_pending_callback_before_removing_manifest() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut settings = config("timeout", directory.path());
+        let unicode_host = directory.path().join("主机😀.jar");
+        std::fs::copy(&settings.host_jar, &unicode_host).unwrap();
+        settings.host_jar = unicode_host.clone();
+        settings.request_timeout = Duration::from_secs(30);
+        let plugins = JavaPlugins::spawn(settings).await.unwrap();
+        let artifacts = classpath_artifacts(&unicode_host);
+        assert_eq!(artifacts.len(), 1);
+        {
+            let request = plugins.dispatch(Event::Tick { tick: 0 }, None);
+            tokio::pin!(request);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), &mut request)
+                    .await
+                    .is_err()
+            );
+        }
+        let started = Instant::now();
+        drop(plugins);
+        while artifacts.iter().any(|path| path.exists()) {
+            assert!(
+                started.elapsed() < Duration::from_secs(3),
+                "manifest survived cancellation of a pending callback"
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }

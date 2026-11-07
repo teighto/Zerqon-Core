@@ -1,0 +1,22 @@
+[package]
+name = "zerqon-inventory"
+description = "Validated Minecraft 26.3 items and authoritative inventory transitions"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+zerqon-protocol = { path = "../zerqon-protocol" }
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"
+
+[lints]
+workspace = true

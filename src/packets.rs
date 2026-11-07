@@ -35,12 +35,19 @@ pub fn login(entity_id: i32, max_players: i32, view_distance: i32, dimension_typ
 }
 
 pub fn position(teleport: i32, x: f64, y: f64, z: f64) -> Vec<u8> {
+    position_rotated(teleport, [x, y, z], [0.0, 0.0])
+}
+
+pub fn position_rotated(teleport: i32, xyz: [f64; 3], rotation: [f32; 2]) -> Vec<u8> {
     let mut out = vec![73];
     put_varint(teleport, &mut out);
-    for value in [x, y, z, 0.0, 0.0, 0.0] {
+    for value in [xyz[0], xyz[1], xyz[2], 0.0, 0.0, 0.0] {
         out.extend_from_slice(&value.to_be_bytes());
     }
-    out.extend_from_slice(&[0; 12]);
+    for value in rotation {
+        out.extend_from_slice(&value.to_be_bytes());
+    }
+    out.extend_from_slice(&[0; 4]);
     out
 }
 
@@ -284,12 +291,18 @@ pub fn chunk_batch_finished(count: i32) -> Vec<u8> {
 }
 
 pub fn default_spawn(x: i32, y: i32, z: i32) -> Vec<u8> {
+    world_spawn("minecraft:overworld", [x, y, z], [0.0, 0.0])
+}
+
+pub fn world_spawn(dimension: &str, [x, y, z]: [i32; 3], rotation: [f32; 2]) -> Vec<u8> {
     let mut out = vec![99];
-    put_string("minecraft:overworld", &mut out);
+    put_string(dimension, &mut out);
     let packed =
         ((x as u64 & 0x3ffffff) << 38) | ((z as u64 & 0x3ffffff) << 12) | (y as u64 & 0xfff);
     out.extend_from_slice(&packed.to_be_bytes());
-    out.extend_from_slice(&[0; 8]);
+    for value in rotation {
+        out.extend_from_slice(&value.to_be_bytes());
+    }
     out
 }
 
