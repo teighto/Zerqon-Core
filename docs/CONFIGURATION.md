@@ -12,7 +12,7 @@ server/
 ├── server.properties      # Minecraft-facing settings
 ├── server.settings        # Zerqon settings in TOML
 ├── eula.txt
-├── ops.json               # operator records, managed from the console
+├── ops.json               # operator UUIDs, managed from the console
 ├── plugins/
 │   ├── rust-plugins/
 │   └── java-plugins/
@@ -23,7 +23,7 @@ server/
 └── world/                 # Zerqon chunk storage
 ```
 
-`--directory PATH` selects the server directory. Relative `data_directory` paths resolve from it. For example, with `--directory run`, prepare data using `python scripts/prepare-data.py --output run/.cache/vanilla/26.3` and copy the optional Java libraries to `run/libraries/`.
+`--directory PATH` selects the server directory. Relative `data_directory` paths resolve from it. Game data is prepared automatically inside `.cache/vanilla/26.3`. Keep the Java plugin libraries from the distribution in that server directory's `libraries/` folder.
 
 ## server.properties
 
@@ -58,8 +58,15 @@ This file uses TOML. Missing keys use defaults; unknown keys are errors.
 | `plugin_memory_mib` | `16` | 1–256 MiB WASM linear memory per plugin |
 | `java_plugins` | `true` | Enable the optional host when Java JAR plugins are present |
 | `java_executable` | `java` | Java 25 executable path |
+| `auto_download_runtime` | `true` | Download a private Java 25 runtime when needed; custom paths are never replaced |
+| `max_entities` | `128` | Maximum mobs, from 1 to 10,000 |
+| `spawn_mobs` | `true` | Natural passive mob spawning near players |
+| `update_check` | `true` | Check the public GitHub repository for a newer stable release |
+| `update_check_interval_hours` | `6` | 1–168 hours between successful update checks |
 
 Set the bind address and port in `server.properties`, and thread counts in `server.settings`. These values have no command-line overrides. WASM memory limits cover linear memory, and the chunk byte bound covers the cache; neither is a process-wide RAM cap. The optional Java plugin host has a separate 128 MiB heap limit.
+
+The update checker runs in the background, starting with one check at startup. It uses no GitHub token, skips drafts and prereleases, and downloads no software. New-version notices appear once in the console and once per operator session and version, in English, with the GitHub release link. Failed checks back off; status-only mode never starts the checker. Set `update_check = false` to disable all update-check requests.
 
 ## Command line
 
@@ -68,7 +75,8 @@ Set the bind address and port in `server.properties`, and thread counts in `serv
 | `--directory PATH` | Server directory; defaults to `.` |
 | `--init` | Create missing configuration and exit |
 | `--check-config` | Validate configuration and exit |
-| `--status-only` | Start server-list/status mode without loading game data or a world |
+| `--status-only` | Start server-list/status mode without loading game data, worlds or plugins |
+| `--import-blocks SOURCE` | Import Anvil 26.3 blocks into a new world directory; other world data is not yet imported |
 | `--data PATH` | Override prepared-data path |
 | `--no-console` | Disable stdin command reading |
 | `--no-color` | Disable ANSI log colors |
@@ -78,9 +86,9 @@ When running through Cargo, place operational flags after `--`, for example `car
 
 ## Administration
 
-Use `help`, `version`, `tps`, `plugins` and `stop` in the console. `op NAME` and `deop NAME` manage operators. In-game `/tpsbar` toggles a boss bar; `/setblock X Y Z STATE-ID` changes and persists a block for operators. The current permission model grants non-null plugin permission requirements to operators; there is no full permission-provider API yet.
+Use `help`, `version`, `tps`, `plugins` and `stop` in the console. `op NAME` grants access to a connected player by UUID. `deop NAME` or `deop UUID` removes it. Names in `ops.json` are labels; matching a name does not grant access. Old name-only files are rejected. In-game `/tpsbar` toggles a boss bar; `/setblock X Y Z STATE-ID` changes and saves a block. Core commands use operator levels. A full permission-provider API is still being developed.
 
-`/tps` reports the recent coordinator tick rate and average measured tick work. Worker CPU, JVM and WASM costs require separate profiling. Integrated spark is not available yet. The append-only `logs/latest.log` is not automatically rotated; archive it between runs when needed. `RUST_LOG` selects log verbosity, for example `info` or `zerqon=debug`.
+`/tps` reports the recent coordinator tick rate and average measured tick work. The built-in Rust CPU profiler uses `/spark profiler start` and `/spark profiler stop` on Linux. It saves reports in `profiles/`; see [Profiling](PROFILING.md). The append-only `logs/latest.log` is not automatically rotated. `RUST_LOG` selects log verbosity, for example `info` or `zerqon=debug`.
 
 ## Русский
 
@@ -88,8 +96,10 @@ Use `help`, `version`, `tps`, `plugins` and `stop` in the console. `op NAME` and
 
 `cargo run --release -- --init` создаёт конфиги и завершает работу, `cargo run --release -- --check-config` проверяет значения без запуска сети. Настройки применяются после перезапуска. `server.properties` содержит адрес, порт, MOTD, онлайн-проверку аккаунтов и параметры Minecraft. `server.settings` — TOML с настройками потоков, кеша, очередей и плагинов. Неизвестные и повторяющиеся ключи отвергаются.
 
-Для папки `run` используйте `--directory run`; подготовьте данные в `run/.cache/vanilla/26.3`, Java-библиотеки поместите в `run/libraries/`. Плагины устанавливаются в `plugins/rust-plugins/` и `plugins/java-plugins/` внутри выбранной папки.
+Для папки `run` используйте `--directory run`. Игровые данные подготовятся автоматически в `run/.cache/vanilla/26.3`; Java-библиотеки из дистрибутива должны находиться в `run/libraries/`. Плагины устанавливаются в `plugins/rust-plugins/` и `plugins/java-plugins/` внутри выбранной папки.
 
 Адрес и порт задаются только в `server.properties`, количество потоков — только в `server.settings`. Переопределений этих настроек через командную строку нет. Для служебных флагов Cargo нужен разделитель `--`: например, `cargo run --release -- --directory run`.
 
-Команды консоли: `help`, `version`, `tps`, `plugins`, `op NAME`, `deop NAME`, `setblock X Y Z STATE-ID`, `stop`. Права плагинов сейчас проверяются через статус оператора. `/tpsbar` отображается в игре. Полного permission API и встроенного spark пока нет. Журнал `logs/latest.log` дописывается и автоматически не ротируется.
+Проверка обновлений задаётся `update_check = true` и интервалом `update_check_interval_hours = 6` (1–168 часов). Она обращается к публичному GitHub без токена и не скачивает программы. О новой стабильной версии консоль и операторы получают одно английское уведомление со ссылкой; для игрока повторное уведомление возможно в новом сеансе или при появлении более новой версии. `update_check = false` полностью отключает запросы, а диагностический режим статуса их не запускает.
+
+Команды консоли: `help`, `version`, `tps`, `plugins`, `op NAME`, `deop NAME`, `setblock X Y Z STATE-ID`, `stop`. Операторы определяются по UUID. Для `op NAME` игрок должен быть на сервере; `deop` принимает имя или UUID. Для команд ядра учитывается уровень оператора. Полный API прав ещё дорабатывается. `/tpsbar` отображается в игре. Rust-профилировщик работает на Linux и сохраняет отчёты spark в `profiles/`. Журнал `logs/latest.log` дописывается и автоматически не ротируется.

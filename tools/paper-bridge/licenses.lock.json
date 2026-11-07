@@ -1,0 +1,476 @@
+{
+  "sources": {
+    "adventure": {
+      "license": "MIT",
+      "source": "https://github.com/PaperMC/adventure/tree/4bcbbd74339547bc061a9cc0a4aecf88f1f1a63c",
+      "documents": [
+        {
+          "url": "https://raw.githubusercontent.com/PaperMC/adventure/4bcbbd74339547bc061a9cc0a4aecf88f1f1a63c/license.txt",
+          "sha256": "6f3f7529e339bca44fb8693f606267dabf80e11ce228e12e9a4fa3316a30d6b5"
+        }
+      ]
+    },
+    "annotations": {
+      "license": "Apache-2.0",
+      "source": "https://github.com/JetBrains/java-annotations/tree/6f588d455af377bedf5a163b298960e8283ef66e",
+      "documents": [
+        {
+          "url": "https://raw.githubusercontent.com/JetBrains/java-annotations/6f588d455af377bedf5a163b298960e8283ef66e/LICENSE.txt",
+          "sha256": "8c1e966c7855fb54027bcaf6ebe7a43abe4785791e8cf9148c363761d493d097"
+        }
+      ]
+    },
+    "auto-service": {
+      "license": "Apache-2.0",
+      "source": "https://github.com/google/auto/tree/b89063966c781303166cc108223816d734ae7e6d",
+      "documents": [
+        {
+          "url": "https://raw.githubusercontent.com/google/auto/b89063966c781303166cc108223816d734ae7e6d/LICENSE",
+          "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+        }
+      ]
+    },
+    "brigadier": {
+      "license": "MIT",
+      "source": "https://github.com/Mojang/brigadier/tree/9ba4f13c0fe82b07c08c2dc2d8043f075ffd0d98",
+      "documents": [
+        {
+          "url": "https://raw.githubusercontent.com/Mojang/brigadier/9ba4f13c0fe82b07c08c2dc2d8043f075ffd0d98/LICENSE",
+          "sha256": "d25deed12d803f6c973597348627b1939e2d19bbc28fda83c93ea0cde44702da"
+        }
+      ]
+    },
+    "bungee": {
+      "license": "BSD-3-Clause",
+      "source": "https://github.com/SpigotMC/BungeeCord/tree/fc101fe75e925ebe5f15e66a7da753a41f26683a",
+      "documents": [
+        {
+          "url": "https://raw.githubusercontent.com/SpigotMC/BungeeCord/fc101fe75e925ebe5f15e66a7da753a41f26683a/LICENSE",
+          "sha256": "c3134e1f3e978c8bd093cec890bf48bc18910407cc70f1ea0e3ef464dc9c1d74"
+        }
+      ]
+    },
+    "errorprone": {
+      "license": "Apache-2.0",
+      "source": "https://github.com/google/error-prone/tree/afa2d04b51099e466863b0051fa05b48971ac757",
+      "documents": [
+        {
+          "url": "https://raw.githubusercontent.com/google/error-prone/afa2d04b51099e466863b0051fa05b48971ac757/COPYING",
+          "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+        }
+      ]
+    },
+    "fastutil": {
+      "license": "Apache-2.0",
+      "source": "https://github.com/vigna/fastutil/tree/e70f36a137c349efa50f346818d16917a9f91986",
+      "documents": [
+        {
+          "url": "https://raw.githubusercontent.com/vigna/fastutil/e70f36a137c349efa50f346818d16917a9f91986/LICENSE-2.0",
+          "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+        }
+      ]
+    },
+    "gson": {
+      "license": "Apache-2.0",
+      "source": "https://github.com/google/gson/tree/3ff35d6269894901ab8006258395aafc4b9765cd",
+      "documents": [
+        {
+          "url": "https://raw.githubusercontent.com/google/gson/3ff35d6269894901ab8006258395aafc4b9765cd/LICENSE",
+          "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+        }
+      ]
+    },
+    "j2objc": {
+      "license": "Apache-2.0",
+      "source": "https://github.com/google/j2objc/tree/1671e9afb72a16126d448f468db3e582358fba47",
+      "documents": [
+        {
+          "url": "https://raw.githubusercontent.com/google/j2objc/1671e9afb72a16126d448f468db3e582358fba47/LICENSE",
+          "sha256": "22418fba3d2030cc22690f1c0c38ae423d5540110e9d61519027e3210ac29726"
+        }
+      ]
+    },
+    "jcl": {
+      "license": "Apache-2.0",
+      "source": "https://github.com/qos-ch/slf4j/tree/e9ee55cca93c2bf26f14482a9bdf961c750d2a56",
+      "documents": [
+        {
+          "url": "https://raw.githubusercontent.com/qos-ch/slf4j/e9ee55cca93c2bf26f14482a9bdf961c750d2a56/jcl-over-slf4j/LICENSE.txt",
+          "sha256": "59899c6091b540582ed617e8eeaac4919dc985ccfc35459ee9752b699be5205b"
+        }
+      ]
+    },
+    "joml": {
+      "license": "MIT",
+      "source": "https://github.com/JOML-CI/JOML/tree/faf9eef2511242122beb6055fe3da92daed214c5",
+      "documents": [
+        {
+          "url": "https://raw.githubusercontent.com/JOML-CI/JOML/faf9eef2511242122beb6055fe3da92daed214c5/LICENSE",
+          "sha256": "c043070fc7376139226cea94e02afd1af2f264699589484d3cbce91b29ffb2c5"
+        }
+      ]
+    },
+    "jspecify": {
+      "license": "Apache-2.0",
+      "source": "https://github.com/jspecify/jspecify/tree/b2a10e14bb81c1b7cb6e488c112fe55cb2218d7d",
+      "documents": [
+        {
+          "url": "https://raw.githubusercontent.com/jspecify/jspecify/b2a10e14bb81c1b7cb6e488c112fe55cb2218d7d/LICENSE",
+          "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+        }
+      ]
+    },
+    "listenablefuture": {
+      "license": "Apache-2.0",
+      "source": "https://github.com/google/guava/tree/bbf9295088d668c06e573cea03f01375985c1814",
+      "documents": [
+        {
+          "url": "https://raw.githubusercontent.com/google/guava/bbf9295088d668c06e573cea03f01375985c1814/COPYING",
+          "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+        }
+      ]
+    },
+    "option": {
+      "license": "MIT",
+      "source": "https://github.com/KyoriPowered/option/tree/c1f7a76af0882a4bf4466b0c1dc07af15261d775",
+      "documents": [
+        {
+          "url": "https://raw.githubusercontent.com/KyoriPowered/option/c1f7a76af0882a4bf4466b0c1dc07af15261d775/license.txt",
+          "sha256": "71c1374a3b176c6728754ac99275b321fddbb3e4c2a139e734a3566640e6c1b9"
+        }
+      ]
+    },
+    "sisu": {
+      "license": "EPL version 1.0; bundled ASM BSD notice preserved in about.html",
+      "source": "https://github.com/eclipse/sisu.inject/tree/14439cd38535c22cc908eacf99b70daf66d949b3",
+      "documents": [
+        {
+          "url": "https://raw.githubusercontent.com/eclipse/sisu.inject/14439cd38535c22cc908eacf99b70daf66d949b3/LICENSE.txt",
+          "sha256": "44277b2bec6093e4ac313afec251a4de599d24c4e768f8574d95b13a9d2d97b5"
+        }
+      ]
+    },
+    "paper": {
+      "license": "GPL version 3; MIT exceptions documented in upstream LICENSE.md",
+      "source": "https://github.com/PaperMC/Paper/tree/35a2d155771786a370831ad2ad3c8bd45dc0bb1a",
+      "documents": [
+        {
+          "url": "https://raw.githubusercontent.com/PaperMC/Paper/35a2d155771786a370831ad2ad3c8bd45dc0bb1a/LICENSE.md",
+          "sha256": "fc5629be761124cb418bed11c70b2cd2aeff136c52ca8b80caf8fdf7474c3bc8"
+        },
+        {
+          "url": "https://raw.githubusercontent.com/PaperMC/Paper/35a2d155771786a370831ad2ad3c8bd45dc0bb1a/licenses/GPL.md",
+          "sha256": "33bc26d4498c183b703d1760ee45b8774d21d6e0178ca393dc715271840c7a21"
+        },
+        {
+          "url": "https://raw.githubusercontent.com/PaperMC/Paper/35a2d155771786a370831ad2ad3c8bd45dc0bb1a/licenses/MIT.md",
+          "sha256": "559c62b6c55d1288098a4f744832081cdb7e0015139636cbbad1ad6cbe55ffea"
+        }
+      ]
+    },
+    "snakeyaml": {
+      "license": "Apache-2.0",
+      "source": "https://github.com/snakeyaml/snakeyaml/tree/a34989252e6f59e36a3aaf788a903b7a37a73d33",
+      "documents": [
+        {
+          "url": "https://raw.githubusercontent.com/snakeyaml/snakeyaml/a34989252e6f59e36a3aaf788a903b7a37a73d33/LICENSE.txt",
+          "sha256": "a6cba85bc92e0cff7a450b1d873c0eaa2e9fc96bf472df0247a26bec77bf3ff9"
+        }
+      ]
+    },
+    "inject": {
+      "license": "Apache-2.0",
+      "source": "https://github.com/javax-inject/javax-inject/tree/1f74ea7bd05ce4a3a62ddfe4a2511bf1b4287a61",
+      "documents": [
+        {
+          "url": "https://www.apache.org/licenses/LICENSE-2.0.txt",
+          "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+        },
+        {
+          "url": "https://raw.githubusercontent.com/javax-inject/javax-inject/1f74ea7bd05ce4a3a62ddfe4a2511bf1b4287a61/src/javax/inject/Inject.java",
+          "sha256": "04cefc686b5ea6d0d40d569d2345a3a6f0a5f6baa5c39976f047fbbd7bc5cf9f",
+          "extract": "copyright_comment"
+        }
+      ]
+    },
+    "plexus": {
+      "license": "Apache-2.0",
+      "source": "https://github.com/codehaus-plexus/plexus-interpolation/tree/159e6971b0e2db261be1d01deb9149f27f8fb752",
+      "documents": [
+        {
+          "url": "https://www.apache.org/licenses/LICENSE-2.0.txt",
+          "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+        },
+        {
+          "url": "https://raw.githubusercontent.com/codehaus-plexus/plexus-interpolation/159e6971b0e2db261be1d01deb9149f27f8fb752/src/main/java/org/codehaus/plexus/interpolation/Interpolator.java",
+          "sha256": "5c2ecc7f22944b3274ed3fa4b5152890fb7720aee83cf942bf95c70e2ba7952a",
+          "extract": "copyright_comment"
+        }
+      ]
+    }
+  },
+  "artifacts": {
+    "adventure-api-5.2.0.jar": {
+      "license": "MIT",
+      "sources": [
+        "adventure"
+      ]
+    },
+    "adventure-key-5.2.0.jar": {
+      "license": "MIT",
+      "sources": [
+        "adventure"
+      ]
+    },
+    "adventure-text-logger-slf4j-5.2.0.jar": {
+      "license": "MIT",
+      "sources": [
+        "adventure"
+      ]
+    },
+    "adventure-text-minimessage-5.2.0.jar": {
+      "license": "MIT",
+      "sources": [
+        "adventure"
+      ]
+    },
+    "adventure-text-serializer-commons-5.2.0.jar": {
+      "license": "MIT",
+      "sources": [
+        "adventure"
+      ]
+    },
+    "adventure-text-serializer-gson-5.2.0.jar": {
+      "license": "MIT",
+      "sources": [
+        "adventure"
+      ]
+    },
+    "adventure-text-serializer-json-5.2.0.jar": {
+      "license": "MIT",
+      "sources": [
+        "adventure"
+      ]
+    },
+    "adventure-text-serializer-legacy-5.2.0.jar": {
+      "license": "MIT",
+      "sources": [
+        "adventure"
+      ]
+    },
+    "adventure-text-serializer-plain-5.2.0.jar": {
+      "license": "MIT",
+      "sources": [
+        "adventure"
+      ]
+    },
+    "annotations-26.1.0.jar": {
+      "license": "Apache-2.0",
+      "sources": [
+        "annotations"
+      ]
+    },
+    "auto-service-annotations-1.1.1.jar": {
+      "license": "Apache-2.0",
+      "sources": [
+        "auto-service"
+      ]
+    },
+    "brigadier-1.3.11.jar": {
+      "license": "MIT",
+      "sources": [
+        "brigadier"
+      ]
+    },
+    "bungeecord-chat-1.21-R0.2-deprecated+build.21.jar": {
+      "license": "BSD-3-Clause",
+      "sources": [
+        "bungee"
+      ]
+    },
+    "checker-qual-4.2.3.jar": {
+      "license": "See bundled LICENSE and NOTICE documents",
+      "sources": []
+    },
+    "commons-codec-1.16.0.jar": {
+      "license": "See bundled LICENSE and NOTICE documents",
+      "sources": []
+    },
+    "commons-lang3-3.12.0.jar": {
+      "license": "See bundled LICENSE and NOTICE documents",
+      "sources": []
+    },
+    "error_prone_annotations-2.47.0.jar": {
+      "license": "Apache-2.0",
+      "sources": [
+        "errorprone"
+      ]
+    },
+    "failureaccess-1.0.3.jar": {
+      "license": "See bundled LICENSE and NOTICE documents",
+      "sources": []
+    },
+    "fastutil-8.5.18.jar": {
+      "license": "Apache-2.0",
+      "sources": [
+        "fastutil"
+      ]
+    },
+    "gson-2.14.0.jar": {
+      "license": "Apache-2.0",
+      "sources": [
+        "gson"
+      ]
+    },
+    "guava-33.6.0-jre.jar": {
+      "license": "See bundled LICENSE and NOTICE documents",
+      "sources": []
+    },
+    "httpclient-4.5.14.jar": {
+      "license": "See bundled LICENSE and NOTICE documents",
+      "sources": []
+    },
+    "httpcore-4.4.16.jar": {
+      "license": "See bundled LICENSE and NOTICE documents",
+      "sources": []
+    },
+    "j2objc-annotations-3.1.jar": {
+      "license": "Apache-2.0",
+      "sources": [
+        "j2objc"
+      ]
+    },
+    "javax.inject-1.jar": {
+      "license": "Apache-2.0",
+      "sources": [
+        "inject"
+      ]
+    },
+    "jcl-over-slf4j-1.7.36.jar": {
+      "license": "Apache-2.0",
+      "sources": [
+        "jcl"
+      ]
+    },
+    "joml-1.10.9.jar": {
+      "license": "MIT",
+      "sources": [
+        "joml"
+      ]
+    },
+    "jspecify-1.0.0.jar": {
+      "license": "Apache-2.0",
+      "sources": [
+        "jspecify"
+      ]
+    },
+    "listenablefuture-9999.0-empty-to-avoid-conflict-with-guava.jar": {
+      "license": "Apache-2.0",
+      "sources": [
+        "listenablefuture"
+      ]
+    },
+    "log4j-api-2.26.0.jar": {
+      "license": "See bundled LICENSE and NOTICE documents",
+      "sources": []
+    },
+    "maven-artifact-3.9.6.jar": {
+      "license": "See bundled LICENSE and NOTICE documents",
+      "sources": []
+    },
+    "maven-builder-support-3.9.6.jar": {
+      "license": "See bundled LICENSE and NOTICE documents",
+      "sources": []
+    },
+    "maven-model-3.9.6.jar": {
+      "license": "See bundled LICENSE and NOTICE documents",
+      "sources": []
+    },
+    "maven-model-builder-3.9.6.jar": {
+      "license": "See bundled LICENSE and NOTICE documents",
+      "sources": []
+    },
+    "maven-repository-metadata-3.9.6.jar": {
+      "license": "See bundled LICENSE and NOTICE documents",
+      "sources": []
+    },
+    "maven-resolver-api-1.9.18.jar": {
+      "license": "See bundled LICENSE and NOTICE documents",
+      "sources": []
+    },
+    "maven-resolver-connector-basic-1.9.18.jar": {
+      "license": "See bundled LICENSE and NOTICE documents",
+      "sources": []
+    },
+    "maven-resolver-impl-1.9.18.jar": {
+      "license": "See bundled LICENSE and NOTICE documents",
+      "sources": []
+    },
+    "maven-resolver-named-locks-1.9.18.jar": {
+      "license": "See bundled LICENSE and NOTICE documents",
+      "sources": []
+    },
+    "maven-resolver-provider-3.9.6.jar": {
+      "license": "See bundled LICENSE and NOTICE documents",
+      "sources": []
+    },
+    "maven-resolver-spi-1.9.18.jar": {
+      "license": "See bundled LICENSE and NOTICE documents",
+      "sources": []
+    },
+    "maven-resolver-transport-http-1.9.18.jar": {
+      "license": "See bundled LICENSE and NOTICE documents",
+      "sources": []
+    },
+    "maven-resolver-util-1.9.18.jar": {
+      "license": "See bundled LICENSE and NOTICE documents",
+      "sources": []
+    },
+    "option-1.1.0.jar": {
+      "license": "MIT",
+      "sources": [
+        "option"
+      ]
+    },
+    "org.eclipse.sisu.inject-0.9.0.M2.jar": {
+      "license": "EPL version 1.0; bundled ASM BSD notice preserved in about.html",
+      "sources": [
+        "sisu"
+      ],
+      "source_archive": {
+        "url": "https://repo.papermc.io/repository/maven-public/org/eclipse/sisu/org.eclipse.sisu.inject/0.9.0.M2/org.eclipse.sisu.inject-0.9.0.M2-sources.jar",
+        "sha256": "071d842e8e51fb889a19997b414eff75ebb06f6d4dc79d3f062c03dc5cd2bd51"
+      }
+    },
+    "paper-api-26.3.build.242-stable.jar": {
+      "license": "GPL version 3; MIT exceptions documented in upstream LICENSE.md",
+      "sources": [
+        "paper"
+      ],
+      "source_archive": {
+        "url": "https://repo.papermc.io/repository/maven-public/io/papermc/paper/paper-api/26.3.build.242-stable/paper-api-26.3.build.242-stable-sources.jar",
+        "sha256": "f07bfed72387baaf6481f2d26277f32fa6bc2c2ff54d22bfed56245bbf962e72"
+      }
+    },
+    "plexus-interpolation-1.26.jar": {
+      "license": "Apache-2.0",
+      "sources": [
+        "plexus"
+      ]
+    },
+    "plexus-utils-3.5.1.jar": {
+      "license": "See bundled LICENSE and NOTICE documents",
+      "sources": []
+    },
+    "slf4j-api-2.0.17.jar": {
+      "license": "See bundled LICENSE and NOTICE documents",
+      "sources": []
+    },
+    "snakeyaml-2.2.jar": {
+      "license": "Apache-2.0",
+      "sources": [
+        "snakeyaml"
+      ]
+    }
+  }
+}

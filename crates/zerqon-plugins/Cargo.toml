@@ -1,0 +1,23 @@
+[package]
+name = "zerqon-plugins"
+description = "Sandboxed WebAssembly plugin runtime for Zerqon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+zerqon-plugin-api = { path = "../zerqon-plugin-api" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+wasmi = { version = "2.0.0", default-features = false, features = ["std", "validate", "portable-dispatch"] }
+
+[dev-dependencies]
+wat = "1"
+tempfile = "3"
+
+[lints]
+workspace = true

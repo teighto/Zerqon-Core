@@ -49,7 +49,7 @@ zerqon_plugin_api::export_plugin!(handle);
 
 Commands register only during `Enable`, use lowercase names and cannot contain spaces. `Reply` is valid only while handling a command and is returned to that command's sender. `permission: None` requests a public command; a permission string is a requirement that the server's command dispatcher must enforce. The plugin host returns actions; it does not bypass the server's permission or command-collision checks.
 
-`Event::Command.sender_kind` is `SenderKind::Console` or `SenderKind::Player`. The `sender` string is a display name, never evidence of console privileges: a player can be named `CONSOLE`. Use the explicit sender kind and server-enforced permissions for privileged behavior.
+`Event::Command.sender_kind` is `SenderKind::Console` or `SenderKind::Player`; `operator` carries the server's authorization decision and defaults to false when absent. The `sender` string is a display name, never evidence of console privileges: a player can be named `CONSOLE`. Use the explicit sender kind and server-enforced permissions for privileged behavior.
 
 Callbacks execute serially within one plugin instance. Keep them short. The host does not give a plugin mutable access to the world or spawn an OS thread for it. Plugin memory survives between callbacks until disable, a fault, unload or server shutdown. There is no filesystem persistence API in ABI 1.
 
@@ -70,7 +70,7 @@ Only these imports are available, in module `zerqon`:
 | `event_read` | `(pointer: i32, length: i32) -> i32` | Copies the complete event into guest memory; length must match exactly |
 | `emit` | `(pointer: i32, length: i32) -> i32` | Reads one JSON action and returns `0` |
 
-Events use a tagged JSON object, for example `{"event":"command","sender":"teighto","sender_kind":"player","command":"hello","args":[]}`. Actions use `{"action":"reply","message":"Hello"}`. The SDK performs serialization and exposes Rust enums. Unknown fields and variants are rejected. Start functions, other imports, WASI, native libraries, host file access and network access are unavailable.
+Events use a tagged JSON object, for example `{"event":"command","sender":"teighto","sender_kind":"player","operator":false,"command":"hello","args":[]}`. Actions use `{"action":"reply","message":"Hello"}`. The SDK performs serialization and exposes Rust enums. Unknown fields and variants are rejected. Start functions, other imports, WASI, native libraries, host file access and network access are unavailable.
 
 The SDK's small WebAssembly FFI boundary contains the pointer operations; plugin authors use the safe `Event` and `Action` interface. The native host reads and writes guest memory through checked Wasmi APIs and contains no unsafe Rust.
 
@@ -92,6 +92,6 @@ API версии 1 содержит события включения/выклю
 
 Обработчик `handle(Event) -> Vec<Action>` возвращает действия. Команда регистрируется только в `Enable`, ответ допустим только в `Command`. Проверку разрешений и конфликтов имён выполняет диспетчер сервера. Обработчики одного плагина вызываются последовательно; работа должна укладываться в лимит инструкций.
 
-Тип отправителя задаётся полем `sender_kind`: `Console` или `Player`. Ник `CONSOLE` не даёт игроку права консоли. Для проверки привилегий нельзя использовать текст поля `sender`.
+Тип отправителя задаётся полем `sender_kind`: `Console` или `Player`. Поле `operator` передаёт решение сервера о правах; при отсутствии оно равно false. Ник `CONSOLE` не даёт игроку права консоли. Для проверки привилегий нельзя использовать текст поля `sender`.
 
 У каждого плагина отдельная память, ограничение инструкций, размера входа/выхода и количества действий. Нет доступа к файлам, сети и системным библиотекам. Ошибка плагина отключает только его, освобождает его runtime и отменяет действия неуспешного вызова. После исправления нужен перезапуск или явная выгрузка/загрузка. Лимит памяти WebAssembly не равен лимиту всей памяти процесса.

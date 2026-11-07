@@ -1,6 +1,6 @@
 # Zerqon Java API / Java API Zerqon
 
-Zerqon has its own Java plugin API alongside its Rust plugin API. The server engine and world remain Rust. Java plugins run in one optional Java 25 process and communicate with the Rust core through bounded JSON requests. This API is separate from Paper/Bukkit compatibility; a Paper JAR is rejected explicitly by this host.
+Zerqon has its own Java plugin API alongside its Rust plugin API. The server engine and world remain Rust. Java plugins run in one optional Java 25 process and communicate with the Rust core through bounded JSON requests. The same host can load an experimental subset of original Paper 26.3 plugins when the libraries in `libraries/paper/` are on its classpath. The [Paper compatibility matrix](../tools/paper-bridge/README.md) lists what is implemented.
 
 ## Build and install
 
@@ -10,7 +10,7 @@ Requirements: Python 3.10+ and JDK 25. From the source checkout:
 python scripts/build-java-plugins.py
 ```
 
-The script compiles with `--release 25 -Xlint:all -Werror`, builds the example and runs real subprocess/JAR integration tests. It downloads Google's Gson 2.13.2 from Maven Central into `libraries/` and checks the pinned SHA-256 before use. Downloads and binaries are excluded from Git.
+The script compiles with `--release 25 -Xlint:all -Werror`, builds the example and runs real subprocess/JAR integration tests for both APIs. It verifies the pinned SHA-256 for Gson and the original Paper API dependencies, then stages the optional Paper libraries in `libraries/paper/`. Downloads and binaries are excluded from Git; the host never downloads dependencies at startup.
 
 Outputs:
 
@@ -19,6 +19,7 @@ Outputs:
 | `libraries/zerqon-java-api-0.0.1.jar` | Compile-time SDK; no Gson dependency |
 | `libraries/zerqon-java-host-0.0.1.jar` | Optional host, including SDK classes |
 | `libraries/gson-2.13.2.jar` | Host JSON library |
+| `libraries/paper/*.jar` | Optional pinned Paper API, dependencies and experimental bridge |
 | `dist/hello-java-plugin-0.0.1.jar` | Example registering `/jhello` |
 
 Copy the example JAR into the server's `plugins/java-plugins/hello.jar`. Place the host and Gson JARs in the server's `libraries/` directory. `java_plugins = true` in `server.settings` enables the host when Java plugin files are present; `java_executable` selects Java 25. Rust plugins remain in `plugins/rust-plugins/`.
@@ -73,7 +74,7 @@ JAR file names contain 1–64 ASCII letters, digits, underscores or hyphens befo
 |---|---|
 | `Event.Enable` | Zerqon server version |
 | `Event.Disable` | Shutdown notification |
-| `Event.Command` | Sender display name, `SenderKind`, command name, immutable argument list |
+| `Event.Command` | Sender display name, `SenderKind`, trusted `operator` flag, command name, immutable argument list |
 | `Event.Tick` | Nonnegative tick counter |
 | `Event.PlayerJoin` | Player UUID string and name |
 | `Event.PlayerQuit` | Player UUID string and name |
@@ -84,9 +85,9 @@ JAR file names contain 1–64 ASCII letters, digits, underscores or hyphens befo
 | `Action.Reply` | Respond to the current command sender |
 | `Action.RegisterCommand` | Register a name, description and nullable permission during Enable |
 
-Command names are lowercase ASCII letters, digits, underscores or hyphens. A non-null permission is a requirement that the Rust command dispatcher must enforce; `null` requests a public command. A plugin cannot register commands from a tick or return a reply outside a command callback. The core checks command collisions and permissions before dispatch. Events are delivered only when the server sends them.
+Command names are lowercase ASCII letters, digits, underscores or hyphens. For this custom API, a non-null permission requires an operator or trusted console; `null` requests a public command. The Java host enforces that check using the trusted flags supplied by Rust. Paper commands use their own supported permission defaults in the adapter. A plugin cannot register commands from a tick or return a reply outside a command callback. The core checks command collisions before dispatch. Events are delivered only when the server sends them.
 
-`command.senderKind()` is `Event.SenderKind.CONSOLE` or `PLAYER`. Never infer privileges from `command.sender()`: it is a display name, and a player may be named `CONSOLE`. Use the explicit sender kind and server-enforced permissions.
+`command.senderKind()` is `Event.SenderKind.CONSOLE` or `PLAYER`; `command.operator()` reports the server's authorization decision. Never infer privileges from `command.sender()`: it is a display name, and a player may be named `CONSOLE`. Missing `operator` in the wire protocol defaults to false.
 
 ABI 1 does not yet provide world, inventory, entity manipulation, a task scheduler or a persistent storage API. These capabilities are not represented by successful no-ops.
 
@@ -106,7 +107,7 @@ UTF-8 JSON Lines on stdin/stdout, with no unsolicited startup output. Every requ
 
 ```json
 {"id":1,"op":"load","directory":"/srv/zerqon/plugins/java-plugins","server_version":"0.0.1"}
-{"id":2,"op":"event","plugin":"hello","event":{"event":"command","sender":"console","sender_kind":"console","command":"jhello","args":[]}}
+{"id":2,"op":"event","plugin":"hello","event":{"event":"command","sender":"console","sender_kind":"console","operator":true,"command":"jhello","args":[]}}
 {"id":3,"op":"list"}
 {"id":4,"op":"shutdown"}
 ```
@@ -119,15 +120,15 @@ Omitting `plugin` broadcasts an event to enabled plugins. Load invokes Enable; s
 
 An operation-level failure sets `ok:false` and `error`; a plugin-level failure appears in that result's `error`, with `enabled:false`. Duplicate loading leaves an existing plugin intact and returns an error for that entry. Logs go only to stderr. An invalid or oversized protocol stream can terminate the host.
 
-Direct diagnostic launch uses `java -Xms16M -Xmx128M -cp "libraries/zerqon-java-host-0.0.1.jar:./libraries/gson-2.13.2.jar" io.github.teighto.zerqon.host.PluginHost`. On Windows, use `;` between classpath entries.
+Direct diagnostic launch uses `java -Xms16M -Xmx128M -cp "libraries/zerqon-java-host-0.0.1.jar:./libraries/paper/*:./libraries/gson-2.13.2.jar" io.github.teighto.zerqon.host.PluginHost`. On Windows, use `;` between classpath entries. Leave out `libraries/paper/*` to run only the custom API. Paper's pinned Gson takes precedence when the optional libraries are present.
 
 ## Русский
 
-У Zerqon собственный Java API, отдельный от совместимости Paper/Bukkit. Ядро и мир работают на Rust; Java-плагины исполняются в одном дополнительном процессе Java 25. Папка плагинов — `plugins/java-plugins/`, для Rust — `plugins/rust-plugins/`.
+У Zerqon собственный Java API. Ядро и мир работают на Rust; Java-плагины исполняются в одном дополнительном процессе Java 25. Этот же host распознаёт `plugin.yml` и запускает проверенную часть Paper 26.3 API при наличии `libraries/paper/` в classpath. Полной совместимости Paper пока нет; ограничения указаны в матрице. Папка Java-плагинов — `plugins/java-plugins/`, для Rust — `plugins/rust-plugins/`.
 
 Сборка: `python scripts/build-java-plugins.py`. Она проверяет SHA-256 библиотеки Gson, компилирует SDK, хост и пример, запускает интеграционные тесты с настоящими JAR и JVM. Скопируйте `dist/hello-java-plugin-0.0.1.jar` в `plugins/java-plugins/hello.jar`, хост и Gson — в `libraries/`. Настройка `java_plugins = true` в `server.settings` включает хост при наличии JAR; `java_executable` задаёт Java 25. Пример добавляет `/jhello`.
 
-Плагин реализует `Plugin.onEvent(Event)` и возвращает действия `Action`. В манифесте обязательны `Zerqon-Plugin` с именем класса и `Zerqon-API: 1`. Есть события включения, выключения, команд, тиков и входа/выхода игроков. Действия — журнал, ответ на команду и регистрация команды. Право доступа и конфликт имён проверяет Rust-диспетчер сервера.
+Плагин собственного API реализует `Plugin.onEvent(Event)` и возвращает действия `Action`. В манифесте обязательны `Zerqon-Plugin` с именем класса и `Zerqon-API: 1`. Есть события включения, выключения, команд, тиков и входа/выхода игроков. Действия — журнал, ответ на команду и регистрация команды. Java-host проверяет права по доверенным признакам `senderKind` и `operator`, полученным от Rust; конфликты команд проверяет ядро.
 
 `senderKind()` различает консоль и игрока. Строка `sender()` — отображаемое имя; игрок с ником `CONSOLE` остаётся игроком. Не проверяйте привилегии по этому тексту.
 

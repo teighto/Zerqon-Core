@@ -11,7 +11,7 @@ Zerqon is a Minecraft 26.3 server written in Rust by teighto. The project focuse
 
 The server keeps the familiar folder layout: worlds, logs, configuration files and a plugins folder. Java and Rust plugins can run on the same server, while players connect with their usual client.
 
-Version 0.0.1 is in development. A Java client can enter the test world, and the Java and Rust example plugins run. Full gameplay, Paper compatibility and spark are still being implemented.
+Version 0.0.1 is in development. The test world has players and mobs, and Java and Rust plugins run together. Survival, complete world transfers and full Paper support still need work.
 
 ### Paper and Zerqon
 
@@ -21,6 +21,7 @@ Version 0.0.1 is in development. A Java client can enter the test world, and the
 | Plugins | Bukkit, Spigot and Paper Java plugins | Own Java and Rust APIs; Paper support in development |
 | Java runtime | Required for the server | Used for Java plugins and initial game-data preparation |
 | Worlds | Vanilla world storage | Own storage; world import is being developed |
+| Profiling | Bundled spark | Built-in Rust CPU profiler on Linux; spark reports |
 | Availability | Published server releases | 0.0.1 is not released yet |
 
 Paper details: [PaperMC documentation](https://docs.papermc.io/paper/). A speed or RAM comparison between the two servers needs the same world and workload; that comparison has not been run yet.
@@ -45,20 +46,26 @@ cargo run -p zerqon-world --example world_bench --release --locked -- 10000 4
 
 ### Start the server
 
-Use Rust 1.97, Python 3.11+ and JDK 25. Java is needed to prepare Minecraft's data and to run Java plugins. The game engine runs in Rust.
+Run the compiled file. On Linux:
 
 ```sh
-cargo run --release -- --init
-python scripts/prepare-data.py
+chmod +x zerqon
+./zerqon
 ```
 
-Read the [Minecraft EULA](https://aka.ms/MinecraftEULA) and set `eula=true` in `eula.txt` if you agree. Set the port in `server.properties` and the thread counts in `server.settings`. Then start:
+On Windows, run `zerqon.exe`.
+
+The first start creates the configuration files. Read the [Minecraft EULA](https://aka.ms/MinecraftEULA), set `eula=true` if you agree, then start again. Zerqon prepares the game data automatically. If Java 25 is needed and not installed, it downloads a copy into `.cache/` without changing the system installation. Python is not needed to run the server.
+
+Set the port in `server.properties` and the thread counts in `server.settings`. Type `stop` in the console to shut down.
+
+To build and run from source with Rust 1.97:
 
 ```sh
 cargo run --release
 ```
 
-For a server without the Rust toolchain, build once with `cargo build --release` and run `target/release/zerqon` (`zerqon.exe` on Windows). There is no core JAR. Type `stop` in the console to shut down.
+`cargo build --release` produces `target/release/zerqon` (`zerqon.exe` on Windows). Java plugin development has its own [build instructions](docs/JAVA_PLUGINS.md).
 
 ### Settings and plugins
 
@@ -90,7 +97,7 @@ Zerqon, сервер Minecraft 26.3 на Rust от teighto. Работа над 
 
 Папки остаются привычными: миры, логи, настройки и плагины. На одном сервере можно использовать Java- и Rust-плагины. Игроки подключаются обычным клиентом.
 
-Версия 0.0.1 в разработке. Java-клиент уже заходит в тестовый мир, примеры Java- и Rust-плагинов работают. Полный игровой процесс, совместимость с Paper и spark ещё разрабатываются.
+Версия 0.0.1 в разработке. В тестовом мире видны игроки и мобы, Java- и Rust-плагины работают вместе. Выживание, полный перенос миров и совместимость со всем Paper API ещё дорабатываются.
 
 ### Paper и Zerqon
 
@@ -100,6 +107,7 @@ Zerqon, сервер Minecraft 26.3 на Rust от teighto. Работа над 
 | Плагины | Java-плагины Bukkit, Spigot и Paper | Собственные API Java и Rust; поддержка Paper в разработке |
 | Java | Нужна для работы сервера | Нужна Java-плагинам и для первоначальной подготовки игровых данных |
 | Миры | Формат хранения vanilla | Собственное хранение; импорт миров разрабатывается |
+| Профилирование | Встроенный spark | Rust-профилировщик CPU на Linux, отчёты spark |
 | Выпуск | Есть опубликованные релизы | 0.0.1 пока не выпущена |
 
 Сведения о Paper: [документация PaperMC](https://docs.papermc.io/paper/). Сравнение скорости и памяти требует одинакового мира и нагрузки. Такого замера пока нет.
@@ -122,20 +130,26 @@ cargo run -p zerqon-world --example world_bench --release --locked -- 10000 4
 
 ### Запуск
 
-Нужны Rust 1.97, Python 3.11+ и JDK 25. Java используется для подготовки данных Minecraft и Java-плагинов. Игровой движок работает на Rust.
+На Linux запустите готовый файл:
 
 ```sh
-cargo run --release -- --init
-python scripts/prepare-data.py
+chmod +x zerqon
+./zerqon
 ```
 
-Прочитайте [Minecraft EULA](https://aka.ms/MinecraftEULA) и при согласии установите `eula=true` в `eula.txt`. Порт задаётся в `server.properties`, количество потоков в `server.settings`. Обычный запуск:
+На Windows запустите `zerqon.exe`.
+
+Первый запуск создаёт настройки. Прочитайте [Minecraft EULA](https://aka.ms/MinecraftEULA), при согласии установите `eula=true` и запустите сервер ещё раз. Игровые данные подготовятся автоматически. Если нужна Java 25, а в системе её нет, сервер скачает отдельную копию в `.cache/`. Установленная Java останется без изменений. Python для запуска не нужен.
+
+Порт задаётся в `server.properties`, потоки в `server.settings`. Для остановки введите `stop` в консоли.
+
+Из исходников с установленным Rust 1.97:
 
 ```sh
 cargo run --release
 ```
 
-Для запуска без Cargo и установленного Rust сначала выполните `cargo build --release`, затем запускайте `target/release/zerqon` или `zerqon.exe` на Windows. JAR-версии ядра нет. Для остановки введите `stop` в консоли.
+После `cargo build --release` готовый файл лежит в `target/release/`. Для разработки Java-плагинов есть отдельная [инструкция](docs/JAVA_PLUGINS.md).
 
 ### Настройки и плагины
 

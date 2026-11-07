@@ -1,0 +1,1120 @@
+use std::{
+    collections::VecDeque,
+    fs,
+    io::{BufRead, BufReader, Write},
+    path::{Path, PathBuf},
+    process::{Child, Command, Stdio},
+    time::Duration,
+};
+
+use tokio::{net::TcpStream, time::timeout};
+use uuid::Uuid;
+use zerqon_protocol::codec::{
+    get_string, get_varint, put_string, put_varint, read_frame, take, write_frame,
+};
+
+struct Server(Child);
+
+fn server_executable() -> PathBuf {
+    std::env::var_os("ZERQON_TEST_SERVER_EXE").map_or_else(
+        || PathBuf::from(env!("CARGO_BIN_EXE_zerqon")),
+        PathBuf::from,
+    )
+}
+
+impl Server {
+    fn start(directory: &Path, data: &Path) -> (Self, String) {
+        let mut server = Self(
+            Command::new(server_executable())
+                .args([
+                    "--directory",
+                    directory.to_str().unwrap(),
+                    "--data",
+                    data.to_str().unwrap(),
+                    "--no-color",
+                ])
+                .env("RUST_LOG", "info")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap(),
+        );
+        let output = server.0.stdout.take().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(output).lines().map_while(Result::ok) {
+                if let Some((_, address)) = line.split_once("Listening on ") {
+                    let _ = sender.send(address.trim().to_owned());
+                }
+            }
+        });
+        let address = receiver
+            .recv_timeout(Duration::from_secs(30))
+            .expect("test server did not start");
+        (server, address)
+    }
+
+    async fn stop(&mut self) {
+        writeln!(self.0.stdin.as_mut().unwrap(), "stop").unwrap();
+        let status = timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(status) = self.0.try_wait().unwrap() {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("test server did not shut down");
+        assert!(status.success(), "server shutdown failed");
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        if let Some(input) = self.0.stdin.as_mut() {
+            let _ = writeln!(input, "stop");
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            if matches!(self.0.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+struct Client {
+    socket: TcpStream,
+    threshold: usize,
+    entity_id: i32,
+    uuid: Uuid,
+    pending: VecDeque<Vec<u8>>,
+    observed: Vec<Vec<u8>>,
+}
+
+impl Client {
+    async fn join(address: &str, username: &str) -> (Self, Vec<Vec<u8>>) {
+        timeout(Duration::from_secs(20), async {
+            let mut socket = TcpStream::connect(address).await.unwrap();
+            let mut handshake = vec![0];
+            put_varint(777, &mut handshake);
+            put_string("localhost", &mut handshake);
+            handshake.extend_from_slice(&25565_u16.to_be_bytes());
+            handshake.push(2);
+            write_frame(&mut socket, &handshake, None).await.unwrap();
+            let mut hello = vec![0];
+            put_string(username, &mut hello);
+            hello.extend_from_slice(&[0; 16]);
+            write_frame(&mut socket, &hello, None).await.unwrap();
+            let compression = read_frame(&mut socket, 65536, None).await.unwrap();
+            let mut bytes = compression.as_slice();
+            assert_eq!(get_varint(&mut bytes).unwrap(), 3);
+            let threshold = get_varint(&mut bytes).unwrap() as usize;
+            let mut client = Self {
+                socket,
+                threshold,
+                entity_id: 0,
+                uuid: Uuid::nil(),
+                pending: VecDeque::new(),
+                observed: Vec::new(),
+            };
+            let success = client.read().await;
+            assert_eq!(success[0], 2);
+            client.uuid = Uuid::from_slice(&success[1..17]).unwrap();
+            client.send(&[3]).await;
+            let mut known = client.read().await;
+            assert_eq!(known[0], 15);
+            known[0] = 7;
+            client.send(&known).await;
+            loop {
+                if client.read().await[0] == 3 {
+                    break;
+                }
+            }
+            client.send(&[3]).await;
+            let mut chunks = Vec::new();
+            let mut login = false;
+            let mut teleported = false;
+            loop {
+                let packet = client.read().await;
+                match packet[0] {
+                    50 => {
+                        login = true;
+                        client.entity_id = i32::from_be_bytes(packet[1..5].try_into().unwrap());
+                    }
+                    73 => {
+                        let mut body = &packet[1..];
+                        let teleport = get_varint(&mut body).unwrap();
+                        let mut ack = vec![0];
+                        put_varint(teleport, &mut ack);
+                        client.send(&ack).await;
+                        teleported = true;
+                    }
+                    46 => chunks.push(packet),
+                    11 => {
+                        let mut body = &packet[1..];
+                        assert_eq!(get_varint(&mut body).unwrap() as usize, chunks.len());
+                        break;
+                    }
+                    1 | 35 | 70 | 71 | 78 | 101 => client.pending.push_back(packet),
+                    _ => {}
+                }
+            }
+            assert!(login && teleported);
+            assert!(!chunks.is_empty());
+            client.send(&[44]).await;
+            let mut batch = vec![11];
+            batch.extend_from_slice(&8.0_f32.to_be_bytes());
+            client.send(&batch).await;
+            (client, chunks)
+        })
+        .await
+        .expect("client join timed out")
+    }
+
+    async fn send(&mut self, packet: &[u8]) {
+        timeout(
+            Duration::from_secs(5),
+            write_frame(&mut self.socket, packet, Some(self.threshold)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    }
+
+    async fn read(&mut self) -> Vec<u8> {
+        let packet = timeout(
+            Duration::from_secs(5),
+            read_frame(&mut self.socket, 2_097_151, Some(self.threshold)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        if matches!(packet[0], 1 | 35 | 70 | 71 | 78 | 101) {
+            self.observed.push(packet.clone());
+        }
+        packet
+    }
+
+    async fn command(&mut self, command: &str) {
+        let mut packet = vec![7];
+        put_string(command, &mut packet);
+        self.send(&packet).await;
+    }
+
+    async fn until(&mut self, mut predicate: impl FnMut(&[u8]) -> bool) -> Vec<u8> {
+        if let Some(index) = self.pending.iter().position(|packet| predicate(packet)) {
+            return self.pending.remove(index).unwrap();
+        }
+        timeout(Duration::from_secs(8), async {
+            loop {
+                let packet = self.read().await;
+                if packet[0] == 45 {
+                    let mut response = packet;
+                    response[0] = 28;
+                    self.send(&response).await;
+                } else {
+                    assert_ne!(packet[0], 32, "server disconnected client: {packet:?}");
+                    if predicate(&packet) {
+                        break packet;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("expected client packet was not received")
+    }
+
+    async fn reply(&mut self, command: &str, expected: &str) {
+        self.command(command).await;
+        let packet = self.until(|packet| packet[0] == 124).await;
+        let mut body = &packet[1..];
+        assert_eq!(take(&mut body, 1).unwrap(), &[8]);
+        let length = u16::from_be_bytes(take(&mut body, 2).unwrap().try_into().unwrap()) as usize;
+        let text = std::str::from_utf8(take(&mut body, length).unwrap()).unwrap();
+        assert!(
+            text.contains(expected),
+            "command /{command}: expected {expected:?}, received {text:?}"
+        );
+    }
+
+    async fn move_to(&mut self, position: [f64; 3], yaw: f32, pitch: f32) {
+        let mut packet = vec![31];
+        for value in position {
+            packet.extend_from_slice(&value.to_be_bytes());
+        }
+        packet.extend_from_slice(&yaw.to_be_bytes());
+        packet.extend_from_slice(&pitch.to_be_bytes());
+        packet.push(1);
+        self.send(&packet).await;
+    }
+    async fn attack(&mut self, id: i32) {
+        let mut packet = vec![1];
+        put_varint(id, &mut packet);
+        self.send(&packet).await;
+    }
+    async fn mob(&mut self, kind: i32) -> MobWire {
+        if let Some(mob) = self
+            .observed
+            .iter()
+            .find_map(|packet| mob_spawn(packet).filter(|mob| mob.kind == kind))
+        {
+            return mob;
+        }
+        let packet = self
+            .until(|packet| mob_spawn(packet).is_some_and(|mob| mob.kind == kind))
+            .await;
+        mob_spawn(&packet).unwrap()
+    }
+}
+
+fn setup(directory: &Path, root: &Path) {
+    let status = Command::new(server_executable())
+        .args(["--init", "--directory", directory.to_str().unwrap()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    fs::write(directory.join("eula.txt"), "eula=true\n").unwrap();
+    fs::write(
+        directory.join("server.settings"),
+        "update_check=false\nspawn_mobs=false\n",
+    )
+    .unwrap();
+    fs::write(directory.join("server.properties"),"server-ip=127.0.0.1\nserver-port=0\nonline-mode=false\nview-distance=1\nnetwork-compression-threshold=256\n").unwrap();
+    let mut bytes: [u8; 16] = {
+        use md5::{Digest, Md5};
+        Md5::digest(b"OfflinePlayer:LiveOp").into()
+    };
+    bytes[6] = (bytes[6] & 0x0f) | 0x30;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    fs::write(directory.join("ops.json"),serde_json::to_vec(&serde_json::json!([{"uuid":uuid::Uuid::from_bytes(bytes),"name":"LiveOp","level":4,"bypassesPlayerLimit":false}])).unwrap()).unwrap();
+    for name in ["zerqon-java-host-0.0.1.jar", "gson-2.13.2.jar"] {
+        fs::copy(
+            root.join("libraries").join(name),
+            directory.join("libraries").join(name),
+        )
+        .expect("run python scripts/build-java-plugins.py first");
+    }
+    fs::copy(
+        root.join("dist/hello-java-plugin-0.0.1.jar"),
+        directory.join("plugins/java-plugins/hello-java.jar"),
+    )
+    .expect("build the example Java plugin");
+    fs::copy(
+        root.join("target/wasm32-unknown-unknown/release/zerqon_hello_plugin.wasm"),
+        directory.join("plugins/rust-plugins/hello.wasm"),
+    )
+    .expect("build zerqon-hello-plugin for wasm32-unknown-unknown");
+}
+
+fn paletted_value(bytes: &mut &[u8], entries: usize, index: usize, local_limit: u8) -> u32 {
+    let bits = take(bytes, 1).unwrap()[0];
+    if bits == 0 {
+        return get_varint(bytes).unwrap() as u32;
+    }
+    let palette = if bits <= local_limit {
+        let count = get_varint(bytes).unwrap();
+        (0..count)
+            .map(|_| get_varint(bytes).unwrap() as u32)
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let per = 64 / bits as usize;
+    let words = take(bytes, entries.div_ceil(per) * 8).unwrap();
+    let offset = index / per * 8;
+    let word = u64::from_be_bytes(words[offset..offset + 8].try_into().unwrap());
+    let value = ((word >> ((index % per) * bits as usize)) & ((1_u64 << bits) - 1)) as u32;
+    if palette.is_empty() {
+        value
+    } else {
+        palette[value as usize]
+    }
+}
+
+fn saved_block(chunks: &[Vec<u8>]) -> u32 {
+    let packet = chunks
+        .iter()
+        .find(|packet| packet[1..9] == [0; 8])
+        .expect("center chunk");
+    let mut body = &packet[9..];
+    for _ in 0..get_varint(&mut body).unwrap() {
+        get_varint(&mut body).unwrap();
+        let words = get_varint(&mut body).unwrap() as usize;
+        take(&mut body, words * 8).unwrap();
+    }
+    let length = get_varint(&mut body).unwrap() as usize;
+    let mut sections = take(&mut body, length).unwrap();
+    for index in 0..24 {
+        take(&mut sections, 4).unwrap();
+        let state = paletted_value(&mut sections, 4096, 0, 8);
+        paletted_value(&mut sections, 64, 0, 3);
+        if index == 8 {
+            return state;
+        }
+    }
+    panic!("missing y=64 section")
+}
+
+#[tokio::test]
+#[ignore = "requires prepared 26.3 data, Java 25 host/example JARs and the Rust WASM example"]
+async fn compiled_plugins_tpsbar_permissions_and_saved_world_survive_restart() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let data = root.join(".cache/vanilla/26.3");
+    assert!(
+        data.join("prepared.json").is_file(),
+        "run python scripts/prepare-data.py"
+    );
+    let directory = tempfile::tempdir().unwrap();
+    setup(directory.path(), &root);
+    let (mut server, address) = Server::start(directory.path(), &data);
+    let (mut client, chunks) = Client::join(&address, "LiveOp").await;
+    assert_eq!(saved_block(&chunks), 0);
+    client
+        .reply(
+            "plugins",
+            "Rust: hello (enabled); Java: hello-java (enabled)",
+        )
+        .await;
+    client
+        .reply("hello", "Hello, LiveOp! This plugin is written in Rust.")
+        .await;
+    client
+        .reply(
+            "jhello",
+            "Hello, LiveOp! This plugin uses the Zerqon Java API.",
+        )
+        .await;
+    client.reply("tps", "TPS ").await;
+    client.command("tpsbar").await;
+    let add = client
+        .until(|packet| packet[0] == 9 && packet.get(17) == Some(&0))
+        .await;
+    let id = add[1..17].to_vec();
+    let health = client
+        .until(|packet| packet[0] == 9 && packet.get(17) == Some(&2))
+        .await;
+    assert_eq!(&health[1..17], &id);
+    let progress = f32::from_be_bytes(health[18..22].try_into().unwrap());
+    assert!(progress.is_finite() && (0.0..=1.0).contains(&progress));
+    client.command("tpsbar").await;
+    let remove = client
+        .until(|packet| packet[0] == 9 && packet.get(17) == Some(&1))
+        .await;
+    assert_eq!(&remove[1..17], &id);
+    let (mut guest, _) = Client::join(&address, "Guest").await;
+    guest.reply("setblock 0 64 0 1", "Permission denied").await;
+    guest.reply("stop", "Permission denied").await;
+    drop(guest);
+    client
+        .reply("setblock 0 64 0 1", "Block set at 0 64 0")
+        .await;
+    client
+        .reply("setblock 0 64 0 2147483647", "Command failed:")
+        .await;
+    drop(client);
+    server.stop().await;
+    let (mut restarted, address) = Server::start(directory.path(), &data);
+    let (mut client, chunks) = Client::join(&address, "LiveOp").await;
+    assert_eq!(
+        saved_block(&chunks),
+        1,
+        "saved block was not present on the wire after restart"
+    );
+    client.reply("hello", "written in Rust").await;
+    client.reply("jhello", "Zerqon Java API").await;
+    drop(client);
+    restarted.stop().await;
+}
+
+fn tab_entry(packet: &[u8]) -> Option<(Uuid, String)> {
+    if packet.first() != Some(&71) || packet.get(1).is_none_or(|actions| actions & 1 == 0) {
+        return None;
+    }
+    let mut body = &packet[2..];
+    assert_eq!(get_varint(&mut body).unwrap(), 1);
+    let uuid = Uuid::from_slice(take(&mut body, 16).unwrap()).unwrap();
+    Some((uuid, get_string(&mut body, 16).unwrap().to_owned()))
+}
+
+fn spawned_entity(packet: &[u8]) -> Option<(i32, Uuid)> {
+    if packet.first() != Some(&1) {
+        return None;
+    }
+    let mut body = &packet[1..];
+    let id = get_varint(&mut body).unwrap();
+    let uuid = Uuid::from_slice(take(&mut body, 16).unwrap()).unwrap();
+    if get_varint(&mut body).unwrap() != 159 {
+        return None;
+    }
+    Some((id, uuid))
+}
+
+fn removes_entity(packet: &[u8], expected: i32) -> bool {
+    if packet.first() != Some(&78) {
+        return false;
+    }
+    let mut body = &packet[1..];
+    (0..get_varint(&mut body).unwrap()).any(|_| get_varint(&mut body).unwrap() == expected)
+}
+
+fn removes_tab(packet: &[u8], expected: Uuid) -> bool {
+    if packet.first() != Some(&70) {
+        return false;
+    }
+    let mut body = &packet[1..];
+    (0..get_varint(&mut body).unwrap())
+        .any(|_| Uuid::from_slice(take(&mut body, 16).unwrap()).unwrap() == expected)
+}
+
+async fn refused_duplicate(address: &str, name: &str) {
+    timeout(Duration::from_secs(5), async {
+        let mut socket = TcpStream::connect(address).await.unwrap();
+        let mut packet = vec![0];
+        put_varint(777, &mut packet);
+        put_string("localhost", &mut packet);
+        packet.extend_from_slice(&25565_u16.to_be_bytes());
+        packet.push(2);
+        write_frame(&mut socket, &packet, None).await.unwrap();
+        let mut packet = vec![0];
+        put_string(name, &mut packet);
+        packet.extend_from_slice(&[0; 16]);
+        write_frame(&mut socket, &packet, None).await.unwrap();
+        let packet = read_frame(&mut socket, 65536, None).await.unwrap();
+        assert_eq!(
+            packet[0], 0,
+            "duplicate login must be rejected before compression/success"
+        );
+        let mut body = &packet[1..];
+        let reason = get_string(&mut body, 32767).unwrap();
+        assert!(
+            reason.contains("already connected"),
+            "unexpected duplicate rejection: {reason}"
+        );
+    })
+    .await
+    .expect("duplicate login did not complete");
+}
+
+#[tokio::test]
+#[ignore = "requires python scripts/prepare-data.py, python scripts/build-java-plugins.py and cargo build -p zerqon-hello-plugin --target wasm32-unknown-unknown --release"]
+async fn two_clients_replicate_tab_entities_motion_visibility_and_departures() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let data = root.join(".cache/vanilla/26.3");
+    assert!(
+        data.join("prepared.json").is_file(),
+        "run python scripts/prepare-data.py"
+    );
+    let directory = tempfile::tempdir().unwrap();
+    setup(directory.path(), &root);
+    let (mut server, address) = Server::start(directory.path(), &data);
+    let (mut first, _) = Client::join(&address, "CONSOLE").await;
+    first.reply("stop", "Permission denied").await;
+    first.reply("setblock 0 64 0 1", "Permission denied").await;
+    refused_duplicate(&address, "console").await;
+    first.reply("version", "Zerqon").await;
+    let (mut second, _) = Client::join(&address, "Peer").await;
+    assert_ne!(first.entity_id, second.entity_id);
+    assert_ne!(first.uuid, second.uuid);
+    let first_id = first.entity_id;
+    let first_uuid = first.uuid;
+    let second_id = second.entity_id;
+    let second_uuid = second.uuid;
+    first
+        .until(|packet| tab_entry(packet) == Some((second_uuid, "Peer".into())))
+        .await;
+    second
+        .until(|packet| tab_entry(packet) == Some((first_uuid, "CONSOLE".into())))
+        .await;
+    first
+        .until(|packet| spawned_entity(packet) == Some((second_id, second_uuid)))
+        .await;
+    second
+        .until(|packet| spawned_entity(packet) == Some((first_id, first_uuid)))
+        .await;
+    second.move_to([2.0, 64.0, 3.0], 90.0, -15.0).await;
+    let movement = first.until(|packet| packet[0] == 35).await;
+    let mut body = &movement[1..];
+    assert_eq!(get_varint(&mut body).unwrap(), second_id);
+    assert_eq!(get_varint(&mut body).unwrap(), 0);
+    for expected in [2.0, 64.0, 3.0] {
+        assert_eq!(
+            f64::from_be_bytes(take(&mut body, 8).unwrap().try_into().unwrap()),
+            expected
+        );
+    }
+    assert_eq!(
+        f32::from_be_bytes(take(&mut body, 4).unwrap().try_into().unwrap()),
+        90.0
+    );
+    assert_eq!(
+        f32::from_be_bytes(take(&mut body, 4).unwrap().try_into().unwrap()),
+        -15.0
+    );
+    assert_eq!(body, &[1]);
+    let out_mark = first.observed.len();
+    second.move_to([64.5, 64.0, 0.5], 0.0, 0.0).await;
+    first
+        .until(|packet| removes_entity(packet, second_id))
+        .await;
+    second
+        .until(|packet| removes_entity(packet, first_id))
+        .await;
+    first.reply("version", "Zerqon").await;
+    assert!(
+        !first.observed[out_mark..]
+            .iter()
+            .any(|packet| removes_tab(packet, second_uuid)),
+        "leaving view distance must retain TAB entry"
+    );
+    second.move_to([0.5, 64.0, 0.5], 0.0, 0.0).await;
+    first
+        .until(|packet| spawned_entity(packet) == Some((second_id, second_uuid)))
+        .await;
+    second
+        .until(|packet| spawned_entity(packet) == Some((first_id, first_uuid)))
+        .await;
+    drop(second);
+    first.until(|packet| removes_tab(packet, second_uuid)).await;
+    first
+        .until(|packet| removes_entity(packet, second_id))
+        .await;
+    first.reply("list", "Players (1): CONSOLE").await;
+    let reconnect_mark = first.observed.len();
+    let (mut reconnected, _) = Client::join(&address, "Peer").await;
+    assert_eq!(reconnected.uuid, second_uuid);
+    assert_ne!(reconnected.entity_id, second_id);
+    first
+        .until(|packet| tab_entry(packet) == Some((second_uuid, "Peer".into())))
+        .await;
+    first
+        .until(|packet| spawned_entity(packet) == Some((reconnected.entity_id, second_uuid)))
+        .await;
+    reconnected
+        .until(|packet| spawned_entity(packet) == Some((first_id, first_uuid)))
+        .await;
+    first.reply("list", "Players (2):").await;
+    assert!(
+        !first.observed[reconnect_mark..]
+            .iter()
+            .any(|packet| spawned_entity(packet).is_some_and(|(id, _)| id == second_id)),
+        "reconnect recreated the departed entity ID"
+    );
+    drop(reconnected);
+    drop(first);
+    server.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "requires prepared 26.3 data and built Java/Rust example plugins"]
+async fn summoned_mob_has_real_motion_damage_and_persisted_lifecycle() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let data = root.join(".cache/vanilla/26.3");
+    let directory = tempfile::tempdir().unwrap();
+    setup(directory.path(), &root);
+    let (mut server, address) = Server::start(directory.path(), &data);
+    let (mut first, _) = Client::join(&address, "LiveOp").await;
+    let (mut second, _) = Client::join(&address, "Guest").await;
+    second
+        .reply("summon pig 2.5 64 0.5", "Permission denied")
+        .await;
+    first
+        .reply("summon pig 2.5 64 0.5", "Summoned minecraft:pig")
+        .await;
+    let pig = first.mob(101).await;
+    let peer_pig = second.mob(101).await;
+    assert_eq!((pig.id, pig.uuid), (peer_pig.id, peer_pig.uuid));
+    assert_ne!(pig.id, first.entity_id);
+    assert_ne!(pig.id, second.entity_id);
+    second.move_to([64.5, 64.0, 0.5], 0.0, 0.0).await;
+    second.until(|packet| removes_entity(packet, pig.id)).await;
+    second.move_to([1.5, 64.0, 0.5], 0.0, 0.0).await;
+    second
+        .until(|packet| {
+            mob_spawn(packet).is_some_and(|mob| mob.id == pig.id && mob.uuid == pig.uuid)
+        })
+        .await;
+    let moved = first
+        .until(|packet| packet_entity(packet, 35) == Some(pig.id))
+        .await;
+    let mut body = &moved[1..];
+    get_varint(&mut body).unwrap();
+    assert_eq!(get_varint(&mut body).unwrap(), 0);
+    let position = std::array::from_fn(|_| {
+        f64::from_be_bytes(take(&mut body, 8).unwrap().try_into().unwrap())
+    });
+    assert_ne!(
+        position, pig.position,
+        "mob must run real simulation after summon"
+    );
+    second.attack(pig.id).await;
+    first
+        .until(|packet| mob_health(packet) == Some((pig.id, 6.0)))
+        .await;
+    second
+        .until(|packet| mob_health(packet) == Some((pig.id, 6.0)))
+        .await;
+    let registry: serde_json::Value =
+        serde_json::from_slice(&fs::read(data.join("generated/reports/registries.json")).unwrap())
+            .unwrap();
+    let cow_kind = registry["minecraft:entity_type"]["entries"]["minecraft:cow"]["protocol_id"]
+        .as_i64()
+        .unwrap() as i32;
+    let zombie_kind =
+        registry["minecraft:entity_type"]["entries"]["minecraft:zombie"]["protocol_id"]
+            .as_i64()
+            .unwrap() as i32;
+    first
+        .reply("summon cow 5.5 64 5.5", "Summoned minecraft:cow")
+        .await;
+    first
+        .reply("summon zombie -5.5 64 5.5", "Summoned minecraft:zombie")
+        .await;
+    let cow = first.mob(cow_kind).await;
+    let zombie = first.mob(zombie_kind).await;
+    assert_ne!(cow.id, pig.id);
+    assert_ne!(zombie.id, cow.id);
+    drop(second);
+    drop(first);
+    server.stop().await;
+    assert!(directory.path().join("world/entities.zqe").is_file());
+    let (mut restarted, address) = Server::start(directory.path(), &data);
+    let (mut first, _) = Client::join(&address, "LiveOp").await;
+    let restored = first.mob(101).await;
+    assert_eq!(first.mob(cow_kind).await.uuid, cow.uuid);
+    assert_eq!(first.mob(zombie_kind).await.uuid, zombie.uuid);
+    assert_eq!((restored.id, restored.uuid), (pig.id, pig.uuid));
+    assert_ne!(restored.id, first.entity_id);
+    first
+        .until(|packet| mob_health(packet) == Some((pig.id, 6.0)))
+        .await;
+    first
+        .move_to(
+            [
+                restored.position[0] - 1.0,
+                restored.position[1],
+                restored.position[2],
+            ],
+            0.0,
+            0.0,
+        )
+        .await;
+    first.attack(pig.id).await;
+    first.attack(pig.id).await;
+    first
+        .until(|packet| mob_health(packet) == Some((pig.id, 2.0)))
+        .await;
+    first.reply("version", "Zerqon").await;
+    assert!(
+        !first
+            .observed
+            .iter()
+            .any(|packet| removes_entity(packet, pig.id)),
+        "attack cooldown failed"
+    );
+    tokio::time::sleep(Duration::from_millis(550)).await;
+    first.attack(pig.id).await;
+    first
+        .until(|packet| mob_health(packet) == Some((pig.id, 0.0)))
+        .await;
+    first.until(|packet| removes_entity(packet, pig.id)).await;
+    drop(first);
+    restarted.stop().await;
+    let (mut final_server, address) = Server::start(directory.path(), &data);
+    let (mut first, _) = Client::join(&address, "LiveOp").await;
+    first.reply("version", "Zerqon").await;
+    assert!(
+        !first
+            .observed
+            .iter()
+            .any(|packet| mob_spawn(packet).is_some_and(|mob| mob.uuid == pig.uuid)),
+        "dead mob reappeared after restart"
+    );
+    drop(first);
+    final_server.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "requires prepared 26.3 data and built Java/Rust example plugins"]
+async fn default_natural_spawning_creates_passive_mobs_and_enforces_cap() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let data = root.join(".cache/vanilla/26.3");
+    let directory = tempfile::tempdir().unwrap();
+    setup(directory.path(), &root);
+    fs::write(
+        directory.path().join("server.settings"),
+        "update_check=false\nmax_entities=2\n",
+    )
+    .unwrap();
+    let properties = fs::read_to_string(directory.path().join("server.properties"))
+        .unwrap()
+        .replace("view-distance=1", "view-distance=4");
+    fs::write(directory.path().join("server.properties"), properties).unwrap();
+    let (mut server, address) = Server::start(directory.path(), &data);
+    let (mut client, _) = Client::join(&address, "LiveOp").await;
+    let packet = client.until(|packet| mob_spawn(packet).is_some()).await;
+    let first = mob_spawn(&packet).unwrap();
+    let packet = client
+        .until(|packet| mob_spawn(packet).is_some_and(|mob| mob.id != first.id))
+        .await;
+    let second = mob_spawn(&packet).unwrap();
+    let registry: serde_json::Value =
+        serde_json::from_slice(&fs::read(data.join("generated/reports/registries.json")).unwrap())
+            .unwrap();
+    let cow = registry["minecraft:entity_type"]["entries"]["minecraft:cow"]["protocol_id"]
+        .as_i64()
+        .unwrap() as i32;
+    for mob in [first, second] {
+        assert!([101, cow].contains(&mob.kind));
+        assert!((mob.position[0] - 0.5).hypot(mob.position[2] - 0.5) >= 24.0);
+    }
+    client
+        .reply("summon pig 0.5 64 0.5", "entity capacity reached")
+        .await;
+    drop(client);
+    server.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "requires prepared 26.3 data, built Java/Rust examples, and Windows or Linux process inspection"]
+async fn failed_mob_shutdown_save_still_disables_plugins_and_terminates_java() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let data = root.join(".cache/vanilla/26.3");
+    let directory = tempfile::tempdir().unwrap();
+    setup(directory.path(), &root);
+    let (mut server, address) = Server::start(directory.path(), &data);
+    let java_pid = java_child_pid(server.0.id()).await;
+    assert!(
+        java_process_alive(java_pid).await,
+        "Java host must be running before shutdown"
+    );
+    let (mut client, _) = Client::join(&address, "LiveOp").await;
+    client
+        .reply("summon pig 2.5 64 0.5", "Summoned minecraft:pig")
+        .await;
+    let pig = client.mob(101).await;
+    client
+        .until(|packet| packet_entity(packet, 35) == Some(pig.id))
+        .await;
+    let path = directory.path().join("world/entities.zqe");
+    fs::write(&path, b"shutdown regression corrupt snapshot").unwrap();
+    let log_path = directory.path().join("logs/latest.log");
+    timeout(Duration::from_secs(12), async {
+        loop {
+            let log = fs::read_to_string(&log_path).unwrap();
+            if log.contains("Mob tick failed") && log.contains("invalid entity snapshot store") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .expect("mob save failure was not observed while entity was dirty");
+    writeln!(server.0.stdin.as_mut().unwrap(), "stop").unwrap();
+    let status = timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(status) = server.0.try_wait().unwrap() {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("server did not finish failed shutdown");
+    assert!(
+        !status.success(),
+        "failed save must produce a failing exit status"
+    );
+    timeout(Duration::from_secs(5), async {
+        while java_process_alive(java_pid).await {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .expect("Java host survived server shutdown");
+    let log = fs::read_to_string(log_path).unwrap();
+    assert!(
+        log.contains("Hello Java plugin disabled"),
+        "Java Disable was skipped: {log}"
+    );
+    assert!(
+        log.contains("Hello Rust plugin disabled"),
+        "Rust Disable was skipped: {log}"
+    );
+    assert!(
+        !log.contains("Stopped cleanly"),
+        "failed save must not report a clean shutdown"
+    );
+    assert_eq!(
+        fs::read(path).unwrap(),
+        b"shutdown regression corrupt snapshot"
+    );
+    drop(client);
+}
+
+#[tokio::test]
+#[ignore = "requires prepared 26.3 data, Java 25 javac/jar and built Java/Rust examples"]
+async fn java_disable_failure_preserves_other_cleanup_and_fails_process() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let data = root.join(".cache/vanilla/26.3");
+    let directory = tempfile::tempdir().unwrap();
+    setup(directory.path(), &root);
+    build_failing_java_plugin(&root, directory.path()).await;
+    let (mut server, _address) = Server::start(directory.path(), &data);
+    let log_path = directory.path().join("logs/latest.log");
+    let log = fs::read_to_string(&log_path).unwrap();
+    let java_pid = log
+        .lines()
+        .find_map(|line| {
+            line.split_once("SHUTDOWN_FIXTURE_PID=")
+                .and_then(|(_, tail)| tail.split_whitespace().next())
+                .and_then(|pid| pid.parse::<u32>().ok())
+        })
+        .expect("real fixture plugin did not enable");
+    assert!(java_process_alive(java_pid).await);
+    writeln!(server.0.stdin.as_mut().unwrap(), "stop").unwrap();
+    let status = timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(status) = server.0.try_wait().unwrap() {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("server did not finish callback failure shutdown");
+    timeout(Duration::from_secs(5), async {
+        while java_process_alive(java_pid).await {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .expect("Java host survived callback failure");
+    let log = fs::read_to_string(log_path).unwrap();
+    assert!(
+        log.contains("deliberate Java Disable failure"),
+        "failure callback was not attempted: {log}"
+    );
+    assert!(
+        log.contains("Hello Java plugin disabled"),
+        "another Java plugin did not receive Disable: {log}"
+    );
+    assert!(
+        log.contains("Hello Rust plugin disabled"),
+        "Rust cleanup was skipped: {log}"
+    );
+    assert!(
+        !status.success(),
+        "Java Disable failure was swallowed; process reported success: {log}"
+    );
+    assert!(
+        !log.contains("Stopped cleanly"),
+        "failed callback reported a clean shutdown"
+    );
+}
+
+async fn build_failing_java_plugin(root: &Path, directory: &Path) {
+    let fixture = directory.join("fixture-build");
+    let classes = fixture.join("classes");
+    fs::create_dir_all(&classes).unwrap();
+    let mut javac = tokio::process::Command::new("javac");
+    javac
+        .arg("--release")
+        .arg("25")
+        .arg("-encoding")
+        .arg("UTF-8")
+        .arg("-cp")
+        .arg(root.join("libraries/zerqon-java-api-0.0.1.jar"))
+        .arg("-d")
+        .arg(&classes)
+        .arg(root.join("tests/fixtures/java-plugin-shutdown/FailingDisablePlugin.java"))
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    javac.creation_flags(0x0800_0000);
+    let output = timeout(Duration::from_secs(30), javac.output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "javac fixture: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut java = tokio::process::Command::new("java");
+    java.args(["-XshowSettings:properties", "-version"])
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    java.creation_flags(0x0800_0000);
+    let output = timeout(Duration::from_secs(10), java.output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(output.status.success());
+    let properties = String::from_utf8_lossy(&output.stderr);
+    let java_home = properties
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("java.home = "))
+        .expect("java.home missing");
+    let manifest = fixture.join("MANIFEST.MF");
+    fs::write(
+        &manifest,
+        "Manifest-Version: 1.0\nZerqon-Plugin: FailingDisablePlugin\nZerqon-API: 1\n\n",
+    )
+    .unwrap();
+    let mut jar =
+        tokio::process::Command::new(Path::new(java_home).join("bin").join(if cfg!(windows) {
+            "jar.exe"
+        } else {
+            "jar"
+        }));
+    jar.arg("--create")
+        .arg("--file")
+        .arg(directory.join("plugins/java-plugins/fail-disable.jar"))
+        .arg("--manifest")
+        .arg(manifest)
+        .arg("-C")
+        .arg(classes)
+        .arg(".")
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    jar.creation_flags(0x0800_0000);
+    let output = timeout(Duration::from_secs(10), jar.output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "jar fixture: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+async fn java_child_pid(parent: u32) -> u32 {
+    #[cfg(windows)]
+    {
+        let script = format!(
+            "Get-CimInstance Win32_Process -Filter 'ParentProcessId = {parent}' | Where-Object {{ $_.Name -in @('java.exe','javaw.exe') }} | Select-Object -ExpandProperty ProcessId"
+        );
+        let mut command = tokio::process::Command::new("powershell.exe");
+        command
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .kill_on_drop(true)
+            .creation_flags(0x0800_0000);
+        let output = timeout(Duration::from_secs(8), command.output())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(output.status.success(), "cannot inspect Java child process");
+        let pids = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.trim().parse::<u32>().ok())
+            .collect::<Vec<_>>();
+        assert_eq!(pids.len(), 1, "expected one Java host child");
+        pids[0]
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mut pids = std::collections::BTreeSet::new();
+        for task in fs::read_dir(format!("/proc/{parent}/task")).unwrap() {
+            let children =
+                fs::read_to_string(task.unwrap().path().join("children")).unwrap_or_default();
+            for pid in children
+                .split_whitespace()
+                .filter_map(|pid| pid.parse::<u32>().ok())
+            {
+                if fs::read_to_string(format!("/proc/{pid}/comm"))
+                    .is_ok_and(|name| name.trim().starts_with("java"))
+                {
+                    pids.insert(pid);
+                }
+            }
+        }
+        assert_eq!(pids.len(), 1, "expected one Java host child");
+        *pids.first().unwrap()
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        let _ = parent;
+        panic!("process inspection test supports Windows and Linux")
+    }
+}
+
+async fn java_process_alive(pid: u32) -> bool {
+    #[cfg(windows)]
+    {
+        let mut command = tokio::process::Command::new("tasklist.exe");
+        command
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .kill_on_drop(true)
+            .creation_flags(0x0800_0000);
+        let output = timeout(Duration::from_secs(3), command.output())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\""))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Path::new(&format!("/proc/{pid}")).exists()
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+#[derive(Debug)]
+struct MobWire {
+    id: i32,
+    uuid: Uuid,
+    kind: i32,
+    position: [f64; 3],
+}
+fn mob_spawn(packet: &[u8]) -> Option<MobWire> {
+    if packet.first() != Some(&1) {
+        return None;
+    }
+    let mut body = &packet[1..];
+    let id = get_varint(&mut body).unwrap();
+    let uuid = Uuid::from_slice(take(&mut body, 16).unwrap()).unwrap();
+    let kind = get_varint(&mut body).unwrap();
+    if kind == 159 {
+        return None;
+    }
+    let position = std::array::from_fn(|_| {
+        f64::from_be_bytes(take(&mut body, 8).unwrap().try_into().unwrap())
+    });
+    Some(MobWire {
+        id,
+        uuid,
+        kind,
+        position,
+    })
+}
+fn packet_entity(packet: &[u8], packet_id: u8) -> Option<i32> {
+    if packet.first() != Some(&packet_id) {
+        return None;
+    }
+    Some(get_varint(&mut &packet[1..]).unwrap())
+}
+fn mob_health(packet: &[u8]) -> Option<(i32, f32)> {
+    if packet.first() != Some(&101) {
+        return None;
+    }
+    let mut body = &packet[1..];
+    let id = get_varint(&mut body).unwrap();
+    if take(&mut body, 1).unwrap() != [9] || get_varint(&mut body).unwrap() != 3 {
+        return None;
+    }
+    Some((
+        id,
+        f32::from_be_bytes(take(&mut body, 4).unwrap().try_into().unwrap()),
+    ))
+}

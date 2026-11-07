@@ -1,0 +1,5 @@
+Manifest-Version: 1.0
+Zerqon-Plugin: io.github.teighto.zerqon.example.HelloPlugin
+Zerqon-API: 1
+Implementation-Version: 0.0.1
+Implementation-Vendor: teighto

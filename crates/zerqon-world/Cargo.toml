@@ -1,0 +1,24 @@
+[package]
+name = "zerqon-world"
+description = "Compact chunks, bounded workers and durable world storage for Zerqon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+crc32fast = "1"
+thiserror.workspace = true
+tempfile = "3"
+fastnbt = "2.6.3"
+flate2 = "1"
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+proptest = "1"
+
+[lints]
+workspace = true

@@ -1,0 +1,24 @@
+[package]
+name = "zerqon-profiler"
+description = "Bounded native CPU sampling and spark-compatible export for Zerqon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+prost = "0.14"
+flate2 = "1"
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile = "3"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+perf-event = { package = "perf-event2", version = "0.7.4" }
+backtrace = "0.3"
+
+[lints]
+workspace = true
