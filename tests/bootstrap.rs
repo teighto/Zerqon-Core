@@ -264,6 +264,10 @@ mod tests {
 
     #[tokio::test]
     async fn report_generator_runs_with_utf8_stdout_stderr_and_unicode_output_path() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("bootstrap=debug")
+            .with_test_writer()
+            .try_init();
         let directory = tempfile::tempdir().unwrap();
         let java = java_runtime(Path::new("java")).await.unwrap();
         let bin = java.parent().unwrap();
