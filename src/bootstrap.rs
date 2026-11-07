@@ -426,6 +426,38 @@ async fn java_runtime(java: &Path) -> Result<PathBuf, BootstrapError> {
 }
 
 async fn generate_reports(java: &Path, jar: &Path, stage: &Path) -> Result<(), BootstrapError> {
+    let source_jar = jar.to_owned();
+    let output_stage = stage.to_owned();
+    let jar_argument = tokio::task::spawn_blocking(move || {
+        let parent = source_jar
+            .parent()
+            .ok_or_else(|| invalid("generator JAR has no parent"))?
+            .canonicalize()?;
+        let stage_parent = output_stage
+            .parent()
+            .ok_or_else(|| invalid("generator stage has no parent"))?
+            .canonicalize()?;
+        let name = source_jar
+            .file_name()
+            .ok_or_else(|| invalid("generator JAR has no file name"))?;
+        if parent == stage_parent && name.to_str().is_some_and(str::is_ascii) {
+            return Ok::<_, BootstrapError>(PathBuf::from("..").join(name));
+        }
+        let input = File::open(&source_jar)?;
+        if input.metadata()?.len() > SERVER_BYTES {
+            return Err(invalid("generator JAR exceeds its size limit"));
+        }
+        let mut copied = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(output_stage.join("generator-input.jar"))?;
+        if std::io::copy(&mut input.take(SERVER_BYTES + 1), &mut copied)? > SERVER_BYTES {
+            return Err(invalid("generator JAR grew beyond its size limit"));
+        }
+        copied.sync_all()?;
+        Ok(PathBuf::from("generator-input.jar"))
+    })
+    .await??;
     let mut child = tokio::process::Command::new(java)
         .args([
             "-Dfile.encoding=UTF-8",
@@ -436,10 +468,10 @@ async fn generate_reports(java: &Path, jar: &Path, stage: &Path) -> Result<(), B
             "-DbundlerMainClass=net.minecraft.data.Main",
             "-jar",
         ])
-        .arg(jar)
+        .arg(jar_argument)
         .arg("--reports")
         .arg("--output")
-        .arg(stage.join("generated"))
+        .arg("generated")
         .current_dir(stage)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

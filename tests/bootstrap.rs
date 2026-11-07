@@ -302,12 +302,16 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&packaged.stderr)
         );
-        let stage = directory.path().join("данные-Minecraft");
-        fs::create_dir(&stage).unwrap();
-        generate_reports(&java, &jar, &stage).await.unwrap();
-        assert_eq!(
-            fs::read_to_string(stage.join("generated/charset-result.txt")).unwrap(),
-            "Привет из генератора"
-        );
+        let unicode_jar = directory.path().join("генератор.jar");
+        fs::copy(&jar, &unicode_jar).unwrap();
+        for (index, jar) in [jar, unicode_jar].iter().enumerate() {
+            let stage = directory.path().join(format!("данные-Minecraft-{index}"));
+            fs::create_dir(&stage).unwrap();
+            generate_reports(&java, jar, &stage).await.unwrap();
+            assert_eq!(
+                fs::read_to_string(stage.join("generated/charset-result.txt")).unwrap(),
+                "Привет из генератора"
+            );
+        }
     }
 }
