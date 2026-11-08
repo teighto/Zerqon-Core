@@ -291,7 +291,11 @@ def fetch_server(destination: Path):
             os.fsync(target.fileno())
         if not verified_file(temporary, SERVER_SHA1):
             raise ValueError("Downloaded Minecraft server failed its pinned SHA-1 check")
-        os.replace(temporary, destination)
+        try:
+            os.replace(temporary, destination)
+        except PermissionError:
+            if not verified_file(destination, SERVER_SHA1):
+                raise
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)

@@ -225,6 +225,40 @@ class DataPreparationTests(unittest.TestCase):
             self.assertEqual(destination.read_bytes(), raw)
             self.assertEqual(list(destination.parent.iterdir()), [destination])
 
+    @unittest.skipUnless(os.name == "nt", "Windows denies replacement while another reader holds the file")
+    def test_download_reuses_only_a_verified_concurrent_publisher_with_an_open_file(self):
+        raw = b"verified fixture archive"
+        verified = prepare.verified_file
+        for published in [raw, b"unverified concurrent archive"]:
+            with self.subTest(published=published), tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as readers:
+                destination = Path(directory) / "server.jar"
+
+                def publish_before_replace(path, expected):
+                    result = verified(path, expected)
+                    if path != destination and result:
+                        destination.write_bytes(published)
+                        readers.enter_context(destination.open("rb"))
+                    return result
+
+                with patch.object(prepare, "SERVER_SHA1", hashlib.sha1(raw).hexdigest()), patch.object(prepare, "verified_file", side_effect=publish_before_replace), patch.object(prepare.urllib.request, "urlopen", return_value=io.BytesIO(raw)):
+                    if published == raw:
+                        prepare.fetch_server(destination)
+                    else:
+                        with self.assertRaises((PermissionError, ValueError)):
+                            prepare.fetch_server(destination)
+                self.assertEqual(destination.read_bytes(), published)
+                self.assertEqual(list(destination.parent.iterdir()), [destination])
+
+    def test_download_publication_failure_without_a_verified_winner_is_reported(self):
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "server.jar"
+            raw = b"verified fixture archive"
+            with patch.object(prepare, "SERVER_SHA1", hashlib.sha1(raw).hexdigest()), patch.object(prepare.urllib.request, "urlopen", return_value=io.BytesIO(raw)), patch.object(prepare.os, "replace", side_effect=PermissionError("publication denied")):
+                with self.assertRaisesRegex(PermissionError, "publication denied"):
+                    prepare.fetch_server(destination)
+            self.assertFalse(destination.exists())
+            self.assertEqual(list(destination.parent.iterdir()), [])
+
     @unittest.skipUnless(shutil.which("rustc"), "Rust compiler needed for native lock interoperability")
     def test_python_preparation_and_rust_file_lock_exclude_each_other(self):
         with tempfile.TemporaryDirectory() as directory:
