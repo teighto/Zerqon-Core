@@ -26,11 +26,11 @@ workers.shutdown()?;
 
 ## Storage
 
-`WorldStore::open` locks `world.lock` for its lifetime. Chunk files are `c.<x>.<z>.zqc`, in Zerqon's own versioned format, **not Minecraft Anvil**. The loader checks a 1 MiB file limit, format version, coordinates, payload length, CRC32, palette lengths and every packed palette index. Missing chunks return `None`; corruption returns an error. `save` refuses to replace an existing corrupt chunk.
+`WorldStore::open` locks `world.lock` for its lifetime. Current chunks live in `chunks.redb`; each payload uses Zerqon's palette format, coordinates and CRC32. The loader checks size limits, palette lengths and every packed palette index. Missing chunks return `None` in a native world and `MissingImportedChunk` in an imported world. Corruption returns an error.
 
-Saves write and synchronize a temporary file in the same directory, then atomically replace the destination. Unix additionally synchronizes the parent directory. This prevents readers from observing partial writes; it is not a substitute for backups or a guarantee against faulty storage hardware.
+`snapshot` and `commit` compare revisions and save the affected chunks with an operation receipt in one durable transaction. Opening an older store migrates its `.zqc` files into the database and preserves the originals. The import tool also writes `.zqc` files while preparing a new destination. See [world storage](../../docs/WORLD_STORAGE.md) for recovery and migration rules.
 
-World simulation owns update ordering. Concurrent saves of different snapshots are atomic individually but the last completed replacement wins; callers must serialize read-modify-save transactions for each chunk. The store checks structural integrity, not Minecraft registry semantics. Callers validate block state IDs against the active registry before sending or changing blocks.
+World simulation owns update ordering. Callers handle transaction conflicts and validate block state IDs against the active registry before sending or changing blocks.
 
 ## Checks
 
@@ -42,8 +42,38 @@ cargo run -p zerqon-world --release --locked --example world_bench -- 10000 4
 
 The benchmark measures synthetic flat generation, decoding and allocated section payload sizes. It does not measure gameplay, network throughput or RSS. Compare runs using the same machine and load.
 
+## Ordinary terrain block loading
+
+Create a separate vanilla fixture with a fixed seed:
+
+```sh
+python scripts/generate-test-world.py --server-jar .cache/vanilla/26.3/server.jar \
+  --directory .local/ordinary-vanilla --terrain normal --seed 20261108 --accept-eula
+```
+
+Import its `world/` into a new `.local/ordinary-import` server directory using the [block import instructions](../../docs/WORLD_IMPORT.md). The commands below select 256 completed chunks and prepare that dedicated store before timing. Linux release builds require the musl toolchain described in the [configuration guide](../../docs/CONFIGURATION.md).
+
+```sh
+python scripts/prepare-world-benchmark.py --world .local/ordinary-import/world \
+  --rectangle 0 0 15 15 --output .local/ordinary-selection.json
+cargo build -p zerqon-world --example ordinary_load_bench --release --locked \
+  --target x86_64-unknown-linux-musl
+target/x86_64-unknown-linux-musl/release/examples/ordinary_load_bench \
+  --prepare-store .local/ordinary-import/world .local/ordinary-selection.json
+python scripts/benchmark-world-load.py \
+  --binary target/x86_64-unknown-linux-musl/release/examples/ordinary_load_bench \
+  --world .local/ordinary-import/world --selection .local/ordinary-selection.json \
+  --settings .local/ordinary-import/server.settings --output .local/ordinary-results
+```
+
+The Linux driver starts a fresh process for each run with 1, 4 and the configured number of world workers. It measures storage reads and block decoding after an untimed warmup. Database setup, full chunk hash checks and shutdown are outside that timer. Process CPU and peak RSS are recorded separately, including setup and shutdown. The OS page cache is not flushed.
+
+This workload excludes terrain generation, pregeneration, biome and light processing, entities and network delivery. The selected chunk bodies are checked before and after every run. Output files retain each result, the median and the full observed range; an existing output directory is refused.
+
 ## По-русски
 
 Секции хранят блоки компактно; ID берутся из реестра вызывающей стороны. Генератор создаёт плоский тестовый мир с поверхностью Y=63. Рабочие потоки и очередь имеют явные пределы; при заполнении очереди вызывающий код получает ошибку и должен ограничить поступление задач. Кэш возвращает вытесненные чанки для сохранения изменений.
 
-Формат `.zqc` собственный, несовместим с Anvil. Хранилище блокирует одновременное открытие несколькими процессами, проверяет CRC и структуру файлов, атомарно заменяет исправные чанки и отказывается затирать повреждённые. Тесты проверяют запись, повторное открытие, повреждения, уплотнённые палитры и работу потоков. Полноценная генерация Minecraft, сущности и игровая симуляция находятся вне этого модуля.
+Текущие чанки хранятся в `chunks.redb`. Транзакция сохраняет изменения чанков вместе с результатом операции и проверяет версии прочитанных данных. При переносе старого хранилища исходные `.zqc` сохраняются. Хранилище проверяет CRC и структуру данных и блокирует одновременное открытие мира несколькими процессами. Правила переноса описаны в [документации хранилища](../../docs/WORLD_STORAGE.md).
+
+Для замеров обычного рельефа используйте команды выше: отдельный мир vanilla с заданным seed, импорт блоков, фиксированный набор чанков и подготовка базы. Драйвер Linux повторяет чтение и декодирование с 1, 4 и заданным в конфиге числом потоков. Перед каждым прогоном он прогревает выбранные данные, а до и после сверяет хеши чанков. CPU и пиковая память процесса учитываются отдельно. Кеш ОС принудительно не очищается. Генерация, предгенерация, освещение, биомы, сущности и отправка по сети в этот замер не входят.
