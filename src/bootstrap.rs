@@ -1,7 +1,7 @@
 use crate::cache_lock::TrackedCacheLock;
 use crate::lifecycle::{Lifecycle, StopToken, Stopped};
 use crate::managed_tasks::{self as tasks, OperationError, TaskError};
-use aws_lc_rs::digest::{Context, SHA1_FOR_LEGACY_USE_ONLY};
+use aws_lc_rs::digest::{Context, SHA1_FOR_LEGACY_USE_ONLY, SHA256, digest};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, HashSet},
@@ -54,6 +54,8 @@ const REGISTRIES: &[&str] = &[
     "worldgen/block_state_provider",
 ];
 const REPORTS: &[&str] = &["packets.json", "registries.json", "blocks.json"];
+const MAX_RECIPES: usize = 4096;
+const MAX_RECIPE_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum BootstrapError {
@@ -94,18 +96,23 @@ pub struct PreparedData {
 }
 pub struct Bootstrap;
 impl Bootstrap {
-    pub async fn is_prepared_with_lifecycle(
+    pub async fn needs_java_with_lifecycle(
         directory: &Path,
         lifecycle: &Lifecycle,
         stop: &StopToken,
     ) -> Result<bool, BootstrapError> {
         let directory = directory.to_owned();
-        tasks::blocking(lifecycle, stop, "check Minecraft data cache", move |stop| {
-            stop.check()?;
-            let ready = cache_ready(&directory)?;
-            stop.check()?;
-            Ok::<_, BootstrapError>(ready)
-        })
+        tasks::blocking(
+            lifecycle,
+            stop,
+            "check reusable Minecraft reports",
+            move |stop| {
+                stop.check()?;
+                let ready = base_cache_ready(&directory)?;
+                stop.check()?;
+                Ok::<_, BootstrapError>(!ready)
+            },
+        )
         .await?
     }
 
@@ -189,15 +196,28 @@ impl Bootstrap {
                 reused: true,
             });
         }
-        tracing::info!("Preparing Minecraft 26.3 registries and protocol reports");
-        let java = java_runtime_tracked(java, lifecycle, stop).await?;
         let stage = std::sync::Arc::new(
             tempfile::Builder::new()
                 .prefix("prepare-")
                 .tempdir_in(&directory)?,
         );
-        generate_reports_tracked(&java, &jar, std::sync::Arc::clone(&stage), lifecycle, stop)
-            .await?;
+        let cached = directory.clone();
+        let reused_reports = preparation_task_tracked(
+            std::sync::Arc::clone(&stage),
+            std::sync::Arc::clone(&lock),
+            move |stage| stage_cached_reports(&cached, stage),
+            lifecycle,
+            stop,
+        )
+        .await?;
+        if reused_reports {
+            tracing::info!("Rebuilding Minecraft 26.3 data assets using verified cached reports");
+        } else {
+            tracing::info!("Preparing Minecraft 26.3 registries and protocol reports");
+            let java = java_runtime_tracked(java, lifecycle, stop).await?;
+            generate_reports_tracked(&java, &jar, std::sync::Arc::clone(&stage), lifecycle, stop)
+                .await?;
+        }
         let jar_path = jar.clone();
         let prepared = preparation_task_tracked(
             std::sync::Arc::clone(&stage),
@@ -377,7 +397,7 @@ async fn download_tracked(
     Ok(())
 }
 
-fn read_json(path: &Path, limit: u64) -> Result<Value, BootstrapError> {
+pub(crate) fn read_json(path: &Path, limit: u64) -> Result<Value, BootstrapError> {
     reject_cache_links(path)?;
     if !fs::symlink_metadata(path)?.is_file() {
         return Err(invalid("JSON path must be a regular file"));
@@ -398,6 +418,19 @@ fn read_json(path: &Path, limit: u64) -> Result<Value, BootstrapError> {
 }
 
 fn cache_ready(directory: &Path) -> Result<bool, BootstrapError> {
+    if !base_cache_ready(directory)? {
+        return Ok(false);
+    }
+    let identity = read_json(&directory.join("prepared.json"), 65536)?;
+    let (recipes, checksum) = match recipe_identity(&directory.join("data")) {
+        Ok(identity) => identity,
+        Err(_) => return Ok(false),
+    };
+    Ok(identity["recipes"].as_u64() == Some(recipes as u64)
+        && identity["recipes_sha256"].as_str() == Some(checksum.as_str()))
+}
+
+fn base_cache_ready(directory: &Path) -> Result<bool, BootstrapError> {
     reject_cache_links(&directory.join("prepared.json"))?;
     if !directory.join("prepared.json").is_file() {
         return Ok(false);
@@ -559,6 +592,202 @@ fn cache_ready(directory: &Path) -> Result<bool, BootstrapError> {
         }
     }
     Ok(identity["tags"].as_u64() == Some(count as u64))
+}
+
+fn stage_cached_reports(directory: &Path, stage: &Path) -> Result<bool, BootstrapError> {
+    if !base_cache_ready(directory)? {
+        return Ok(false);
+    }
+    let paths = REPORTS
+        .iter()
+        .map(|report| PathBuf::from("generated/reports").join(report))
+        .chain(item_report_paths(directory)?);
+    for path in paths {
+        let source = directory.join(&path);
+        reject_cache_links(&source)?;
+        let destination = stage.join(path);
+        checked_cache_directory(
+            destination
+                .parent()
+                .ok_or_else(|| invalid("missing report parent"))?,
+        )?;
+        atomic_copy(&source, &destination)?;
+    }
+    Ok(true)
+}
+
+fn validate_recipe(path: &str, value: &Value) -> Result<(), BootstrapError> {
+    let parts = safe_archive_path(path)?;
+    if parts.len() < 3
+        || parts[1] != "recipe"
+        || !path.ends_with(".json")
+        || path.len() > 256
+        || !parts[0].bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"_.-".contains(&byte)
+        })
+        || !parts[2..].join("/").bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"/_.-".contains(&byte)
+        })
+    {
+        return Err(invalid("invalid recipe path"));
+    }
+    let kind = value["type"].as_str().and_then(|kind| kind.split_once(':'));
+    if kind.is_none_or(|(namespace, name)| {
+        namespace.is_empty()
+            || name.is_empty()
+            || !namespace.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"_.-".contains(&byte)
+            })
+            || !name.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"/_.-".contains(&byte)
+            })
+    }) {
+        return Err(invalid("invalid recipe JSON type"));
+    }
+    Ok(())
+}
+
+fn recipe_paths(data: &Path) -> Result<Vec<(String, PathBuf)>, BootstrapError> {
+    fn collect(
+        root: &Path,
+        paths: &mut Vec<PathBuf>,
+        directories: &mut usize,
+        depth: usize,
+    ) -> Result<(), BootstrapError> {
+        reject_cache_links(root)?;
+        *directories += 1;
+        if *directories > MAX_RECIPES || depth > 64 {
+            return Err(invalid("too many or deeply nested recipe directories"));
+        }
+        for entry in fs::read_dir(root)? {
+            let entry = entry?;
+            let metadata = fs::symlink_metadata(entry.path())?;
+            if is_cache_link(&metadata) {
+                return Err(invalid("recipe path is a link or reparse point"));
+            }
+            if metadata.is_dir() {
+                collect(&entry.path(), paths, directories, depth + 1)?;
+            } else if metadata.is_file() {
+                paths.push(entry.path());
+                if paths.len() > MAX_RECIPES {
+                    return Err(invalid("too many recipes"));
+                }
+            } else {
+                return Err(invalid("recipe must be a regular file"));
+            }
+        }
+        Ok(())
+    }
+    reject_cache_links(data)?;
+    let mut paths = Vec::new();
+    let mut directories = 0;
+    for (index, namespace) in fs::read_dir(data)?.enumerate() {
+        if index >= MAX_RECIPES {
+            return Err(invalid("too many data namespaces"));
+        }
+        let namespace = namespace?;
+        reject_cache_links(&namespace.path())?;
+        if namespace.file_type()?.is_dir() {
+            let root = namespace.path().join("recipe");
+            reject_cache_links(&root)?;
+            if root.exists() {
+                collect(&root, &mut paths, &mut directories, 0)?;
+            }
+        }
+    }
+    let mut relative_paths = paths
+        .into_iter()
+        .map(|path| {
+            let relative = path
+                .strip_prefix(data)
+                .map_err(|_| invalid("recipe outside data directory"))?;
+            let relative = relative
+                .to_str()
+                .ok_or_else(|| invalid("recipe path is not UTF-8"))?
+                .replace('\\', "/");
+            Ok((relative, path))
+        })
+        .collect::<Result<Vec<_>, BootstrapError>>()?;
+    relative_paths.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(relative_paths)
+}
+
+fn recipe_identity(data: &Path) -> Result<(usize, String), BootstrapError> {
+    read_recipe_files(data, |_, _| Ok(()))
+}
+
+fn read_recipe_files(
+    data: &Path,
+    mut accept: impl FnMut(&str, Value) -> Result<(), BootstrapError>,
+) -> Result<(usize, String), BootstrapError> {
+    let relative_paths = recipe_paths(data)?;
+    if relative_paths.is_empty() {
+        return Err(invalid("no recipes in prepared data"));
+    }
+    let mut total = 0;
+    let mut checksum = Context::new(&SHA256);
+    for (relative, path) in &relative_paths {
+        let mut file = File::open(path)?;
+        let size = file.metadata()?.len();
+        if size > 1024 * 1024 {
+            return Err(invalid("recipe data exceeds its size limit"));
+        }
+        let mut bytes = Vec::new();
+        Read::by_ref(&mut file)
+            .take(1024 * 1024 + 1)
+            .read_to_end(&mut bytes)?;
+        total += bytes.len() as u64;
+        if bytes.len() > 1024 * 1024 || total > MAX_RECIPE_BYTES {
+            return Err(invalid("recipe grew beyond its size limit"));
+        }
+        let value = serde_json::from_slice(&bytes)?;
+        validate_recipe(relative, &value)?;
+        // NUL-terminated path plus fixed-width SHA-256 makes the sorted stream unambiguous.
+        checksum.update(relative.as_bytes());
+        checksum.update(&[0]);
+        checksum.update(digest(&SHA256, &bytes).as_ref());
+        accept(relative, value)?;
+    }
+    Ok((relative_paths.len(), hex(checksum.finish().as_ref())))
+}
+
+pub(crate) fn load_prepared_recipes(
+    directory: &Path,
+) -> Result<BTreeMap<String, Value>, BootstrapError> {
+    let identity = read_json(&directory.join("prepared.json"), 65536)?;
+    if identity["version"] != VERSION
+        || identity["protocol"] != PROTOCOL
+        || identity["world_version"] != 5023
+        || identity["java_major"] != 25
+        || identity["server_sha1"] != SERVER_SHA1
+    {
+        return Err(invalid(
+            "crafting cache identity differs from Minecraft 26.3",
+        ));
+    }
+    let mut recipes = BTreeMap::new();
+    let (count, checksum) = read_recipe_files(&directory.join("data"), |path, value| {
+        let (namespace, name) = path
+            .split_once('/')
+            .ok_or_else(|| invalid("invalid recipe namespace"))?;
+        let name = name
+            .strip_prefix("recipe/")
+            .and_then(|name| name.strip_suffix(".json"))
+            .ok_or_else(|| invalid("invalid recipe resource path"))?;
+        if recipes
+            .insert(format!("{namespace}:{name}"), value)
+            .is_some()
+        {
+            return Err(invalid("duplicate recipe identifier"));
+        }
+        Ok(())
+    })?;
+    if identity["recipes"].as_u64() != Some(count as u64)
+        || identity["recipes_sha256"].as_str() != Some(checksum.as_str())
+    {
+        return Err(invalid("recipe contents differ from the prepared manifest"));
+    }
+    Ok(recipes)
 }
 
 fn item_report_paths(directory: &Path) -> Result<Vec<PathBuf>, BootstrapError> {
@@ -891,6 +1120,8 @@ fn prepare_payloads(jar: &Path, stage: &Path) -> Result<Value, BootstrapError> {
     }
     let mut data = BTreeMap::new();
     let mut total = 0u64;
+    let mut recipes = 0;
+    let mut recipe_bytes = 0;
     for index in 0..inner.len() {
         let mut file = inner.by_index(index)?;
         let name = file.name()?.into_owned();
@@ -900,6 +1131,7 @@ fn prepare_payloads(jar: &Path, stage: &Path) -> Result<Value, BootstrapError> {
         }
         let relative = parts[2..].join("/");
         if !relative.starts_with("tags/")
+            && !relative.starts_with("recipe/")
             && !REGISTRIES
                 .iter()
                 .any(|registry| relative.starts_with(&format!("{registry}/")))
@@ -909,10 +1141,6 @@ fn prepare_payloads(jar: &Path, stage: &Path) -> Result<Value, BootstrapError> {
         if file.size() > 1024 * 1024 {
             return Err(invalid("registry JSON exceeds1MiB"));
         }
-        total += file.size();
-        if total > 64 * 1024 * 1024 {
-            return Err(invalid("registry JSON total exceeds64MiB"));
-        }
         let mut bytes = Vec::new();
         Read::by_ref(&mut file)
             .take(1024 * 1024 + 1)
@@ -920,8 +1148,20 @@ fn prepare_payloads(jar: &Path, stage: &Path) -> Result<Value, BootstrapError> {
         if bytes.len() > 1024 * 1024 {
             return Err(invalid("inflated registry JSON exceeds1MiB"));
         }
+        total += bytes.len() as u64;
+        if total > 64 * 1024 * 1024 {
+            return Err(invalid("registry JSON total exceeds64MiB"));
+        }
         let value: Value = serde_json::from_slice(&bytes)?;
         let key = parts[1..].join("/");
+        if relative.starts_with("recipe/") {
+            recipes += 1;
+            recipe_bytes += bytes.len() as u64;
+            if recipes > MAX_RECIPES || recipe_bytes > MAX_RECIPE_BYTES {
+                return Err(invalid("recipe assets exceed their count or size limit"));
+            }
+            validate_recipe(&key, &value)?;
+        }
         if data.insert(key.clone(), value).is_some() {
             return Err(invalid("duplicate registry ZIP entry"));
         }
@@ -949,7 +1189,8 @@ fn prepare_payloads(jar: &Path, stage: &Path) -> Result<Value, BootstrapError> {
         stage.join("tags-sync.json"),
         serde_json::to_vec(&json!({"registries":tags}))?,
     )?;
-    let prepared = json!({"version":VERSION,"protocol":PROTOCOL,"server_sha1":SERVER_SHA1,"world_version":5023,"java_major":25,"registries":registries.len(),"entries":registries.iter().map(|registry|registry["entries"].as_array().map_or(0,Vec::len)).sum::<usize>(),"tag_registries":tags.len(),"tags":tags.iter().map(|registry|registry["tags"].as_array().map_or(0,Vec::len)).sum::<usize>()});
+    let (recipes, recipes_sha256) = recipe_identity(&stage.join("data"))?;
+    let prepared = json!({"version":VERSION,"protocol":PROTOCOL,"server_sha1":SERVER_SHA1,"world_version":5023,"java_major":25,"registries":registries.len(),"entries":registries.iter().map(|registry|registry["entries"].as_array().map_or(0,Vec::len)).sum::<usize>(),"tag_registries":tags.len(),"tags":tags.iter().map(|registry|registry["tags"].as_array().map_or(0,Vec::len)).sum::<usize>(),"recipes":recipes,"recipes_sha256":recipes_sha256});
     fs::write(
         stage.join("prepared.json"),
         serde_json::to_vec_pretty(&prepared)?,
@@ -1166,6 +1407,19 @@ fn install_prepared(
         Ok(())
     }
     preflight(&stage.join("data"), &destination.join("data"))?;
+    if destination.join("data").exists() {
+        let expected: HashSet<_> = recipe_paths(&stage.join("data"))?
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        for (name, _) in recipe_paths(&destination.join("data"))? {
+            if !expected.contains(&name) {
+                return Err(invalid(
+                    "unexpected cached recipe; preserve/remove it before retrying",
+                ));
+            }
+        }
+    }
     for path in [
         "generated/reports",
         "registries-sync.json",

@@ -1,9 +1,11 @@
 mod catalog;
+mod crafting;
 mod inventory;
 mod types;
 mod wire;
 
 pub use catalog::{ComponentDef, ItemCatalog, ItemDef};
+pub use crafting::*;
 pub use inventory::*;
 pub use types::*;
 pub use wire::*;

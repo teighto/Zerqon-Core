@@ -944,7 +944,10 @@ async fn play(
         }
         if !from_deferred
             && (ordered_work_pending || !deferred.is_empty())
-            && matches!(id, 1 | 7 | 8 | 18 | 30 | 31 | 32 | 33 | 41 | 54 | 57 | 66)
+            && matches!(
+                id,
+                1 | 7 | 8 | 18 | 19 | 30 | 31 | 32 | 33 | 41 | 54 | 57 | 66
+            )
         {
             if is_command {
                 zerqon_protocol::decode_command(view, id == 8)?;
@@ -962,7 +965,7 @@ async fn play(
         }
         let can_interact = play.teleport_confirmed && sequence > play.last_ack_sequence;
         match id {
-            18 | 54 | 57 => {
+            18 | 19 | 54 | 57 => {
                 play.inventory_count += 1;
                 if play.inventory_count > 64 {
                     if play.inventory_count == 65 {

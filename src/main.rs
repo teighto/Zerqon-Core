@@ -4,6 +4,7 @@ mod cache_lock;
 mod client_policy;
 mod config;
 mod connection;
+mod crafting_data;
 mod entity_packets;
 mod game_data;
 mod java_launch;
@@ -184,7 +185,7 @@ async fn run_program(
                 Ok(false)
             })
             .await??;
-        if !bootstrap::Bootstrap::is_prepared_with_lifecycle(&data_directory, lifecycle, &stop)
+        if bootstrap::Bootstrap::needs_java_with_lifecycle(&data_directory, lifecycle, &stop)
             .await?
             || (settings.java_plugins && java_plugins_present)
         {

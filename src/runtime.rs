@@ -526,6 +526,18 @@ impl State {
         } else {
             None
         };
+        let crafting = if let Some(catalog) = &items {
+            let path = directory.join(&settings.data_directory);
+            let catalog = Arc::clone(catalog);
+            Some(Arc::new(
+                startup_work(lifecycle, stop, "load crafting data", move || {
+                    Ok(crate::crafting_data::CraftingData::load(&path, &catalog)?)
+                })
+                .await?,
+            ))
+        } else {
+            None
+        };
         stop.check()?;
         let operator_path = directory.join("ops.json");
         let operators = startup_work(lifecycle, stop, "load operators", move || {
@@ -581,18 +593,20 @@ impl State {
                 .await?,
             ))
         };
-        let inventories = items
-            .as_ref()
-            .map(|catalog| {
-                InventoryService::new(
-                    directory.join(&properties.level_name).join("playerdata"),
-                    Arc::clone(catalog),
-                    Arc::clone(&players),
-                    properties.max_players,
-                    Arc::clone(&gameplay),
-                )
-            })
-            .transpose()?;
+        let inventories = if let Some(catalog) = &items {
+            let crafting = crafting.as_ref().ok_or("crafting data unavailable")?;
+            Some(InventoryService::new(
+                directory.join(&properties.level_name).join("playerdata"),
+                Arc::clone(catalog),
+                Arc::clone(&players),
+                properties.max_players,
+                Arc::clone(&gameplay),
+                lifecycle.clone(),
+                Arc::clone(crafting),
+            )?)
+        } else {
+            None
+        };
         let mobs = match (&world, &data, &blocks) {
             (Some(world), Some(data), Some(blocks)) => Some(
                 Mobs::open(

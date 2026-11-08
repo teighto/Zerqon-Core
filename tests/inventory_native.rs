@@ -14,6 +14,7 @@ use zerqon_protocol::codec::{
 struct Server {
     child: Child,
     address: String,
+    lines: std::sync::mpsc::Receiver<String>,
 }
 impl Drop for Server {
     fn drop(&mut self) {
@@ -57,11 +58,13 @@ impl Server {
             .unwrap();
         let stdout = child.stdout.take().unwrap();
         let (send, receive) = std::sync::mpsc::channel();
+        let (line_sender, lines) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
                 if let Some((_, address)) = line.split_once("Listening on ") {
                     let _ = send.send(address.trim().to_owned());
                 }
+                let _ = line_sender.send(line);
             }
         });
         let address = match receive.recv_timeout(Duration::from_secs(20)) {
@@ -72,7 +75,11 @@ impl Server {
                 panic!("server startup failed: {error}");
             }
         };
-        Self { child, address }
+        Self {
+            child,
+            address,
+            lines,
+        }
     }
     fn command(&mut self, command: &str) {
         writeln!(self.child.stdin.as_mut().unwrap(), "{command}").unwrap();
@@ -90,6 +97,21 @@ impl Server {
         .await
         .unwrap();
         assert!(status.success());
+    }
+
+    async fn player_left(&self, name: &str) {
+        timeout(Duration::from_secs(10), async {
+            loop {
+                while let Ok(line) = self.lines.try_recv() {
+                    if line.contains("Player left") && line.contains(name) {
+                        return;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("owned server did not finish the disconnected player session");
     }
 }
 
@@ -342,6 +364,47 @@ impl Client {
             }
         }
     }
+
+    async fn creative_stack(&mut self, slot: i16, stack: Option<Stack>) -> Snapshot {
+        let mut body = slot.to_be_bytes().to_vec();
+        if let Some(stack) = stack {
+            assert!(stack.name.is_none(), "crafting fixture uses default stacks");
+            put_varint(stack.count, &mut body);
+            put_varint(stack.item, &mut body);
+            body.extend_from_slice(&[0, 0]);
+        } else {
+            body.push(0);
+        }
+        self.send(57, &body).await;
+        self.sync().await
+    }
+
+    async fn crafting_click(
+        &mut self,
+        slot: i16,
+        button: u8,
+        mode: i32,
+        state: i32,
+        forged: bool,
+    ) -> Snapshot {
+        self.send(18, &crafting_click_body(slot, button, mode, state, forged))
+            .await;
+        self.sync().await
+    }
+
+    async fn ordered_snapshot(&mut self) -> Snapshot {
+        // Zerqon awaits each inventory mutation and writes its entire snapshot
+        // before dispatching the later command. Commands also use the ordered
+        // deferred lane; this is a Zerqon fence, not a vanilla command barrier.
+        self.command("tps").await;
+        self.chat_containing("TPS").await;
+        self.snapshot.clone()
+    }
+
+    async fn close_crafting(&mut self) -> Snapshot {
+        self.send(19, &[0]).await;
+        self.ordered_snapshot().await
+    }
 }
 
 fn stone(count: i32) -> Option<Stack> {
@@ -350,6 +413,90 @@ fn stone(count: i32) -> Option<Stack> {
         count,
         name: None,
     })
+}
+
+// IDs independently exported from the pinned original 26.3 item registry in
+// tools/crafting-menu-oracle/oracle.json (protocol 777).
+const OAK_LOG: i32 = 163;
+const OAK_PLANKS: i32 = 63;
+const HONEY_BOTTLE: i32 = 1533;
+const HONEY_BLOCK: i32 = 832;
+const GLASS_BOTTLE: i32 = 1270;
+
+fn item_stack(item: i32, count: i32) -> Option<Stack> {
+    Some(Stack {
+        item,
+        count,
+        name: None,
+    })
+}
+
+fn crafting_click_body(slot: i16, button: u8, mode: i32, state: i32, forged: bool) -> Vec<u8> {
+    let mut body = Vec::new();
+    put_varint(0, &mut body);
+    put_varint(state, &mut body);
+    body.extend_from_slice(&slot.to_be_bytes());
+    body.push(button);
+    put_varint(mode, &mut body);
+    if forged {
+        // Well-formed but fabricated result-slot and cursor predictions. The
+        // server must execute the click using its real inputs and output.
+        body.push(1);
+        body.extend_from_slice(&0_i16.to_be_bytes());
+        body.extend_from_slice(&[1, 1, 64, 0, 0]);
+        body.extend_from_slice(&[1, 1, 64, 0, 0]);
+    } else {
+        body.extend_from_slice(&[0, 0]);
+    }
+    body
+}
+
+fn real_count(snapshot: &Snapshot, item: i32) -> i32 {
+    snapshot
+        .slots
+        .iter()
+        .skip(1) // The derived result is not owned item value.
+        .chain(std::iter::once(&snapshot.cursor))
+        .flatten()
+        .filter(|stack| stack.item == item)
+        .map(|stack| stack.count)
+        .sum()
+}
+
+fn assert_same_inventory(actual: &Snapshot, expected: &Snapshot) {
+    assert_eq!(
+        actual.slots, expected.slots,
+        "real or preview slots changed"
+    );
+    assert_eq!(actual.cursor, expected.cursor, "cursor changed");
+    assert_eq!(actual.selected, expected.selected, "selection changed");
+    assert_eq!(
+        actual.state, expected.state,
+        "rejected mutation changed state ID"
+    );
+}
+
+fn saved_inventory(directory: &Path, uuid: Uuid) -> serde_json::Value {
+    let bytes = std::fs::read(
+        directory
+            .join("world/playerdata")
+            .join(format!("{uuid}.zinv")),
+    )
+    .unwrap();
+    assert!((44..=2 * 1024 * 1024).contains(&bytes.len()));
+    assert_eq!(&bytes[..8], b"ZINV\0\0\0\x01");
+    assert_eq!(
+        u32::from_be_bytes(bytes[8..12].try_into().unwrap()) as usize,
+        bytes.len() - 44
+    );
+    let value: serde_json::Value = serde_json::from_slice(&bytes[44..]).unwrap();
+    assert_eq!(value["schema"], 2);
+    assert_eq!(value["slots"].as_array().unwrap().len(), 46);
+    assert!(
+        value["slots"][0].is_null(),
+        "derived result was persisted as item value"
+    );
+    value
 }
 
 #[tokio::test]
@@ -527,4 +674,269 @@ async fn inventory_rate_limit_keeps_connection_alive_and_give_requires_level_two
         drop(client);
         server.stop().await;
     }
+}
+
+#[tokio::test]
+#[ignore = "requires prepared official Minecraft26.3 crafting data"]
+async fn native_crafting_result_shift_predictions_and_stale_revisions() {
+    timeout(Duration::from_secs(60), async {
+        let directory = tempfile::tempdir().unwrap();
+        let mut server = Server::start(directory.path());
+        let mut client = Client::join(&server.address, "CraftClicks").await;
+        let seeded = client.creative_stack(1, item_stack(OAK_LOG, 3)).await;
+        assert_eq!(seeded.slots[0], item_stack(OAK_PLANKS, 4));
+        assert_eq!(real_count(&seeded, OAK_PLANKS), 0);
+        let denied = client.creative_stack(0, stone(64)).await;
+        assert_same_inventory(&denied, &seeded);
+
+        let stale = seeded.state;
+        let first = client.crafting_click(0, 0, 0, stale, true).await;
+        assert_eq!(first.cursor, item_stack(OAK_PLANKS, 4));
+        assert_eq!(first.slots[1], item_stack(OAK_LOG, 2));
+        assert_eq!(
+            real_count(&first, 1),
+            0,
+            "forged stone prediction became item value"
+        );
+        let second = client.crafting_click(0, 1, 0, stale, false).await;
+        assert_eq!(second.cursor, item_stack(OAK_PLANKS, 8));
+        assert_eq!(second.slots[1], item_stack(OAK_LOG, 1));
+        let third = client.crafting_click(0, 0, 0, stale, false).await;
+        assert_eq!(third.cursor, item_stack(OAK_PLANKS, 12));
+        assert!(third.slots[..5].iter().all(Option::is_none));
+        let exhausted = client.crafting_click(0, 0, 0, stale, true).await;
+        assert_eq!(exhausted.cursor, item_stack(OAK_PLANKS, 12));
+        assert_eq!(real_count(&exhausted, OAK_PLANKS), 12);
+        assert_eq!(real_count(&exhausted, 1), 0);
+
+        let seeded = client.creative_stack(1, item_stack(OAK_LOG, 2)).await;
+        let shifted = client.crafting_click(0, 0, 1, seeded.state, false).await;
+        assert!(shifted.slots[..5].iter().all(Option::is_none));
+        assert_eq!(shifted.slots[44], item_stack(OAK_PLANKS, 8));
+        assert_eq!(shifted.cursor, item_stack(OAK_PLANKS, 12));
+        assert_eq!(real_count(&shifted, OAK_PLANKS), 20);
+        saved_inventory(directory.path(), client.uuid);
+        drop(client);
+        server.stop().await;
+    })
+    .await
+    .expect("native crafting click scenario timed out");
+}
+
+#[tokio::test]
+#[ignore = "requires prepared official Minecraft26.3 crafting data"]
+async fn native_crafting_honey_remainders_return_to_inputs_and_inventory() {
+    timeout(Duration::from_secs(60), async {
+        let directory = tempfile::tempdir().unwrap();
+        let mut server = Server::start(directory.path());
+        let mut client = Client::join(&server.address, "CraftHoney").await;
+        for slot in 1..=4 {
+            client
+                .creative_stack(slot, item_stack(HONEY_BOTTLE, 2))
+                .await;
+        }
+        assert_eq!(client.snapshot.slots[0], item_stack(HONEY_BLOCK, 1));
+        let first = client
+            .crafting_click(0, 1, 0, client.snapshot.state, false)
+            .await;
+        assert_eq!(first.cursor, item_stack(HONEY_BLOCK, 1));
+        assert!(
+            first.slots[1..5]
+                .iter()
+                .all(|slot| *slot == item_stack(HONEY_BOTTLE, 1))
+        );
+        assert_eq!(first.slots[36], item_stack(GLASS_BOTTLE, 4));
+        let second = client.crafting_click(0, 0, 0, first.state, false).await;
+        assert!(second.slots[0].is_none());
+        assert_eq!(second.cursor, item_stack(HONEY_BLOCK, 2));
+        assert!(
+            second.slots[1..5]
+                .iter()
+                .all(|slot| *slot == item_stack(GLASS_BOTTLE, 1))
+        );
+        assert_eq!(real_count(&second, HONEY_BOTTLE), 0);
+        assert_eq!(real_count(&second, HONEY_BLOCK), 2);
+        assert_eq!(real_count(&second, GLASS_BOTTLE), 8);
+        saved_inventory(directory.path(), client.uuid);
+        drop(client);
+        server.stop().await;
+    })
+    .await
+    .expect("native honey remainder scenario timed out");
+}
+
+#[tokio::test]
+#[ignore = "requires prepared official Minecraft26.3 crafting data"]
+async fn native_crafting_no_drop_rollback_and_preview_recovery_after_restart() {
+    timeout(Duration::from_secs(90), async {
+        let directory = tempfile::tempdir().unwrap();
+        let mut server = Server::start(directory.path());
+        let mut client = Client::join(&server.address, "CraftFull").await;
+        for slot in 9..=44 {
+            if slot == 33 {
+                // Respect the service's independent 32 durable mutations/second
+                // budget; this delay is not used as an operation-completion fence.
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            let seeded = client.creative_stack(slot, stone(64)).await;
+            assert_eq!(
+                seeded.slots[slot as usize],
+                stone(64),
+                "setup write was rejected"
+            );
+        }
+        client.creative_stack(44, item_stack(OAK_PLANKS, 62)).await;
+        let before = client.creative_stack(1, item_stack(OAK_LOG, 1)).await;
+        assert_eq!(before.slots[0], item_stack(OAK_PLANKS, 4));
+        assert_eq!(real_count(&before, 1), 2240);
+        assert_eq!(real_count(&before, OAK_PLANKS), 62);
+        assert_eq!(real_count(&before, OAK_LOG), 1);
+        let uuid = client.uuid;
+        let path = directory
+            .path()
+            .join("world/playerdata")
+            .join(format!("{uuid}.zinv"));
+        let saved_before = std::fs::read(&path).unwrap();
+        saved_inventory(directory.path(), uuid);
+        let rejected = client.crafting_click(0, 0, 1, before.state, false).await;
+        assert_same_inventory(&rejected, &before);
+        assert_eq!(std::fs::read(&path).unwrap(), saved_before);
+        assert_same_inventory(&client.close_crafting().await, &before);
+        drop(client);
+        server.player_left("CraftFull").await;
+        server.stop().await;
+        drop(server);
+
+        let mut server = Server::start(directory.path());
+        let mut client = Client::join(&server.address, "CraftFull").await;
+        assert_eq!(client.uuid, uuid);
+        assert_eq!(client.snapshot.slots, before.slots);
+        assert_eq!(client.snapshot.cursor, before.cursor);
+        assert_eq!(client.snapshot.slots[0], item_stack(OAK_PLANKS, 4));
+        assert_eq!(real_count(&client.snapshot, OAK_PLANKS), 62);
+        assert_eq!(real_count(&client.snapshot, OAK_LOG), 1);
+        client.creative_stack(43, None).await;
+        let completed = client
+            .crafting_click(0, 0, 1, client.snapshot.state, false)
+            .await;
+        assert!(completed.slots[..5].iter().all(Option::is_none));
+        assert_eq!(completed.slots[44], item_stack(OAK_PLANKS, 64));
+        assert_eq!(completed.slots[43], item_stack(OAK_PLANKS, 2));
+        assert_eq!(real_count(&completed, OAK_PLANKS), 66);
+        saved_inventory(directory.path(), uuid);
+        drop(client);
+        server.stop().await;
+    })
+    .await
+    .expect("native no-drop rollback/restart scenario timed out");
+}
+
+#[tokio::test]
+#[ignore = "requires prepared official Minecraft26.3 crafting data"]
+async fn native_crafting_close_returns_real_items_and_survives_reconnect_restart() {
+    timeout(Duration::from_secs(90), async {
+        let directory = tempfile::tempdir().unwrap();
+        let mut server = Server::start(directory.path());
+        let mut client = Client::join(&server.address, "CraftClose").await;
+        let seeded = client.creative_stack(1, item_stack(OAK_LOG, 3)).await;
+        let uuid = client.uuid;
+        let saved = saved_inventory(directory.path(), uuid);
+        assert_eq!(saved["slots"][1]["item"], "minecraft:oak_log");
+        assert_eq!(saved["slots"][1]["count"], 3);
+        let carrying = client.crafting_click(0, 0, 0, seeded.state, false).await;
+        assert_eq!(carrying.cursor, item_stack(OAK_PLANKS, 4));
+        assert_eq!(carrying.slots[1], item_stack(OAK_LOG, 2));
+        for invalid_close in [&[1][..], &[0, 0][..]] {
+            client.send(19, invalid_close).await;
+            let rejected = client.sync().await;
+            assert_same_inventory(&rejected, &carrying);
+            assert_eq!(rejected.content, carrying.content);
+        }
+
+        // Queue the close immediately behind the craft. A later ordered command
+        // fences both; no response assumption can hide an ignored close packet.
+        client
+            .send(18, &crafting_click_body(0, 0, 0, carrying.state, false))
+            .await;
+        let closed = client.close_crafting().await;
+        assert!(
+            closed.slots[..5].iter().all(Option::is_none),
+            "close left the grid or virtual result populated"
+        );
+        assert!(closed.cursor.is_none());
+        assert_eq!(closed.slots[36], item_stack(OAK_PLANKS, 8));
+        assert_eq!(closed.slots[37], item_stack(OAK_LOG, 1));
+        assert_eq!(
+            real_count(&closed, OAK_PLANKS),
+            8,
+            "the virtual preview was duplicated"
+        );
+        assert_eq!(real_count(&closed, OAK_LOG), 1);
+        assert!(saved_inventory(directory.path(), uuid)["cursor"].is_null());
+        drop(client);
+        server.player_left("CraftClose").await;
+        let client = Client::join(&server.address, "CraftClose").await;
+        assert_eq!(client.snapshot.slots, closed.slots);
+        assert_eq!(client.snapshot.cursor, closed.cursor);
+        drop(client);
+        server.player_left("CraftClose").await;
+        server.stop().await;
+        drop(server);
+
+        let mut server = Server::start(directory.path());
+        let client = Client::join(&server.address, "CraftClose").await;
+        assert_eq!(client.uuid, uuid);
+        assert_eq!(client.snapshot.slots, closed.slots);
+        assert_eq!(real_count(&client.snapshot, OAK_PLANKS), 8);
+        assert_eq!(real_count(&client.snapshot, OAK_LOG), 1);
+        drop(client);
+        server.stop().await;
+    })
+    .await
+    .expect("native crafting close/reconnect/restart scenario timed out");
+}
+
+#[tokio::test]
+#[ignore = "requires prepared official Minecraft26.3 crafting data"]
+async fn native_crafting_eof_finalizes_grid_and_cursor_before_same_uuid_reconnect() {
+    timeout(Duration::from_secs(60), async {
+        let directory = tempfile::tempdir().unwrap();
+        let mut server = Server::start(directory.path());
+        let mut client = Client::join(&server.address, "CraftEOF").await;
+        let seeded = client.creative_stack(1, item_stack(OAK_LOG, 2)).await;
+        let committed = client.crafting_click(0, 0, 0, seeded.state, false).await;
+        assert_eq!(committed.cursor, item_stack(OAK_PLANKS, 4));
+        assert_eq!(committed.slots[1], item_stack(OAK_LOG, 1));
+        let uuid = client.uuid;
+        saved_inventory(directory.path(), uuid);
+        drop(client);
+        // This lifecycle event means the former session entered closing. The
+        // login fence must then wait for its actual finalization, not race a sleep.
+        server.player_left("CraftEOF").await;
+        let client = Client::join(&server.address, "CraftEOF").await;
+        assert_eq!(client.uuid, uuid);
+        assert!(
+            client.snapshot.slots[..5].iter().all(Option::is_none),
+            "EOF did not return crafting inputs"
+        );
+        assert!(
+            client.snapshot.cursor.is_none(),
+            "EOF retained the carried result despite free capacity"
+        );
+        assert_eq!(client.snapshot.slots[36], item_stack(OAK_PLANKS, 4));
+        assert_eq!(client.snapshot.slots[37], item_stack(OAK_LOG, 1));
+        assert_eq!(real_count(&client.snapshot, OAK_PLANKS), 4);
+        assert_eq!(real_count(&client.snapshot, OAK_LOG), 1);
+        let saved = saved_inventory(directory.path(), uuid);
+        assert!(saved["cursor"].is_null());
+        assert!(
+            saved["slots"].as_array().unwrap()[..5]
+                .iter()
+                .all(serde_json::Value::is_null)
+        );
+        drop(client);
+        server.stop().await;
+    })
+    .await
+    .expect("native crafting EOF/reconnect scenario timed out");
 }

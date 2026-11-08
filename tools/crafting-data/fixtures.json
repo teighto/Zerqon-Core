@@ -1,0 +1,1626 @@
+{
+  "schema": 1,
+  "minecraft": "26.3",
+  "protocol": 777,
+  "cases": [
+    {
+      "name": "stick_left_mixed_planks",
+      "recipe": "minecraft:stick",
+      "input": [
+        "minecraft:oak_planks",
+        null,
+        "minecraft:birch_planks",
+        null
+      ],
+      "expected": {
+        "matches": true,
+        "result": {
+          "item": "minecraft:stick",
+          "count": 4,
+          "components": {}
+        },
+        "remainders": [
+          null,
+          null,
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "stick_right_offset",
+      "recipe": "minecraft:stick",
+      "input": [
+        null,
+        "minecraft:oak_planks",
+        null,
+        "minecraft:birch_planks"
+      ],
+      "expected": {
+        "matches": true,
+        "result": {
+          "item": "minecraft:stick",
+          "count": 4,
+          "components": {}
+        },
+        "remainders": [
+          null,
+          null,
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "stick_rotation_rejected",
+      "recipe": "minecraft:stick",
+      "input": [
+        "minecraft:oak_planks",
+        "minecraft:birch_planks",
+        null,
+        null
+      ],
+      "expected": {
+        "matches": false
+      }
+    },
+    {
+      "name": "stick_extra_item_rejected",
+      "recipe": "minecraft:stick",
+      "input": [
+        "minecraft:oak_planks",
+        "minecraft:stone",
+        "minecraft:birch_planks",
+        null
+      ],
+      "expected": {
+        "matches": false
+      }
+    },
+    {
+      "name": "stick_missing_item_rejected",
+      "recipe": "minecraft:stick",
+      "input": [
+        "minecraft:oak_planks",
+        null,
+        null,
+        null
+      ],
+      "expected": {
+        "matches": false
+      }
+    },
+    {
+      "name": "torch_coal",
+      "recipe": "minecraft:torch",
+      "input": [
+        "minecraft:coal",
+        null,
+        "minecraft:stick",
+        null
+      ],
+      "expected": {
+        "matches": true,
+        "result": {
+          "item": "minecraft:torch",
+          "count": 4,
+          "components": {}
+        },
+        "remainders": [
+          null,
+          null,
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "torch_charcoal_right",
+      "recipe": "minecraft:torch",
+      "input": [
+        null,
+        "minecraft:charcoal",
+        null,
+        "minecraft:stick"
+      ],
+      "expected": {
+        "matches": true,
+        "result": {
+          "item": "minecraft:torch",
+          "count": 4,
+          "components": {}
+        },
+        "remainders": [
+          null,
+          null,
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "torch_vertical_mirror_rejected",
+      "recipe": "minecraft:torch",
+      "input": [
+        "minecraft:stick",
+        null,
+        "minecraft:coal",
+        null
+      ],
+      "expected": {
+        "matches": false
+      }
+    },
+    {
+      "name": "name_tag_copper",
+      "recipe": "minecraft:name_tag",
+      "input": [
+        null,
+        "minecraft:copper_nugget",
+        "minecraft:paper",
+        null
+      ],
+      "expected": {
+        "matches": true,
+        "result": {
+          "item": "minecraft:name_tag",
+          "count": 1,
+          "components": {}
+        },
+        "remainders": [
+          null,
+          null,
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "name_tag_gold_mirror",
+      "recipe": "minecraft:name_tag",
+      "input": [
+        "minecraft:gold_nugget",
+        null,
+        null,
+        "minecraft:paper"
+      ],
+      "expected": {
+        "matches": true,
+        "result": {
+          "item": "minecraft:name_tag",
+          "count": 1,
+          "components": {}
+        },
+        "remainders": [
+          null,
+          null,
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "name_tag_rotation_rejected",
+      "recipe": "minecraft:name_tag",
+      "input": [
+        "minecraft:paper",
+        null,
+        null,
+        "minecraft:iron_nugget"
+      ],
+      "expected": {
+        "matches": false
+      }
+    },
+    {
+      "name": "oak_planks_trimmed_bottom_right",
+      "recipe": "minecraft:oak_planks",
+      "input": [
+        null,
+        null,
+        null,
+        "minecraft:stripped_oak_wood"
+      ],
+      "expected": {
+        "matches": true,
+        "result": {
+          "item": "minecraft:oak_planks",
+          "count": 4,
+          "components": {}
+        },
+        "remainders": [
+          null,
+          null,
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "oak_planks_wrong_log_rejected",
+      "recipe": "minecraft:oak_planks",
+      "input": [
+        "minecraft:birch_log",
+        null,
+        null,
+        null
+      ],
+      "expected": {
+        "matches": false
+      }
+    },
+    {
+      "name": "fire_charge_shapeless_charcoal",
+      "recipe": "minecraft:fire_charge",
+      "input": [
+        "minecraft:charcoal",
+        null,
+        "minecraft:blaze_powder",
+        "minecraft:gunpowder"
+      ],
+      "expected": {
+        "matches": true,
+        "result": {
+          "item": "minecraft:fire_charge",
+          "count": 3,
+          "components": {}
+        },
+        "remainders": [
+          null,
+          null,
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "fire_charge_shapeless_reordered_coal",
+      "recipe": "minecraft:fire_charge",
+      "input": [
+        "minecraft:gunpowder",
+        "minecraft:coal",
+        null,
+        "minecraft:blaze_powder"
+      ],
+      "expected": {
+        "matches": true,
+        "result": {
+          "item": "minecraft:fire_charge",
+          "count": 3,
+          "components": {}
+        },
+        "remainders": [
+          null,
+          null,
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "fire_charge_extra_item_rejected",
+      "recipe": "minecraft:fire_charge",
+      "input": [
+        "minecraft:coal",
+        "minecraft:blaze_powder",
+        "minecraft:gunpowder",
+        "minecraft:stick"
+      ],
+      "expected": {
+        "matches": false
+      }
+    },
+    {
+      "name": "mushroom_stew_repeated_tag",
+      "recipe": "minecraft:mushroom_stew",
+      "input": [
+        "minecraft:brown_mushroom",
+        "minecraft:brown_mushroom",
+        "minecraft:bowl",
+        null
+      ],
+      "expected": {
+        "matches": true,
+        "result": {
+          "item": "minecraft:mushroom_stew",
+          "count": 1,
+          "components": {}
+        },
+        "remainders": [
+          null,
+          null,
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "mushroom_stew_stack_count_not_multiplicity",
+      "recipe": "minecraft:mushroom_stew",
+      "input": [
+        {
+          "item": "minecraft:brown_mushroom",
+          "count": 2,
+          "components": {}
+        },
+        null,
+        "minecraft:bowl",
+        null
+      ],
+      "expected": {
+        "matches": false
+      }
+    },
+    {
+      "name": "honey_block_remainders",
+      "recipe": "minecraft:honey_block",
+      "input": [
+        "minecraft:honey_bottle",
+        "minecraft:honey_bottle",
+        "minecraft:honey_bottle",
+        "minecraft:honey_bottle"
+      ],
+      "expected": {
+        "matches": true,
+        "result": {
+          "item": "minecraft:honey_block",
+          "count": 1,
+          "components": {}
+        },
+        "remainders": [
+          {
+            "item": "minecraft:glass_bottle",
+            "count": 1,
+            "components": {}
+          },
+          {
+            "item": "minecraft:glass_bottle",
+            "count": 1,
+            "components": {}
+          },
+          {
+            "item": "minecraft:glass_bottle",
+            "count": 1,
+            "components": {}
+          },
+          {
+            "item": "minecraft:glass_bottle",
+            "count": 1,
+            "components": {}
+          }
+        ]
+      }
+    },
+    {
+      "name": "honey_block_large_stacks_remainders",
+      "recipe": "minecraft:honey_block",
+      "input": [
+        {
+          "item": "minecraft:honey_bottle",
+          "count": 16,
+          "components": {}
+        },
+        {
+          "item": "minecraft:honey_bottle",
+          "count": 16,
+          "components": {}
+        },
+        {
+          "item": "minecraft:honey_bottle",
+          "count": 16,
+          "components": {}
+        },
+        {
+          "item": "minecraft:honey_bottle",
+          "count": 16,
+          "components": {}
+        }
+      ],
+      "expected": {
+        "matches": true,
+        "result": {
+          "item": "minecraft:honey_block",
+          "count": 1,
+          "components": {}
+        },
+        "remainders": [
+          {
+            "item": "minecraft:glass_bottle",
+            "count": 1,
+            "components": {}
+          },
+          {
+            "item": "minecraft:glass_bottle",
+            "count": 1,
+            "components": {}
+          },
+          {
+            "item": "minecraft:glass_bottle",
+            "count": 1,
+            "components": {}
+          },
+          {
+            "item": "minecraft:glass_bottle",
+            "count": 1,
+            "components": {}
+          }
+        ]
+      }
+    },
+    {
+      "name": "sugar_honey_remainder_bottom_right",
+      "recipe": "minecraft:sugar_from_honey_bottle",
+      "input": [
+        null,
+        null,
+        null,
+        "minecraft:honey_bottle"
+      ],
+      "expected": {
+        "matches": true,
+        "result": {
+          "item": "minecraft:sugar",
+          "count": 3,
+          "components": {}
+        },
+        "remainders": [
+          null,
+          null,
+          null,
+          {
+            "item": "minecraft:glass_bottle",
+            "count": 1,
+            "components": {}
+          }
+        ]
+      }
+    },
+    {
+      "name": "stick_input_name_not_copied",
+      "recipe": "minecraft:stick",
+      "input": [
+        {
+          "item": "minecraft:oak_planks",
+          "count": 1,
+          "components": {
+            "minecraft:custom_name": "Named planks"
+          }
+        },
+        null,
+        "minecraft:birch_planks",
+        null
+      ],
+      "expected": {
+        "matches": true,
+        "result": {
+          "item": "minecraft:stick",
+          "count": 4,
+          "components": {}
+        },
+        "remainders": [
+          null,
+          null,
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "empty_grid_rejected",
+      "recipe": "minecraft:oak_planks",
+      "input": [
+        null,
+        null,
+        null,
+        null
+      ],
+      "expected": {
+        "matches": false
+      }
+    }
+  ],
+  "codec_cases": [
+    {
+      "name": "shaped_group_object",
+      "base_recipe": "minecraft:torch",
+      "overrides": {
+        "group": {}
+      },
+      "input": [
+        "minecraft:coal",
+        null,
+        "minecraft:stick",
+        null
+      ],
+      "expected": {
+        "accepted": false
+      }
+    },
+    {
+      "name": "shaped_group_null",
+      "base_recipe": "minecraft:torch",
+      "overrides": {
+        "group": null
+      },
+      "input": [
+        "minecraft:coal",
+        null,
+        "minecraft:stick",
+        null
+      ],
+      "expected": {
+        "accepted": true,
+        "show_notification": true,
+        "matches": true,
+        "result": {
+          "item": "minecraft:torch",
+          "count": 4,
+          "components": {}
+        },
+        "remainders": [
+          null,
+          null,
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "shaped_group_number",
+      "base_recipe": "minecraft:torch",
+      "overrides": {
+        "group": 12
+      },
+      "input": [
+        "minecraft:coal",
+        null,
+        "minecraft:stick",
+        null
+      ],
+      "expected": {
+        "accepted": false
+      }
+    },
+    {
+      "name": "shaped_group_boolean",
+      "base_recipe": "minecraft:torch",
+      "overrides": {
+        "group": true
+      },
+      "input": [
+        "minecraft:coal",
+        null,
+        "minecraft:stick",
+        null
+      ],
+      "expected": {
+        "accepted": false
+      }
+    },
+    {
+      "name": "shaped_category_unknown",
+      "base_recipe": "minecraft:torch",
+      "overrides": {
+        "category": "bad"
+      },
+      "input": [
+        "minecraft:coal",
+        null,
+        "minecraft:stick",
+        null
+      ],
+      "expected": {
+        "accepted": false
+      }
+    },
+    {
+      "name": "shaped_category_null",
+      "base_recipe": "minecraft:torch",
+      "overrides": {
+        "category": null
+      },
+      "input": [
+        "minecraft:coal",
+        null,
+        "minecraft:stick",
+        null
+      ],
+      "expected": {
+        "accepted": true,
+        "show_notification": true,
+        "matches": true,
+        "result": {
+          "item": "minecraft:torch",
+          "count": 4,
+          "components": {}
+        },
+        "remainders": [
+          null,
+          null,
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "shaped_category_number",
+      "base_recipe": "minecraft:torch",
+      "overrides": {
+        "category": 1
+      },
+      "input": [
+        "minecraft:coal",
+        null,
+        "minecraft:stick",
+        null
+      ],
+      "expected": {
+        "accepted": false
+      }
+    },
+    {
+      "name": "shaped_show_notification_object",
+      "base_recipe": "minecraft:torch",
+      "overrides": {
+        "show_notification": {}
+      },
+      "input": [
+        "minecraft:coal",
+        null,
+        "minecraft:stick",
+        null
+      ],
+      "expected": {
+        "accepted": false
+      }
+    },
+    {
+      "name": "shaped_show_notification_null",
+      "base_recipe": "minecraft:torch",
+      "overrides": {
+        "show_notification": null
+      },
+      "input": [
+        "minecraft:coal",
+        null,
+        "minecraft:stick",
+        null
+      ],
+      "expected": {
+        "accepted": true,
+        "show_notification": true,
+        "matches": true,
+        "result": {
+          "item": "minecraft:torch",
+          "count": 4,
+          "components": {}
+        },
+        "remainders": [
+          null,
+          null,
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "shaped_show_notification_false",
+      "base_recipe": "minecraft:torch",
+      "overrides": {
+        "show_notification": false
+      },
+      "input": [
+        "minecraft:coal",
+        null,
+        "minecraft:stick",
+        null
+      ],
+      "expected": {
+        "accepted": true,
+        "show_notification": false,
+        "matches": true,
+        "result": {
+          "item": "minecraft:torch",
+          "count": 4,
+          "components": {}
+        },
+        "remainders": [
+          null,
+          null,
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "shaped_show_notification_zero",
+      "base_recipe": "minecraft:torch",
+      "overrides": {
+        "show_notification": 0
+      },
+      "input": [
+        "minecraft:coal",
+        null,
+        "minecraft:stick",
+        null
+      ],
+      "expected": {
+        "accepted": false
+      }
+    },
+    {
+      "name": "shaped_show_notification_one",
+      "base_recipe": "minecraft:torch",
+      "overrides": {
+        "show_notification": 1
+      },
+      "input": [
+        "minecraft:coal",
+        null,
+        "minecraft:stick",
+        null
+      ],
+      "expected": {
+        "accepted": false
+      }
+    },
+    {
+      "name": "shaped_show_notification_two",
+      "base_recipe": "minecraft:torch",
+      "overrides": {
+        "show_notification": 2
+      },
+      "input": [
+        "minecraft:coal",
+        null,
+        "minecraft:stick",
+        null
+      ],
+      "expected": {
+        "accepted": false
+      }
+    },
+    {
+      "name": "shaped_show_notification_string",
+      "base_recipe": "minecraft:torch",
+      "overrides": {
+        "show_notification": "true"
+      },
+      "input": [
+        "minecraft:coal",
+        null,
+        "minecraft:stick",
+        null
+      ],
+      "expected": {
+        "accepted": false
+      }
+    },
+    {
+      "name": "shaped_result_shorthand",
+      "base_recipe": "minecraft:torch",
+      "overrides": {
+        "result": "minecraft:torch"
+      },
+      "input": [
+        "minecraft:coal",
+        null,
+        "minecraft:stick",
+        null
+      ],
+      "expected": {
+        "accepted": true,
+        "show_notification": true,
+        "matches": true,
+        "result": {
+          "item": "minecraft:torch",
+          "count": 1,
+          "components": {}
+        },
+        "remainders": [
+          null,
+          null,
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "shaped_result_empty_components",
+      "base_recipe": "minecraft:torch",
+      "overrides": {
+        "result": {
+          "id": "minecraft:torch",
+          "components": {}
+        }
+      },
+      "input": [
+        "minecraft:coal",
+        null,
+        "minecraft:stick",
+        null
+      ],
+      "expected": {
+        "accepted": true,
+        "show_notification": true,
+        "matches": true,
+        "result": {
+          "item": "minecraft:torch",
+          "count": 1,
+          "components": {}
+        },
+        "remainders": [
+          null,
+          null,
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "shaped_result_null",
+      "base_recipe": "minecraft:torch",
+      "overrides": {
+        "result": null
+      },
+      "input": [
+        "minecraft:coal",
+        null,
+        "minecraft:stick",
+        null
+      ],
+      "expected": {
+        "accepted": false
+      }
+    },
+    {
+      "name": "shaped_result_array",
+      "base_recipe": "minecraft:torch",
+      "overrides": {
+        "result": []
+      },
+      "input": [
+        "minecraft:coal",
+        null,
+        "minecraft:stick",
+        null
+      ],
+      "expected": {
+        "accepted": false
+      }
+    },
+    {
+      "name": "shaped_result_missing_id",
+      "base_recipe": "minecraft:torch",
+      "overrides": {
+        "result": {}
+      },
+      "input": [
+        "minecraft:coal",
+        null,
+        "minecraft:stick",
+        null
+      ],
+      "expected": {
+        "accepted": false
+      }
+    },
+    {
+      "name": "shaped_result_number",
+      "base_recipe": "minecraft:torch",
+      "overrides": {
+        "result": 1
+      },
+      "input": [
+        "minecraft:coal",
+        null,
+        "minecraft:stick",
+        null
+      ],
+      "expected": {
+        "accepted": false
+      }
+    },
+    {
+      "name": "shaped_result_zero_count",
+      "base_recipe": "minecraft:torch",
+      "overrides": {
+        "result": {
+          "id": "minecraft:torch",
+          "count": 0
+        }
+      },
+      "input": [
+        "minecraft:coal",
+        null,
+        "minecraft:stick",
+        null
+      ],
+      "expected": {
+        "accepted": false
+      }
+    },
+    {
+      "name": "shaped_result_null_count",
+      "base_recipe": "minecraft:torch",
+      "overrides": {
+        "result": {
+          "id": "minecraft:torch",
+          "count": null
+        }
+      },
+      "input": [
+        "minecraft:coal",
+        null,
+        "minecraft:stick",
+        null
+      ],
+      "expected": {
+        "accepted": true,
+        "show_notification": true,
+        "matches": true,
+        "result": {
+          "item": "minecraft:torch",
+          "count": 1,
+          "components": {}
+        },
+        "remainders": [
+          null,
+          null,
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "shaped_result_null_components",
+      "base_recipe": "minecraft:torch",
+      "overrides": {
+        "result": {
+          "id": "minecraft:torch",
+          "components": null
+        }
+      },
+      "input": [
+        "minecraft:coal",
+        null,
+        "minecraft:stick",
+        null
+      ],
+      "expected": {
+        "accepted": true,
+        "show_notification": true,
+        "matches": true,
+        "result": {
+          "item": "minecraft:torch",
+          "count": 1,
+          "components": {}
+        },
+        "remainders": [
+          null,
+          null,
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "shapeless_group_object",
+      "base_recipe": "minecraft:oak_planks",
+      "overrides": {
+        "group": {}
+      },
+      "input": [
+        null,
+        null,
+        null,
+        "minecraft:oak_log"
+      ],
+      "expected": {
+        "accepted": false
+      }
+    },
+    {
+      "name": "shapeless_group_null",
+      "base_recipe": "minecraft:oak_planks",
+      "overrides": {
+        "group": null
+      },
+      "input": [
+        null,
+        null,
+        null,
+        "minecraft:oak_log"
+      ],
+      "expected": {
+        "accepted": true,
+        "show_notification": true,
+        "matches": true,
+        "result": {
+          "item": "minecraft:oak_planks",
+          "count": 4,
+          "components": {}
+        },
+        "remainders": [
+          null,
+          null,
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "shapeless_group_number",
+      "base_recipe": "minecraft:oak_planks",
+      "overrides": {
+        "group": 12
+      },
+      "input": [
+        null,
+        null,
+        null,
+        "minecraft:oak_log"
+      ],
+      "expected": {
+        "accepted": false
+      }
+    },
+    {
+      "name": "shapeless_group_boolean",
+      "base_recipe": "minecraft:oak_planks",
+      "overrides": {
+        "group": true
+      },
+      "input": [
+        null,
+        null,
+        null,
+        "minecraft:oak_log"
+      ],
+      "expected": {
+        "accepted": false
+      }
+    },
+    {
+      "name": "shapeless_category_unknown",
+      "base_recipe": "minecraft:oak_planks",
+      "overrides": {
+        "category": "bad"
+      },
+      "input": [
+        null,
+        null,
+        null,
+        "minecraft:oak_log"
+      ],
+      "expected": {
+        "accepted": false
+      }
+    },
+    {
+      "name": "shapeless_category_null",
+      "base_recipe": "minecraft:oak_planks",
+      "overrides": {
+        "category": null
+      },
+      "input": [
+        null,
+        null,
+        null,
+        "minecraft:oak_log"
+      ],
+      "expected": {
+        "accepted": true,
+        "show_notification": true,
+        "matches": true,
+        "result": {
+          "item": "minecraft:oak_planks",
+          "count": 4,
+          "components": {}
+        },
+        "remainders": [
+          null,
+          null,
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "shapeless_category_number",
+      "base_recipe": "minecraft:oak_planks",
+      "overrides": {
+        "category": 1
+      },
+      "input": [
+        null,
+        null,
+        null,
+        "minecraft:oak_log"
+      ],
+      "expected": {
+        "accepted": false
+      }
+    },
+    {
+      "name": "shapeless_show_notification_object",
+      "base_recipe": "minecraft:oak_planks",
+      "overrides": {
+        "show_notification": {}
+      },
+      "input": [
+        null,
+        null,
+        null,
+        "minecraft:oak_log"
+      ],
+      "expected": {
+        "accepted": false
+      }
+    },
+    {
+      "name": "shapeless_show_notification_null",
+      "base_recipe": "minecraft:oak_planks",
+      "overrides": {
+        "show_notification": null
+      },
+      "input": [
+        null,
+        null,
+        null,
+        "minecraft:oak_log"
+      ],
+      "expected": {
+        "accepted": true,
+        "show_notification": true,
+        "matches": true,
+        "result": {
+          "item": "minecraft:oak_planks",
+          "count": 4,
+          "components": {}
+        },
+        "remainders": [
+          null,
+          null,
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "shapeless_show_notification_false",
+      "base_recipe": "minecraft:oak_planks",
+      "overrides": {
+        "show_notification": false
+      },
+      "input": [
+        null,
+        null,
+        null,
+        "minecraft:oak_log"
+      ],
+      "expected": {
+        "accepted": true,
+        "show_notification": false,
+        "matches": true,
+        "result": {
+          "item": "minecraft:oak_planks",
+          "count": 4,
+          "components": {}
+        },
+        "remainders": [
+          null,
+          null,
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "shapeless_show_notification_zero",
+      "base_recipe": "minecraft:oak_planks",
+      "overrides": {
+        "show_notification": 0
+      },
+      "input": [
+        null,
+        null,
+        null,
+        "minecraft:oak_log"
+      ],
+      "expected": {
+        "accepted": false
+      }
+    },
+    {
+      "name": "shapeless_show_notification_one",
+      "base_recipe": "minecraft:oak_planks",
+      "overrides": {
+        "show_notification": 1
+      },
+      "input": [
+        null,
+        null,
+        null,
+        "minecraft:oak_log"
+      ],
+      "expected": {
+        "accepted": false
+      }
+    },
+    {
+      "name": "shapeless_show_notification_two",
+      "base_recipe": "minecraft:oak_planks",
+      "overrides": {
+        "show_notification": 2
+      },
+      "input": [
+        null,
+        null,
+        null,
+        "minecraft:oak_log"
+      ],
+      "expected": {
+        "accepted": false
+      }
+    },
+    {
+      "name": "shapeless_show_notification_string",
+      "base_recipe": "minecraft:oak_planks",
+      "overrides": {
+        "show_notification": "true"
+      },
+      "input": [
+        null,
+        null,
+        null,
+        "minecraft:oak_log"
+      ],
+      "expected": {
+        "accepted": false
+      }
+    },
+    {
+      "name": "shapeless_result_shorthand",
+      "base_recipe": "minecraft:oak_planks",
+      "overrides": {
+        "result": "minecraft:torch"
+      },
+      "input": [
+        null,
+        null,
+        null,
+        "minecraft:oak_log"
+      ],
+      "expected": {
+        "accepted": true,
+        "show_notification": true,
+        "matches": true,
+        "result": {
+          "item": "minecraft:torch",
+          "count": 1,
+          "components": {}
+        },
+        "remainders": [
+          null,
+          null,
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "shapeless_result_empty_components",
+      "base_recipe": "minecraft:oak_planks",
+      "overrides": {
+        "result": {
+          "id": "minecraft:torch",
+          "components": {}
+        }
+      },
+      "input": [
+        null,
+        null,
+        null,
+        "minecraft:oak_log"
+      ],
+      "expected": {
+        "accepted": true,
+        "show_notification": true,
+        "matches": true,
+        "result": {
+          "item": "minecraft:torch",
+          "count": 1,
+          "components": {}
+        },
+        "remainders": [
+          null,
+          null,
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "shapeless_result_null",
+      "base_recipe": "minecraft:oak_planks",
+      "overrides": {
+        "result": null
+      },
+      "input": [
+        null,
+        null,
+        null,
+        "minecraft:oak_log"
+      ],
+      "expected": {
+        "accepted": false
+      }
+    },
+    {
+      "name": "shapeless_result_array",
+      "base_recipe": "minecraft:oak_planks",
+      "overrides": {
+        "result": []
+      },
+      "input": [
+        null,
+        null,
+        null,
+        "minecraft:oak_log"
+      ],
+      "expected": {
+        "accepted": false
+      }
+    },
+    {
+      "name": "shapeless_result_missing_id",
+      "base_recipe": "minecraft:oak_planks",
+      "overrides": {
+        "result": {}
+      },
+      "input": [
+        null,
+        null,
+        null,
+        "minecraft:oak_log"
+      ],
+      "expected": {
+        "accepted": false
+      }
+    },
+    {
+      "name": "shapeless_result_number",
+      "base_recipe": "minecraft:oak_planks",
+      "overrides": {
+        "result": 1
+      },
+      "input": [
+        null,
+        null,
+        null,
+        "minecraft:oak_log"
+      ],
+      "expected": {
+        "accepted": false
+      }
+    },
+    {
+      "name": "shapeless_result_zero_count",
+      "base_recipe": "minecraft:oak_planks",
+      "overrides": {
+        "result": {
+          "id": "minecraft:torch",
+          "count": 0
+        }
+      },
+      "input": [
+        null,
+        null,
+        null,
+        "minecraft:oak_log"
+      ],
+      "expected": {
+        "accepted": false
+      }
+    },
+    {
+      "name": "shapeless_result_null_count",
+      "base_recipe": "minecraft:oak_planks",
+      "overrides": {
+        "result": {
+          "id": "minecraft:torch",
+          "count": null
+        }
+      },
+      "input": [
+        null,
+        null,
+        null,
+        "minecraft:oak_log"
+      ],
+      "expected": {
+        "accepted": true,
+        "show_notification": true,
+        "matches": true,
+        "result": {
+          "item": "minecraft:torch",
+          "count": 1,
+          "components": {}
+        },
+        "remainders": [
+          null,
+          null,
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "shapeless_result_null_components",
+      "base_recipe": "minecraft:oak_planks",
+      "overrides": {
+        "result": {
+          "id": "minecraft:torch",
+          "components": null
+        }
+      },
+      "input": [
+        null,
+        null,
+        null,
+        "minecraft:oak_log"
+      ],
+      "expected": {
+        "accepted": true,
+        "show_notification": true,
+        "matches": true,
+        "result": {
+          "item": "minecraft:torch",
+          "count": 1,
+          "components": {}
+        },
+        "remainders": [
+          null,
+          null,
+          null,
+          null
+        ]
+      }
+    }
+  ],
+  "strict_rejections": [
+    {
+      "name": "shaped_result_integral_float_count",
+      "base_recipe": "minecraft:torch",
+      "overrides": {
+        "result": {
+          "id": "minecraft:torch",
+          "count": 1.0
+        }
+      },
+      "input": [
+        "minecraft:coal",
+        null,
+        "minecraft:stick",
+        null
+      ],
+      "expected": {
+        "accepted": true,
+        "show_notification": true,
+        "matches": true,
+        "result": {
+          "item": "minecraft:torch",
+          "count": 1,
+          "components": {}
+        },
+        "remainders": [
+          null,
+          null,
+          null,
+          null
+        ]
+      },
+      "rust_reject": true
+    },
+    {
+      "name": "shaped_result_fractional_count",
+      "base_recipe": "minecraft:torch",
+      "overrides": {
+        "result": {
+          "id": "minecraft:torch",
+          "count": 1.5
+        }
+      },
+      "input": [
+        "minecraft:coal",
+        null,
+        "minecraft:stick",
+        null
+      ],
+      "expected": {
+        "accepted": true,
+        "show_notification": true,
+        "matches": true,
+        "result": {
+          "item": "minecraft:torch",
+          "count": 1,
+          "components": {}
+        },
+        "remainders": [
+          null,
+          null,
+          null,
+          null
+        ]
+      },
+      "rust_reject": true
+    },
+    {
+      "name": "shapeless_result_integral_float_count",
+      "base_recipe": "minecraft:oak_planks",
+      "overrides": {
+        "result": {
+          "id": "minecraft:torch",
+          "count": 1.0
+        }
+      },
+      "input": [
+        null,
+        null,
+        null,
+        "minecraft:oak_log"
+      ],
+      "expected": {
+        "accepted": true,
+        "show_notification": true,
+        "matches": true,
+        "result": {
+          "item": "minecraft:torch",
+          "count": 1,
+          "components": {}
+        },
+        "remainders": [
+          null,
+          null,
+          null,
+          null
+        ]
+      },
+      "rust_reject": true
+    },
+    {
+      "name": "shapeless_result_fractional_count",
+      "base_recipe": "minecraft:oak_planks",
+      "overrides": {
+        "result": {
+          "id": "minecraft:torch",
+          "count": 1.5
+        }
+      },
+      "input": [
+        null,
+        null,
+        null,
+        "minecraft:oak_log"
+      ],
+      "expected": {
+        "accepted": true,
+        "show_notification": true,
+        "matches": true,
+        "result": {
+          "item": "minecraft:torch",
+          "count": 1,
+          "components": {}
+        },
+        "remainders": [
+          null,
+          null,
+          null,
+          null
+        ]
+      },
+      "rust_reject": true
+    }
+  ]
+}

@@ -60,7 +60,8 @@ impl PlayerStore {
             return Ok(PlayerInventory::new());
         };
         let data = decode_file(&bytes)?;
-        if data.schema != 1 || data.minecraft_version != "26.3" || data.protocol != 777 {
+        if !matches!(data.schema, 1 | 2) || data.minecraft_version != "26.3" || data.protocol != 777
+        {
             return Err(StoreError::Invalid(
                 "unsupported inventory schema or Minecraft version",
             ));
@@ -71,6 +72,11 @@ impl PlayerStore {
         if data.slots.len() != MENU_SLOT_COUNT {
             return Err(StoreError::Invalid(
                 "inventory must have exactly 46 menu slots",
+            ));
+        }
+        if data.slots[0].is_some() {
+            return Err(StoreError::Invalid(
+                "saved crafting result requires explicit recovery; original file preserved",
             ));
         }
         let mut inventory = PlayerInventory::new();
@@ -91,7 +97,7 @@ impl PlayerStore {
         let path = self.path(uuid)?;
         self.load(uuid)?;
         let data = StoredInventory {
-            schema: 1,
+            schema: 2,
             minecraft_version: "26.3".into(),
             protocol: 777,
             uuid,
@@ -99,7 +105,14 @@ impl PlayerStore {
             slots: inventory
                 .slots()
                 .iter()
-                .map(|slot| encode_stack(slot, &self.catalog))
+                .enumerate()
+                .map(|(index, slot)| {
+                    if index == 0 {
+                        Ok(None)
+                    } else {
+                        encode_stack(slot, &self.catalog)
+                    }
+                })
                 .collect::<Result<_, _>>()?,
             cursor: encode_stack(inventory.cursor(), &self.catalog)?,
         };
@@ -606,6 +619,96 @@ mod tests {
     }
 
     #[test]
+    fn derived_crafting_result_is_not_persisted_as_an_owned_item() {
+        let root = tempfile::tempdir().unwrap();
+        let catalog = catalog(1, 6);
+        let store = PlayerStore::new(root.path().into(), Arc::clone(&catalog)).unwrap();
+        let uuid = Uuid::from_u128(51);
+        let mut source = inventory(&catalog);
+        source
+            .set_slot(
+                &catalog,
+                1,
+                Some(ItemStack::new(ItemId(1), 2, ValidatedPatch::default()).unwrap()),
+            )
+            .unwrap();
+        source
+            .set_slot(
+                &catalog,
+                0,
+                Some(ItemStack::new(ItemId(1), 4, ValidatedPatch::default()).unwrap()),
+            )
+            .unwrap();
+        store.save(uuid, &source).unwrap();
+        let restored = store.load(uuid).unwrap();
+        assert!(restored.slots()[0].is_none());
+        assert_eq!(&restored.slots()[1..], &source.slots()[1..]);
+        assert_eq!(restored.cursor(), source.cursor());
+        assert_eq!(source.slots()[0].as_ref().unwrap().count(), 4);
+        let stored = decode_file(&fs::read(store.path(uuid).unwrap()).unwrap()).unwrap();
+        assert_eq!(stored.schema, 2);
+        assert!(stored.slots[0].is_none());
+    }
+
+    #[test]
+    fn legacy_grid_and_cursor_survive_upgrade_but_ambiguous_result_is_preserved() {
+        for has_result in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let catalog = catalog(1, 6);
+            let store = PlayerStore::new(root.path().into(), Arc::clone(&catalog)).unwrap();
+            let uuid = Uuid::from_u128(52);
+            let mut original = inventory(&catalog);
+            original
+                .set_slot(
+                    &catalog,
+                    1,
+                    Some(ItemStack::new(ItemId(1), 2, ValidatedPatch::default()).unwrap()),
+                )
+                .unwrap();
+            if has_result {
+                original
+                    .set_slot(
+                        &catalog,
+                        0,
+                        Some(ItemStack::new(ItemId(1), 4, ValidatedPatch::default()).unwrap()),
+                    )
+                    .unwrap();
+            }
+            let legacy = StoredInventory {
+                schema: 1,
+                minecraft_version: "26.3".into(),
+                protocol: 777,
+                uuid,
+                selected: original.selected(),
+                slots: original
+                    .slots()
+                    .iter()
+                    .map(|slot| encode_stack(slot, &catalog).unwrap())
+                    .collect(),
+                cursor: encode_stack(original.cursor(), &catalog).unwrap(),
+            };
+            let path = store.path(uuid).unwrap();
+            write_file(
+                &mut File::create(&path).unwrap(),
+                &serialize_bounded(&legacy).unwrap(),
+            )
+            .unwrap();
+            let before = fs::read(&path).unwrap();
+            if has_result {
+                assert!(store.load(uuid).is_err());
+                assert!(store.save(uuid, &PlayerInventory::new()).is_err());
+                assert_eq!(fs::read(path).unwrap(), before);
+            } else {
+                let restored = store.load(uuid).unwrap();
+                assert_eq!(restored, original);
+                store.save(uuid, &restored).unwrap();
+                assert_eq!(decode_file(&fs::read(path).unwrap()).unwrap().schema, 2);
+                assert_eq!(store.load(uuid).unwrap(), original);
+            }
+        }
+    }
+
+    #[test]
     fn every_supported_component_and_removed_key_roundtrips_as_typed_data() {
         let root = tempfile::tempdir().unwrap();
         let values = vec![
@@ -763,7 +866,7 @@ mod tests {
         for case in 0..10 {
             let mut data = original.clone();
             match case {
-                0 => data["schema"] = serde_json::json!(2),
+                0 => data["schema"] = serde_json::json!(3),
                 1 => data["minecraft_version"] = serde_json::json!("26.2"),
                 2 => data["selected"] = serde_json::json!(9),
                 3 => data["slots"]

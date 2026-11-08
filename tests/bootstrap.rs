@@ -128,13 +128,234 @@ mod tests {
         fs::write(directory.join("registries-sync.json"), serde_json::to_vec(&json!({"version":VERSION,"protocol":PROTOCOL,"registries":REGISTRIES.iter().map(|name|json!({"name":format!("minecraft:{name}"),"entries":[{"id":"minecraft:test","data":{}}]})).collect::<Vec<_>>()})).unwrap()).unwrap();
         fs::write(directory.join("tags-sync.json"), br#"{"registries":[{"name":"minecraft:item","tags":[{"name":"minecraft:test","ids":[1]}]}]}"#).unwrap();
         fs::write(directory.join("data/unchanged.json"), b"staged payload").unwrap();
-        let prepared = json!({"version":VERSION,"protocol":PROTOCOL,"server_sha1":SERVER_SHA1,"world_version":5023,"java_major":25,"registries":REGISTRIES.len(),"entries":REGISTRIES.len(),"tag_registries":1,"tags":1});
+        fs::create_dir_all(directory.join("data/minecraft/recipe")).unwrap();
+        fs::write(directory.join("data/minecraft/recipe/test.json"), br#"{"type":"minecraft:crafting_shapeless","ingredients":["minecraft:stone"],"result":{"id":"minecraft:stone"}}"#).unwrap();
+        let (recipes, recipes_sha256) = recipe_identity(&directory.join("data")).unwrap();
+        let prepared = json!({"version":VERSION,"protocol":PROTOCOL,"server_sha1":SERVER_SHA1,"world_version":5023,"java_major":25,"registries":REGISTRIES.len(),"entries":REGISTRIES.len(),"tag_registries":1,"tags":1,"recipes":recipes,"recipes_sha256":recipes_sha256});
         fs::write(
             directory.join("prepared.json"),
             serde_json::to_vec(&prepared).unwrap(),
         )
         .unwrap();
         prepared
+    }
+
+    #[test]
+    fn legacy_cache_without_recipe_manifest_is_not_ready() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut identity = inventory_cache(directory.path());
+        identity.as_object_mut().unwrap().remove("recipes");
+        identity.as_object_mut().unwrap().remove("recipes_sha256");
+        fs::write(
+            directory.path().join("prepared.json"),
+            serde_json::to_vec(&identity).unwrap(),
+        )
+        .unwrap();
+        assert!(base_cache_ready(directory.path()).unwrap());
+        assert!(!cache_ready(directory.path()).unwrap());
+    }
+
+    #[test]
+    fn recipe_loader_returns_namespaced_values_verified_by_the_manifest() {
+        let directory = tempfile::tempdir().unwrap();
+        inventory_cache(directory.path());
+        let recipes = load_prepared_recipes(directory.path()).unwrap();
+        assert_eq!(
+            recipes.keys().cloned().collect::<Vec<_>>(),
+            ["minecraft:test"]
+        );
+        assert_eq!(
+            recipes["minecraft:test"]["ingredients"],
+            json!(["minecraft:stone"])
+        );
+        fs::write(directory.path().join("data/minecraft/recipe/test.json"), br#"{"type":"minecraft:crafting_shapeless","ingredients":["minecraft:stone"],"result":"minecraft:diamond"}"#).unwrap();
+        assert!(load_prepared_recipes(directory.path()).is_err());
+    }
+
+    #[test]
+    fn recipe_loader_refuses_missing_manifest_and_wrong_identity_without_writes() {
+        for key in [
+            "recipes",
+            "recipes_sha256",
+            "version",
+            "protocol",
+            "server_sha1",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut identity = inventory_cache(directory.path());
+            identity.as_object_mut().unwrap().remove(key);
+            let bytes = serde_json::to_vec(&identity).unwrap();
+            let path = directory.path().join("prepared.json");
+            fs::write(&path, &bytes).unwrap();
+            assert!(load_prepared_recipes(directory.path()).is_err());
+            assert_eq!(fs::read(path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn missing_or_modified_recipe_invalidates_prepared_cache() {
+        for replacement in [
+            None,
+            Some(br#"{"type":"minecraft:crafting_shapeless"}"#.as_slice()),
+            Some(b"{".as_slice()),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            inventory_cache(directory.path());
+            assert!(cache_ready(directory.path()).unwrap());
+            let path = directory.path().join("data/minecraft/recipe/test.json");
+            if let Some(bytes) = replacement {
+                fs::write(path, bytes).unwrap();
+            } else {
+                fs::remove_file(path).unwrap();
+            }
+            assert!(!cache_ready(directory.path()).unwrap());
+        }
+    }
+
+    #[test]
+    fn corrupt_staged_recipe_cannot_replace_existing_cache() {
+        let directory = tempfile::tempdir().unwrap();
+        let stage = directory.path().join("stage");
+        let destination = directory.path().join("cache");
+        let prepared = inventory_cache(&stage);
+        inventory_cache(&destination);
+        fs::write(destination.join("data/unchanged.json"), b"original payload").unwrap();
+        fs::write(stage.join("data/minecraft/recipe/test.json"), b"{}").unwrap();
+        let identity = fs::read(destination.join("prepared.json")).unwrap();
+        assert!(install_prepared(&stage, &destination, &prepared).is_err());
+        assert_eq!(
+            fs::read(destination.join("data/unchanged.json")).unwrap(),
+            b"original payload"
+        );
+        assert_eq!(
+            fs::read(destination.join("prepared.json")).unwrap(),
+            identity
+        );
+        assert!(cache_ready(&destination).unwrap());
+    }
+
+    #[test]
+    fn unexpected_cached_recipe_is_preserved_before_installation() {
+        let directory = tempfile::tempdir().unwrap();
+        let stage = directory.path().join("stage");
+        let destination = directory.path().join("cache");
+        let prepared = inventory_cache(&stage);
+        inventory_cache(&destination);
+        fs::write(destination.join("data/unchanged.json"), b"original payload").unwrap();
+        let extra = destination.join("data/minecraft/recipe/unexpected.json");
+        fs::write(&extra, b"user content").unwrap();
+        let identity = fs::read(destination.join("prepared.json")).unwrap();
+        assert!(
+            install_prepared(&stage, &destination, &prepared)
+                .unwrap_err()
+                .to_string()
+                .contains("unexpected cached recipe")
+        );
+        assert_eq!(fs::read(extra).unwrap(), b"user content");
+        assert_eq!(
+            fs::read(destination.join("data/unchanged.json")).unwrap(),
+            b"original payload"
+        );
+        assert_eq!(
+            fs::read(destination.join("prepared.json")).unwrap(),
+            identity
+        );
+    }
+
+    #[test]
+    fn linked_recipe_tree_is_rejected_before_installation() {
+        for link_stage in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let stage = directory.path().join("stage");
+            let destination = directory.path().join("cache");
+            let prepared = inventory_cache(&stage);
+            inventory_cache(&destination);
+            let outside = directory.path().join("outside");
+            let linked =
+                if link_stage { &stage } else { &destination }.join("data/minecraft/recipe");
+            fs::rename(&linked, &outside).unwrap();
+            let original = fs::read(outside.join("test.json")).unwrap();
+            directory_link(&outside, &linked);
+            let identity = fs::read(destination.join("prepared.json")).unwrap();
+            assert!(install_prepared(&stage, &destination, &prepared).is_err());
+            assert_eq!(fs::read(outside.join("test.json")).unwrap(), original);
+            assert_eq!(
+                fs::read(destination.join("prepared.json")).unwrap(),
+                identity
+            );
+        }
+    }
+
+    #[test]
+    fn recipe_manifest_rejects_invalid_paths_types_and_oversized_files() {
+        for (name, bytes) in [
+            (
+                "UPPER.json",
+                br#"{"type":"minecraft:crafting_shapeless"}"#.to_vec(),
+            ),
+            ("test.json", br#"{"type":42}"#.to_vec()),
+            ("test.json", b"[]".to_vec()),
+            ("test.json", vec![b' '; 1024 * 1024 + 1]),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().join("minecraft/recipe");
+            fs::create_dir_all(&root).unwrap();
+            fs::write(root.join(name), bytes).unwrap();
+            assert!(recipe_identity(directory.path()).is_err(), "{name}");
+        }
+        assert!(!REGISTRIES.contains(&"recipe"));
+    }
+
+    #[tokio::test]
+    async fn reusable_reports_do_not_require_java_for_recipe_repair() {
+        let directory = tempfile::tempdir().unwrap();
+        inventory_cache(directory.path());
+        fs::remove_file(directory.path().join("data/minecraft/recipe/test.json")).unwrap();
+        let lifecycle = Lifecycle::new();
+        assert!(!cache_ready(directory.path()).unwrap());
+        assert!(
+            !Bootstrap::needs_java_with_lifecycle(directory.path(), &lifecycle, &lifecycle.token())
+                .await
+                .unwrap()
+        );
+        let stage = tempfile::tempdir().unwrap();
+        assert!(stage_cached_reports(directory.path(), stage.path()).unwrap());
+        assert!(
+            stage
+                .path()
+                .join("generated/reports/minecraft/components/item/stone.json")
+                .is_file()
+        );
+        assert!(!stage.path().join("data").exists());
+    }
+
+    #[test]
+    fn cached_report_staging_rejects_corruption_and_ignores_unlisted_files() {
+        let directory = tempfile::tempdir().unwrap();
+        inventory_cache(directory.path());
+        fs::write(
+            directory.path().join("generated/reports/unlisted.json"),
+            b"untrusted",
+        )
+        .unwrap();
+        let stage = tempfile::tempdir().unwrap();
+        assert!(stage_cached_reports(directory.path(), stage.path()).unwrap());
+        assert!(
+            !stage
+                .path()
+                .join("generated/reports/unlisted.json")
+                .exists()
+        );
+        fs::write(
+            directory
+                .path()
+                .join("generated/reports/minecraft/components/item/stone.json"),
+            b"{}",
+        )
+        .unwrap();
+        let invalid_stage = tempfile::tempdir().unwrap();
+        assert!(!stage_cached_reports(directory.path(), invalid_stage.path()).unwrap());
+        assert_eq!(fs::read_dir(invalid_stage.path()).unwrap().count(), 0);
     }
 
     #[test]
@@ -458,11 +679,15 @@ mod tests {
         assert!(!prepared.reused);
         assert_eq!(prepared.directory, directory.path().canonicalize().unwrap());
         for name in ["prepared.json", "registries-sync.json", "tags-sync.json"] {
-            assert_eq!(
-                read_json(&directory.path().join(name), 16 * 1024 * 1024).unwrap(),
-                read_json(&reference.join(name), 16 * 1024 * 1024).unwrap(),
-                "{name}"
-            );
+            let mut actual = read_json(&directory.path().join(name), 16 * 1024 * 1024).unwrap();
+            let expected = read_json(&reference.join(name), 16 * 1024 * 1024).unwrap();
+            if name == "prepared.json" && expected.get("recipes").is_none() {
+                // A legacy reference has identical reports but predates recipe extraction.
+                assert_eq!(actual["recipes"], 2042);
+                actual.as_object_mut().unwrap().remove("recipes");
+                actual.as_object_mut().unwrap().remove("recipes_sha256");
+            }
+            assert_eq!(actual, expected, "{name}");
         }
         for name in REPORTS {
             assert_eq!(
@@ -516,15 +741,113 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "Requires existing verified .cache/vanilla/26.3; exercises concurrent read-only cache reuse"]
+    #[ignore = "Requires existing verified .cache/vanilla/26.3; copies only required reports and pinned JAR into isolation"]
     async fn concurrent_servers_can_reuse_the_same_verified_cache() {
-        let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join(".cache/vanilla/26.3");
+        let isolated = legacy_reference_cache();
+        let directory = isolated.path();
+        Bootstrap::prepare(directory, Path::new("nonexistent-java"))
+            .await
+            .unwrap();
         let (first, second) = tokio::join!(
-            Bootstrap::prepare(&directory, Path::new("nonexistent-java")),
-            Bootstrap::prepare(&directory, Path::new("nonexistent-java"))
+            Bootstrap::prepare(directory, Path::new("nonexistent-java")),
+            Bootstrap::prepare(directory, Path::new("nonexistent-java"))
         );
         assert!(first.unwrap().reused);
         assert!(second.unwrap().reused);
+    }
+
+    fn legacy_reference_cache() -> tempfile::TempDir {
+        let reference = Path::new(env!("CARGO_MANIFEST_DIR")).join(".cache/vanilla/26.3");
+        let directory = tempfile::tempdir().unwrap();
+        assert!(stage_cached_reports(&reference, directory.path()).unwrap());
+        for name in [
+            "server.jar",
+            "registries-sync.json",
+            "tags-sync.json",
+            "prepared.json",
+        ] {
+            fs::copy(reference.join(name), directory.path().join(name)).unwrap();
+        }
+        let mut identity = read_json(&directory.path().join("prepared.json"), 65536).unwrap();
+        identity.as_object_mut().unwrap().remove("recipes");
+        identity.as_object_mut().unwrap().remove("recipes_sha256");
+        fs::write(
+            directory.path().join("prepared.json"),
+            serde_json::to_vec(&identity).unwrap(),
+        )
+        .unwrap();
+        fs::create_dir(directory.path().join("data")).unwrap();
+        directory
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires existing official cached reports and pinned JAR; never invokes Java or changes shared cache"]
+    async fn legacy_recipe_repair_uses_verified_jar_and_reports_without_java() {
+        let directory = legacy_reference_cache();
+        assert!(base_cache_ready(directory.path()).unwrap());
+        assert!(!cache_ready(directory.path()).unwrap());
+        let lifecycle = Lifecycle::new();
+        assert!(
+            !Bootstrap::needs_java_with_lifecycle(directory.path(), &lifecycle, &lifecycle.token())
+                .await
+                .unwrap()
+        );
+        let prepared = Bootstrap::prepare(directory.path(), Path::new("nonexistent-java-runtime"))
+            .await
+            .unwrap();
+        assert!(!prepared.reused);
+        assert!(cache_ready(directory.path()).unwrap());
+        let identity = read_json(&directory.path().join("prepared.json"), 65536).unwrap();
+        assert_eq!(identity["recipes"], 2042);
+        // Independently produced by scripts/prepare-data.py from the checksum-pinned 26.3 JAR.
+        assert_eq!(
+            identity["recipes_sha256"],
+            "7b160ea898535c76f414e580796b13ab59cc6921160d202ecb3d048bed612222"
+        );
+        assert_eq!(
+            recipe_identity(&directory.path().join("data")).unwrap().0,
+            2042
+        );
+        let recipe = directory
+            .path()
+            .join("data/minecraft/recipe/oak_planks.json");
+        let original = fs::read(&recipe).unwrap();
+        fs::write(&recipe, b"{}").unwrap();
+        assert!(!cache_ready(directory.path()).unwrap());
+        assert!(
+            !Bootstrap::prepare(directory.path(), Path::new("nonexistent-java-runtime"))
+                .await
+                .unwrap()
+                .reused
+        );
+        assert_eq!(fs::read(&recipe).unwrap(), original);
+        assert!(
+            Bootstrap::prepare(directory.path(), Path::new("nonexistent-java-runtime"))
+                .await
+                .unwrap()
+                .reused
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires existing official cached reports and pinned JAR; tests isolated archive integrity failure"]
+    async fn invalid_archive_preserves_legacy_cache_before_repair() {
+        let directory = legacy_reference_cache();
+        let before = fs::read(directory.path().join("prepared.json")).unwrap();
+        fs::write(directory.path().join("data/unchanged.json"), b"preserve me").unwrap();
+        fs::write(directory.path().join("server.jar"), b"invalid archive").unwrap();
+        let result =
+            Bootstrap::prepare(directory.path(), Path::new("nonexistent-java-runtime")).await;
+        assert!(result.err().unwrap().to_string().contains("checksum"));
+        assert_eq!(
+            fs::read(directory.path().join("prepared.json")).unwrap(),
+            before
+        );
+        assert_eq!(
+            fs::read(directory.path().join("data/unchanged.json")).unwrap(),
+            b"preserve me"
+        );
+        assert!(!directory.path().join("data/minecraft").exists());
     }
 
     #[tokio::test]

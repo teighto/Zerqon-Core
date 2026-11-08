@@ -73,6 +73,25 @@ jobs:
         run: python -m unittest discover -s scripts -p "test_*.py"
       - name: Prepare official Minecraft data
         run: python scripts/prepare-data.py
+      - name: Original crafting recipes and remainders
+        run: python tools/crafting-data/generate.py --check
+      - name: Crafting data tool checks
+        run: python tools/crafting-data/test_crafting_data.py
+      - name: Original crafting menu and oracle checks
+        shell: python
+        run: |
+          from pathlib import Path
+          import subprocess
+          import sys
+          result = subprocess.run([sys.executable, "tools/crafting-menu-oracle/run.py", "--accept-eula", "--check"],
+                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", timeout=180)
+          print(result.stdout, end="", flush=True)
+          result.check_returncode()
+          evidence = [line.removeprefix("Evidence: ") for line in result.stdout.splitlines() if line.startswith("Evidence: ")]
+          if len(evidence) != 1:
+              raise SystemExit("Expected one crafting menu evidence directory")
+          subprocess.run([sys.executable, "tools/crafting-menu-oracle/test_oracle.py", "--report", str(Path(evidence[0]) / "report.json")],
+                         check=True, timeout=180)
       - name: Verify embedded block metadata
         run: python tools/block-data/generate.py --check
       - name: Prepare official inventory codec fixtures

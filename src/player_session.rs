@@ -578,6 +578,19 @@ impl SessionInner {
             if let Some(control) = control {
                 control.drain().await;
             }
+            let resources = inner
+                .resources
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone();
+            let inventory_cleanup = match resources {
+                Some(resources) => resources
+                    .inventory
+                    .close_and_drain()
+                    .await
+                    .map_err(|error| error.to_string()),
+                None => Ok(()),
+            };
             let mut cleanup = if joining {
                 match crate::managed_tasks::catch_panic(inner.state.player_event(
                     inner.uuid,
@@ -593,6 +606,12 @@ impl SessionInner {
             } else {
                 Ok(())
             };
+            if let Err(failure) = inventory_cleanup {
+                cleanup = Err(match cleanup {
+                    Ok(()) => failure,
+                    Err(error) => format!("{failure}; {error}"),
+                });
+            }
             if let Some(failure) = inner
                 .failure
                 .lock()
@@ -990,6 +1009,61 @@ mod command_tests {
                 .drain(tokio::time::Instant::now() + Duration::from_secs(5))
                 .await
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires prepared official Minecraft 26.3 data"]
+    async fn cancelled_inventory_caller_settles_before_session_quit() {
+        let fixture = Fixture::new().await;
+        let (session, _outbound) = fixture.session().await;
+        session.join().await.unwrap();
+        let resources = session.resources();
+        let pending_resources = Arc::clone(&resources);
+        let (started, running) = oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let caller = tokio::spawn(async move {
+            pending_resources
+                .inventory
+                .test_blocked_change(started, released)
+                .await
+        });
+        running.await.unwrap();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        session.inner.schedule_close();
+        let before_quit = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let quits = fixture.quit_count().await;
+                if quits != "0" || resources.inventory.test_admission_closed() {
+                    break quits;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let retained_slot = fixture.state.slots.available_permits() == fixture.slots - 1;
+        release.send(()).unwrap();
+        session.close().await.unwrap();
+        drop(resources);
+        drop(session);
+        fixture.state.sessions.drain().await;
+        let after_quit = fixture.quit_count().await;
+        fixture.shutdown().await.unwrap();
+        let saved = crate::player_store::PlayerStore::new(
+            fixture.directory.path().join("world/playerdata"),
+            Arc::clone(fixture.state.items.as_ref().unwrap()),
+        )
+        .unwrap()
+        .load(Uuid::from_u128(42))
+        .unwrap();
+        assert_eq!(
+            before_quit, "0",
+            "Quit overtook accepted physical inventory work"
+        );
+        assert!(retained_slot);
+        assert_eq!(after_quit, "1");
+        assert_eq!(saved.selected(), 3);
     }
 
     #[tokio::test]

@@ -1,0 +1,6216 @@
+{
+  "schema": 1,
+  "minecraft": "26.3",
+  "protocol": 777,
+  "cases": [
+    {
+      "name": "creative_left_result",
+      "gamemode": "creative",
+      "setup": {
+        "grid": [
+          {
+            "item": "minecraft:oak_log",
+            "count": 2,
+            "components": {}
+          },
+          null,
+          null,
+          null
+        ],
+        "inventory": {},
+        "cursor": null,
+        "selected": 0
+      },
+      "actions": [
+        {
+          "kind": "click",
+          "slot": 0,
+          "button": 0,
+          "mode": 0,
+          "state_policy": "current"
+        }
+      ],
+      "expected_before": {
+        "slots": {
+          "0": {
+            "item": "minecraft:oak_planks",
+            "count": 4,
+            "components": {}
+          },
+          "1": {
+            "item": "minecraft:oak_log",
+            "count": 2,
+            "components": {}
+          }
+        },
+        "cursor": null,
+        "selected": 0
+      },
+      "expected_after": [
+        {
+          "slots": {
+            "0": {
+              "item": "minecraft:oak_planks",
+              "count": 4,
+              "components": {}
+            },
+            "1": {
+              "item": "minecraft:oak_log",
+              "count": 1,
+              "components": {}
+            }
+          },
+          "cursor": {
+            "item": "minecraft:oak_planks",
+            "count": 4,
+            "components": {}
+          },
+          "selected": 0
+        }
+      ],
+      "expected_dropped": []
+    },
+    {
+      "name": "creative_clone_result",
+      "gamemode": "creative",
+      "setup": {
+        "grid": [
+          {
+            "item": "minecraft:oak_log",
+            "count": 2,
+            "components": {}
+          },
+          null,
+          null,
+          null
+        ],
+        "inventory": {},
+        "cursor": null,
+        "selected": 0
+      },
+      "actions": [
+        {
+          "kind": "click",
+          "slot": 0,
+          "button": 2,
+          "mode": 3,
+          "state_policy": "current"
+        }
+      ],
+      "expected_before": {
+        "slots": {
+          "0": {
+            "item": "minecraft:oak_planks",
+            "count": 4,
+            "components": {}
+          },
+          "1": {
+            "item": "minecraft:oak_log",
+            "count": 2,
+            "components": {}
+          }
+        },
+        "cursor": null,
+        "selected": 0
+      },
+      "expected_after": [
+        {
+          "slots": {
+            "0": {
+              "item": "minecraft:oak_planks",
+              "count": 4,
+              "components": {}
+            },
+            "1": {
+              "item": "minecraft:oak_log",
+              "count": 2,
+              "components": {}
+            }
+          },
+          "cursor": {
+            "item": "minecraft:oak_planks",
+            "count": 64,
+            "components": {}
+          },
+          "selected": 0
+        }
+      ],
+      "expected_dropped": []
+    },
+    {
+      "name": "survival_clone_result",
+      "gamemode": "survival",
+      "setup": {
+        "grid": [
+          {
+            "item": "minecraft:oak_log",
+            "count": 2,
+            "components": {}
+          },
+          null,
+          null,
+          null
+        ],
+        "inventory": {},
+        "cursor": null,
+        "selected": 0
+      },
+      "actions": [
+        {
+          "kind": "click",
+          "slot": 0,
+          "button": 2,
+          "mode": 3,
+          "state_policy": "current"
+        }
+      ],
+      "expected_before": {
+        "slots": {
+          "0": {
+            "item": "minecraft:oak_planks",
+            "count": 4,
+            "components": {}
+          },
+          "1": {
+            "item": "minecraft:oak_log",
+            "count": 2,
+            "components": {}
+          }
+        },
+        "cursor": null,
+        "selected": 0
+      },
+      "expected_after": [
+        {
+          "slots": {
+            "0": {
+              "item": "minecraft:oak_planks",
+              "count": 4,
+              "components": {}
+            },
+            "1": {
+              "item": "minecraft:oak_log",
+              "count": 2,
+              "components": {}
+            }
+          },
+          "cursor": null,
+          "selected": 0
+        }
+      ],
+      "expected_dropped": []
+    },
+    {
+      "name": "swap_result_hotbar",
+      "gamemode": "survival",
+      "setup": {
+        "grid": [
+          {
+            "item": "minecraft:oak_log",
+            "count": 2,
+            "components": {}
+          },
+          null,
+          null,
+          null
+        ],
+        "inventory": {},
+        "cursor": null,
+        "selected": 0
+      },
+      "actions": [
+        {
+          "kind": "click",
+          "slot": 0,
+          "button": 0,
+          "mode": 2,
+          "state_policy": "current"
+        }
+      ],
+      "expected_before": {
+        "slots": {
+          "0": {
+            "item": "minecraft:oak_planks",
+            "count": 4,
+            "components": {}
+          },
+          "1": {
+            "item": "minecraft:oak_log",
+            "count": 2,
+            "components": {}
+          }
+        },
+        "cursor": null,
+        "selected": 0
+      },
+      "expected_after": [
+        {
+          "slots": {
+            "0": {
+              "item": "minecraft:oak_planks",
+              "count": 4,
+              "components": {}
+            },
+            "1": {
+              "item": "minecraft:oak_log",
+              "count": 1,
+              "components": {}
+            },
+            "36": {
+              "item": "minecraft:oak_planks",
+              "count": 4,
+              "components": {}
+            }
+          },
+          "cursor": null,
+          "selected": 0
+        }
+      ],
+      "expected_dropped": []
+    },
+    {
+      "name": "swap_result_offhand",
+      "gamemode": "survival",
+      "setup": {
+        "grid": [
+          {
+            "item": "minecraft:oak_log",
+            "count": 2,
+            "components": {}
+          },
+          null,
+          null,
+          null
+        ],
+        "inventory": {},
+        "cursor": null,
+        "selected": 0
+      },
+      "actions": [
+        {
+          "kind": "click",
+          "slot": 0,
+          "button": 40,
+          "mode": 2,
+          "state_policy": "current"
+        }
+      ],
+      "expected_before": {
+        "slots": {
+          "0": {
+            "item": "minecraft:oak_planks",
+            "count": 4,
+            "components": {}
+          },
+          "1": {
+            "item": "minecraft:oak_log",
+            "count": 2,
+            "components": {}
+          }
+        },
+        "cursor": null,
+        "selected": 0
+      },
+      "expected_after": [
+        {
+          "slots": {
+            "0": {
+              "item": "minecraft:oak_planks",
+              "count": 4,
+              "components": {}
+            },
+            "1": {
+              "item": "minecraft:oak_log",
+              "count": 1,
+              "components": {}
+            },
+            "45": {
+              "item": "minecraft:oak_planks",
+              "count": 4,
+              "components": {}
+            }
+          },
+          "cursor": null,
+          "selected": 0
+        }
+      ],
+      "expected_dropped": []
+    },
+    {
+      "name": "swap_result_occupied_hotbar",
+      "gamemode": "survival",
+      "setup": {
+        "grid": [
+          {
+            "item": "minecraft:oak_log",
+            "count": 2,
+            "components": {}
+          },
+          null,
+          null,
+          null
+        ],
+        "inventory": {
+          "36": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          }
+        },
+        "cursor": null,
+        "selected": 0
+      },
+      "actions": [
+        {
+          "kind": "click",
+          "slot": 0,
+          "button": 0,
+          "mode": 2,
+          "state_policy": "current"
+        }
+      ],
+      "expected_before": {
+        "slots": {
+          "0": {
+            "item": "minecraft:oak_planks",
+            "count": 4,
+            "components": {}
+          },
+          "1": {
+            "item": "minecraft:oak_log",
+            "count": 2,
+            "components": {}
+          },
+          "36": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          }
+        },
+        "cursor": null,
+        "selected": 0
+      },
+      "expected_after": [
+        {
+          "slots": {
+            "0": {
+              "item": "minecraft:oak_planks",
+              "count": 4,
+              "components": {}
+            },
+            "1": {
+              "item": "minecraft:oak_log",
+              "count": 2,
+              "components": {}
+            },
+            "36": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            }
+          },
+          "cursor": null,
+          "selected": 0
+        }
+      ],
+      "expected_dropped": []
+    },
+    {
+      "name": "throw_result_single",
+      "gamemode": "survival",
+      "setup": {
+        "grid": [
+          {
+            "item": "minecraft:oak_log",
+            "count": 2,
+            "components": {}
+          },
+          null,
+          null,
+          null
+        ],
+        "inventory": {},
+        "cursor": null,
+        "selected": 0
+      },
+      "actions": [
+        {
+          "kind": "click",
+          "slot": 0,
+          "button": 0,
+          "mode": 4,
+          "state_policy": "current"
+        }
+      ],
+      "expected_before": {
+        "slots": {
+          "0": {
+            "item": "minecraft:oak_planks",
+            "count": 4,
+            "components": {}
+          },
+          "1": {
+            "item": "minecraft:oak_log",
+            "count": 2,
+            "components": {}
+          }
+        },
+        "cursor": null,
+        "selected": 0
+      },
+      "expected_after": [
+        {
+          "slots": {
+            "0": {
+              "item": "minecraft:oak_planks",
+              "count": 4,
+              "components": {}
+            },
+            "1": {
+              "item": "minecraft:oak_log",
+              "count": 1,
+              "components": {}
+            }
+          },
+          "cursor": null,
+          "selected": 0
+        }
+      ],
+      "expected_dropped": [
+        {
+          "item": "minecraft:oak_planks",
+          "count": 4,
+          "components": {}
+        }
+      ]
+    },
+    {
+      "name": "throw_result_stack",
+      "gamemode": "survival",
+      "setup": {
+        "grid": [
+          {
+            "item": "minecraft:oak_log",
+            "count": 2,
+            "components": {}
+          },
+          null,
+          null,
+          null
+        ],
+        "inventory": {},
+        "cursor": null,
+        "selected": 0
+      },
+      "actions": [
+        {
+          "kind": "click",
+          "slot": 0,
+          "button": 1,
+          "mode": 4,
+          "state_policy": "current"
+        }
+      ],
+      "expected_before": {
+        "slots": {
+          "0": {
+            "item": "minecraft:oak_planks",
+            "count": 4,
+            "components": {}
+          },
+          "1": {
+            "item": "minecraft:oak_log",
+            "count": 2,
+            "components": {}
+          }
+        },
+        "cursor": null,
+        "selected": 0
+      },
+      "expected_after": [
+        {
+          "slots": {},
+          "cursor": null,
+          "selected": 0
+        }
+      ],
+      "expected_dropped": [
+        {
+          "item": "minecraft:oak_planks",
+          "count": 8,
+          "components": {}
+        }
+      ]
+    },
+    {
+      "name": "pickup_all_on_result_noop",
+      "gamemode": "survival",
+      "setup": {
+        "grid": [
+          {
+            "item": "minecraft:oak_log",
+            "count": 2,
+            "components": {}
+          },
+          null,
+          null,
+          null
+        ],
+        "inventory": {
+          "10": {
+            "item": "minecraft:oak_planks",
+            "count": 7,
+            "components": {}
+          }
+        },
+        "cursor": {
+          "item": "minecraft:oak_planks",
+          "count": 1,
+          "components": {}
+        },
+        "selected": 0
+      },
+      "actions": [
+        {
+          "kind": "click",
+          "slot": 0,
+          "button": 0,
+          "mode": 6,
+          "state_policy": "current"
+        }
+      ],
+      "expected_before": {
+        "slots": {
+          "0": {
+            "item": "minecraft:oak_planks",
+            "count": 4,
+            "components": {}
+          },
+          "1": {
+            "item": "minecraft:oak_log",
+            "count": 2,
+            "components": {}
+          },
+          "10": {
+            "item": "minecraft:oak_planks",
+            "count": 7,
+            "components": {}
+          }
+        },
+        "cursor": {
+          "item": "minecraft:oak_planks",
+          "count": 1,
+          "components": {}
+        },
+        "selected": 0
+      },
+      "expected_after": [
+        {
+          "slots": {
+            "0": {
+              "item": "minecraft:oak_planks",
+              "count": 4,
+              "components": {}
+            },
+            "1": {
+              "item": "minecraft:oak_log",
+              "count": 2,
+              "components": {}
+            },
+            "10": {
+              "item": "minecraft:oak_planks",
+              "count": 7,
+              "components": {}
+            }
+          },
+          "cursor": {
+            "item": "minecraft:oak_planks",
+            "count": 1,
+            "components": {}
+          },
+          "selected": 0
+        }
+      ],
+      "expected_dropped": []
+    },
+    {
+      "name": "pickup_all_excludes_virtual_result",
+      "gamemode": "survival",
+      "setup": {
+        "grid": [
+          {
+            "item": "minecraft:oak_log",
+            "count": 2,
+            "components": {}
+          },
+          null,
+          null,
+          null
+        ],
+        "inventory": {
+          "10": {
+            "item": "minecraft:oak_planks",
+            "count": 7,
+            "components": {}
+          }
+        },
+        "cursor": {
+          "item": "minecraft:oak_planks",
+          "count": 1,
+          "components": {}
+        },
+        "selected": 0
+      },
+      "actions": [
+        {
+          "kind": "click",
+          "slot": 9,
+          "button": 0,
+          "mode": 6,
+          "state_policy": "current"
+        }
+      ],
+      "expected_before": {
+        "slots": {
+          "0": {
+            "item": "minecraft:oak_planks",
+            "count": 4,
+            "components": {}
+          },
+          "1": {
+            "item": "minecraft:oak_log",
+            "count": 2,
+            "components": {}
+          },
+          "10": {
+            "item": "minecraft:oak_planks",
+            "count": 7,
+            "components": {}
+          }
+        },
+        "cursor": {
+          "item": "minecraft:oak_planks",
+          "count": 1,
+          "components": {}
+        },
+        "selected": 0
+      },
+      "expected_after": [
+        {
+          "slots": {
+            "0": {
+              "item": "minecraft:oak_planks",
+              "count": 4,
+              "components": {}
+            },
+            "1": {
+              "item": "minecraft:oak_log",
+              "count": 2,
+              "components": {}
+            }
+          },
+          "cursor": {
+            "item": "minecraft:oak_planks",
+            "count": 8,
+            "components": {}
+          },
+          "selected": 0
+        }
+      ],
+      "expected_dropped": []
+    },
+    {
+      "name": "left_result",
+      "gamemode": "survival",
+      "setup": {
+        "grid": [
+          {
+            "item": "minecraft:oak_log",
+            "count": 2,
+            "components": {}
+          },
+          null,
+          null,
+          null
+        ],
+        "inventory": {},
+        "cursor": null,
+        "selected": 0
+      },
+      "actions": [
+        {
+          "kind": "click",
+          "slot": 0,
+          "button": 0,
+          "mode": 0,
+          "state_policy": "current"
+        }
+      ],
+      "expected_before": {
+        "slots": {
+          "0": {
+            "item": "minecraft:oak_planks",
+            "count": 4,
+            "components": {}
+          },
+          "1": {
+            "item": "minecraft:oak_log",
+            "count": 2,
+            "components": {}
+          }
+        },
+        "cursor": null,
+        "selected": 0
+      },
+      "expected_after": [
+        {
+          "slots": {
+            "0": {
+              "item": "minecraft:oak_planks",
+              "count": 4,
+              "components": {}
+            },
+            "1": {
+              "item": "minecraft:oak_log",
+              "count": 1,
+              "components": {}
+            }
+          },
+          "cursor": {
+            "item": "minecraft:oak_planks",
+            "count": 4,
+            "components": {}
+          },
+          "selected": 0
+        }
+      ],
+      "expected_dropped": []
+    },
+    {
+      "name": "right_result",
+      "gamemode": "survival",
+      "setup": {
+        "grid": [
+          {
+            "item": "minecraft:oak_log",
+            "count": 2,
+            "components": {}
+          },
+          null,
+          null,
+          null
+        ],
+        "inventory": {},
+        "cursor": null,
+        "selected": 0
+      },
+      "actions": [
+        {
+          "kind": "click",
+          "slot": 0,
+          "button": 1,
+          "mode": 0,
+          "state_policy": "current"
+        }
+      ],
+      "expected_before": {
+        "slots": {
+          "0": {
+            "item": "minecraft:oak_planks",
+            "count": 4,
+            "components": {}
+          },
+          "1": {
+            "item": "minecraft:oak_log",
+            "count": 2,
+            "components": {}
+          }
+        },
+        "cursor": null,
+        "selected": 0
+      },
+      "expected_after": [
+        {
+          "slots": {
+            "0": {
+              "item": "minecraft:oak_planks",
+              "count": 4,
+              "components": {}
+            },
+            "1": {
+              "item": "minecraft:oak_log",
+              "count": 1,
+              "components": {}
+            }
+          },
+          "cursor": {
+            "item": "minecraft:oak_planks",
+            "count": 4,
+            "components": {}
+          },
+          "selected": 0
+        }
+      ],
+      "expected_dropped": []
+    },
+    {
+      "name": "shift_result",
+      "gamemode": "survival",
+      "setup": {
+        "grid": [
+          {
+            "item": "minecraft:oak_log",
+            "count": 3,
+            "components": {}
+          },
+          null,
+          null,
+          null
+        ],
+        "inventory": {},
+        "cursor": null,
+        "selected": 0
+      },
+      "actions": [
+        {
+          "kind": "click",
+          "slot": 0,
+          "button": 0,
+          "mode": 1,
+          "state_policy": "current"
+        }
+      ],
+      "expected_before": {
+        "slots": {
+          "0": {
+            "item": "minecraft:oak_planks",
+            "count": 4,
+            "components": {}
+          },
+          "1": {
+            "item": "minecraft:oak_log",
+            "count": 3,
+            "components": {}
+          }
+        },
+        "cursor": null,
+        "selected": 0
+      },
+      "expected_after": [
+        {
+          "slots": {
+            "44": {
+              "item": "minecraft:oak_planks",
+              "count": 12,
+              "components": {}
+            }
+          },
+          "cursor": null,
+          "selected": 0
+        }
+      ],
+      "expected_dropped": []
+    },
+    {
+      "name": "cursor_exact_batch_capacity",
+      "gamemode": "survival",
+      "setup": {
+        "grid": [
+          {
+            "item": "minecraft:oak_log",
+            "count": 2,
+            "components": {}
+          },
+          null,
+          null,
+          null
+        ],
+        "inventory": {},
+        "cursor": {
+          "item": "minecraft:oak_planks",
+          "count": 60,
+          "components": {}
+        },
+        "selected": 0
+      },
+      "actions": [
+        {
+          "kind": "click",
+          "slot": 0,
+          "button": 0,
+          "mode": 0,
+          "state_policy": "current"
+        }
+      ],
+      "expected_before": {
+        "slots": {
+          "0": {
+            "item": "minecraft:oak_planks",
+            "count": 4,
+            "components": {}
+          },
+          "1": {
+            "item": "minecraft:oak_log",
+            "count": 2,
+            "components": {}
+          }
+        },
+        "cursor": {
+          "item": "minecraft:oak_planks",
+          "count": 60,
+          "components": {}
+        },
+        "selected": 0
+      },
+      "expected_after": [
+        {
+          "slots": {
+            "0": {
+              "item": "minecraft:oak_planks",
+              "count": 4,
+              "components": {}
+            },
+            "1": {
+              "item": "minecraft:oak_log",
+              "count": 1,
+              "components": {}
+            }
+          },
+          "cursor": {
+            "item": "minecraft:oak_planks",
+            "count": 64,
+            "components": {}
+          },
+          "selected": 0
+        }
+      ],
+      "expected_dropped": []
+    },
+    {
+      "name": "cursor_partial_batch_capacity",
+      "gamemode": "survival",
+      "setup": {
+        "grid": [
+          {
+            "item": "minecraft:oak_log",
+            "count": 2,
+            "components": {}
+          },
+          null,
+          null,
+          null
+        ],
+        "inventory": {},
+        "cursor": {
+          "item": "minecraft:oak_planks",
+          "count": 62,
+          "components": {}
+        },
+        "selected": 0
+      },
+      "actions": [
+        {
+          "kind": "click",
+          "slot": 0,
+          "button": 0,
+          "mode": 0,
+          "state_policy": "current"
+        }
+      ],
+      "expected_before": {
+        "slots": {
+          "0": {
+            "item": "minecraft:oak_planks",
+            "count": 4,
+            "components": {}
+          },
+          "1": {
+            "item": "minecraft:oak_log",
+            "count": 2,
+            "components": {}
+          }
+        },
+        "cursor": {
+          "item": "minecraft:oak_planks",
+          "count": 62,
+          "components": {}
+        },
+        "selected": 0
+      },
+      "expected_after": [
+        {
+          "slots": {
+            "0": {
+              "item": "minecraft:oak_planks",
+              "count": 4,
+              "components": {}
+            },
+            "1": {
+              "item": "minecraft:oak_log",
+              "count": 2,
+              "components": {}
+            }
+          },
+          "cursor": {
+            "item": "minecraft:oak_planks",
+            "count": 62,
+            "components": {}
+          },
+          "selected": 0
+        }
+      ],
+      "expected_dropped": []
+    },
+    {
+      "name": "cursor_full",
+      "gamemode": "survival",
+      "setup": {
+        "grid": [
+          {
+            "item": "minecraft:oak_log",
+            "count": 2,
+            "components": {}
+          },
+          null,
+          null,
+          null
+        ],
+        "inventory": {},
+        "cursor": {
+          "item": "minecraft:oak_planks",
+          "count": 64,
+          "components": {}
+        },
+        "selected": 0
+      },
+      "actions": [
+        {
+          "kind": "click",
+          "slot": 0,
+          "button": 0,
+          "mode": 0,
+          "state_policy": "current"
+        }
+      ],
+      "expected_before": {
+        "slots": {
+          "0": {
+            "item": "minecraft:oak_planks",
+            "count": 4,
+            "components": {}
+          },
+          "1": {
+            "item": "minecraft:oak_log",
+            "count": 2,
+            "components": {}
+          }
+        },
+        "cursor": {
+          "item": "minecraft:oak_planks",
+          "count": 64,
+          "components": {}
+        },
+        "selected": 0
+      },
+      "expected_after": [
+        {
+          "slots": {
+            "0": {
+              "item": "minecraft:oak_planks",
+              "count": 4,
+              "components": {}
+            },
+            "1": {
+              "item": "minecraft:oak_log",
+              "count": 2,
+              "components": {}
+            }
+          },
+          "cursor": {
+            "item": "minecraft:oak_planks",
+            "count": 64,
+            "components": {}
+          },
+          "selected": 0
+        }
+      ],
+      "expected_dropped": []
+    },
+    {
+      "name": "cursor_incompatible",
+      "gamemode": "survival",
+      "setup": {
+        "grid": [
+          {
+            "item": "minecraft:oak_log",
+            "count": 2,
+            "components": {}
+          },
+          null,
+          null,
+          null
+        ],
+        "inventory": {},
+        "cursor": {
+          "item": "minecraft:stone",
+          "count": 1,
+          "components": {}
+        },
+        "selected": 0
+      },
+      "actions": [
+        {
+          "kind": "click",
+          "slot": 0,
+          "button": 0,
+          "mode": 0,
+          "state_policy": "current"
+        }
+      ],
+      "expected_before": {
+        "slots": {
+          "0": {
+            "item": "minecraft:oak_planks",
+            "count": 4,
+            "components": {}
+          },
+          "1": {
+            "item": "minecraft:oak_log",
+            "count": 2,
+            "components": {}
+          }
+        },
+        "cursor": {
+          "item": "minecraft:stone",
+          "count": 1,
+          "components": {}
+        },
+        "selected": 0
+      },
+      "expected_after": [
+        {
+          "slots": {
+            "0": {
+              "item": "minecraft:oak_planks",
+              "count": 4,
+              "components": {}
+            },
+            "1": {
+              "item": "minecraft:oak_log",
+              "count": 2,
+              "components": {}
+            }
+          },
+          "cursor": {
+            "item": "minecraft:stone",
+            "count": 1,
+            "components": {}
+          },
+          "selected": 0
+        }
+      ],
+      "expected_dropped": []
+    },
+    {
+      "name": "shift_full_inventory",
+      "gamemode": "survival",
+      "setup": {
+        "grid": [
+          {
+            "item": "minecraft:oak_log",
+            "count": 2,
+            "components": {}
+          },
+          null,
+          null,
+          null
+        ],
+        "inventory": {
+          "9": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "10": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "11": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "12": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "13": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "14": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "15": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "16": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "17": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "18": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "19": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "20": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "21": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "22": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "23": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "24": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "25": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "26": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "27": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "28": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "29": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "30": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "31": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "32": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "33": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "34": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "35": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "36": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "37": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "38": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "39": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "40": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "41": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "42": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "43": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "44": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          }
+        },
+        "cursor": null,
+        "selected": 0
+      },
+      "actions": [
+        {
+          "kind": "click",
+          "slot": 0,
+          "button": 0,
+          "mode": 1,
+          "state_policy": "current"
+        }
+      ],
+      "expected_before": {
+        "slots": {
+          "0": {
+            "item": "minecraft:oak_planks",
+            "count": 4,
+            "components": {}
+          },
+          "1": {
+            "item": "minecraft:oak_log",
+            "count": 2,
+            "components": {}
+          },
+          "9": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "10": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "11": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "12": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "13": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "14": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "15": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "16": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "17": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "18": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "19": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "20": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "21": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "22": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "23": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "24": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "25": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "26": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "27": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "28": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "29": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "30": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "31": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "32": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "33": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "34": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "35": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "36": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "37": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "38": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "39": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "40": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "41": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "42": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "43": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "44": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          }
+        },
+        "cursor": null,
+        "selected": 0
+      },
+      "expected_after": [
+        {
+          "slots": {
+            "0": {
+              "item": "minecraft:oak_planks",
+              "count": 4,
+              "components": {}
+            },
+            "1": {
+              "item": "minecraft:oak_log",
+              "count": 2,
+              "components": {}
+            },
+            "9": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "10": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "11": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "12": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "13": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "14": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "15": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "16": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "17": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "18": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "19": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "20": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "21": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "22": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "23": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "24": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "25": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "26": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "27": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "28": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "29": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "30": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "31": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "32": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "33": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "34": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "35": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "36": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "37": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "38": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "39": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "40": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "41": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "42": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "43": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "44": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            }
+          },
+          "cursor": null,
+          "selected": 0
+        }
+      ],
+      "expected_dropped": []
+    },
+    {
+      "name": "shift_partial_inventory",
+      "gamemode": "survival",
+      "setup": {
+        "grid": [
+          {
+            "item": "minecraft:oak_log",
+            "count": 2,
+            "components": {}
+          },
+          null,
+          null,
+          null
+        ],
+        "inventory": {
+          "9": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "10": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "11": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "12": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "13": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "14": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "15": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "16": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "17": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "18": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "19": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "20": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "21": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "22": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "23": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "24": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "25": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "26": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "27": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "28": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "29": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "30": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "31": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "32": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "33": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "34": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "35": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "36": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "37": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "38": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "39": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "40": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "41": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "42": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "43": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "44": {
+            "item": "minecraft:oak_planks",
+            "count": 62,
+            "components": {}
+          }
+        },
+        "cursor": null,
+        "selected": 0
+      },
+      "actions": [
+        {
+          "kind": "click",
+          "slot": 0,
+          "button": 0,
+          "mode": 1,
+          "state_policy": "current"
+        }
+      ],
+      "expected_before": {
+        "slots": {
+          "0": {
+            "item": "minecraft:oak_planks",
+            "count": 4,
+            "components": {}
+          },
+          "1": {
+            "item": "minecraft:oak_log",
+            "count": 2,
+            "components": {}
+          },
+          "9": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "10": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "11": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "12": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "13": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "14": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "15": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "16": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "17": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "18": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "19": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "20": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "21": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "22": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "23": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "24": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "25": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "26": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "27": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "28": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "29": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "30": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "31": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "32": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "33": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "34": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "35": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "36": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "37": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "38": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "39": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "40": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "41": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "42": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "43": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "44": {
+            "item": "minecraft:oak_planks",
+            "count": 62,
+            "components": {}
+          }
+        },
+        "cursor": null,
+        "selected": 0
+      },
+      "expected_after": [
+        {
+          "slots": {
+            "0": {
+              "item": "minecraft:oak_planks",
+              "count": 4,
+              "components": {}
+            },
+            "1": {
+              "item": "minecraft:oak_log",
+              "count": 1,
+              "components": {}
+            },
+            "9": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "10": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "11": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "12": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "13": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "14": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "15": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "16": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "17": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "18": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "19": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "20": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "21": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "22": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "23": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "24": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "25": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "26": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "27": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "28": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "29": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "30": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "31": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "32": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "33": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "34": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "35": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "36": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "37": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "38": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "39": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "40": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "41": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "42": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "43": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "44": {
+              "item": "minecraft:oak_planks",
+              "count": 64,
+              "components": {}
+            }
+          },
+          "cursor": null,
+          "selected": 0
+        }
+      ],
+      "expected_dropped": [
+        {
+          "item": "minecraft:oak_planks",
+          "count": 2,
+          "components": {}
+        }
+      ]
+    },
+    {
+      "name": "honey_remainder_grid",
+      "gamemode": "survival",
+      "setup": {
+        "grid": [
+          {
+            "item": "minecraft:honey_bottle",
+            "count": 1,
+            "components": {}
+          },
+          {
+            "item": "minecraft:honey_bottle",
+            "count": 1,
+            "components": {}
+          },
+          {
+            "item": "minecraft:honey_bottle",
+            "count": 1,
+            "components": {}
+          },
+          {
+            "item": "minecraft:honey_bottle",
+            "count": 1,
+            "components": {}
+          }
+        ],
+        "inventory": {},
+        "cursor": null,
+        "selected": 0
+      },
+      "actions": [
+        {
+          "kind": "click",
+          "slot": 0,
+          "button": 0,
+          "mode": 0,
+          "state_policy": "current"
+        }
+      ],
+      "expected_before": {
+        "slots": {
+          "0": {
+            "item": "minecraft:honey_block",
+            "count": 1,
+            "components": {}
+          },
+          "1": {
+            "item": "minecraft:honey_bottle",
+            "count": 1,
+            "components": {}
+          },
+          "2": {
+            "item": "minecraft:honey_bottle",
+            "count": 1,
+            "components": {}
+          },
+          "3": {
+            "item": "minecraft:honey_bottle",
+            "count": 1,
+            "components": {}
+          },
+          "4": {
+            "item": "minecraft:honey_bottle",
+            "count": 1,
+            "components": {}
+          }
+        },
+        "cursor": null,
+        "selected": 0
+      },
+      "expected_after": [
+        {
+          "slots": {
+            "1": {
+              "item": "minecraft:glass_bottle",
+              "count": 1,
+              "components": {}
+            },
+            "2": {
+              "item": "minecraft:glass_bottle",
+              "count": 1,
+              "components": {}
+            },
+            "3": {
+              "item": "minecraft:glass_bottle",
+              "count": 1,
+              "components": {}
+            },
+            "4": {
+              "item": "minecraft:glass_bottle",
+              "count": 1,
+              "components": {}
+            }
+          },
+          "cursor": {
+            "item": "minecraft:honey_block",
+            "count": 1,
+            "components": {}
+          },
+          "selected": 0
+        }
+      ],
+      "expected_dropped": []
+    },
+    {
+      "name": "honey_remainder_inventory",
+      "gamemode": "survival",
+      "setup": {
+        "grid": [
+          {
+            "item": "minecraft:honey_bottle",
+            "count": 2,
+            "components": {}
+          },
+          {
+            "item": "minecraft:honey_bottle",
+            "count": 2,
+            "components": {}
+          },
+          {
+            "item": "minecraft:honey_bottle",
+            "count": 2,
+            "components": {}
+          },
+          {
+            "item": "minecraft:honey_bottle",
+            "count": 2,
+            "components": {}
+          }
+        ],
+        "inventory": {},
+        "cursor": null,
+        "selected": 0
+      },
+      "actions": [
+        {
+          "kind": "click",
+          "slot": 0,
+          "button": 0,
+          "mode": 0,
+          "state_policy": "current"
+        }
+      ],
+      "expected_before": {
+        "slots": {
+          "0": {
+            "item": "minecraft:honey_block",
+            "count": 1,
+            "components": {}
+          },
+          "1": {
+            "item": "minecraft:honey_bottle",
+            "count": 2,
+            "components": {}
+          },
+          "2": {
+            "item": "minecraft:honey_bottle",
+            "count": 2,
+            "components": {}
+          },
+          "3": {
+            "item": "minecraft:honey_bottle",
+            "count": 2,
+            "components": {}
+          },
+          "4": {
+            "item": "minecraft:honey_bottle",
+            "count": 2,
+            "components": {}
+          }
+        },
+        "cursor": null,
+        "selected": 0
+      },
+      "expected_after": [
+        {
+          "slots": {
+            "0": {
+              "item": "minecraft:honey_block",
+              "count": 1,
+              "components": {}
+            },
+            "1": {
+              "item": "minecraft:honey_bottle",
+              "count": 1,
+              "components": {}
+            },
+            "2": {
+              "item": "minecraft:honey_bottle",
+              "count": 1,
+              "components": {}
+            },
+            "3": {
+              "item": "minecraft:honey_bottle",
+              "count": 1,
+              "components": {}
+            },
+            "4": {
+              "item": "minecraft:honey_bottle",
+              "count": 1,
+              "components": {}
+            },
+            "36": {
+              "item": "minecraft:glass_bottle",
+              "count": 4,
+              "components": {}
+            }
+          },
+          "cursor": {
+            "item": "minecraft:honey_block",
+            "count": 1,
+            "components": {}
+          },
+          "selected": 0
+        }
+      ],
+      "expected_dropped": []
+    },
+    {
+      "name": "honey_remainder_overflow",
+      "gamemode": "survival",
+      "setup": {
+        "grid": [
+          {
+            "item": "minecraft:honey_bottle",
+            "count": 2,
+            "components": {}
+          },
+          {
+            "item": "minecraft:honey_bottle",
+            "count": 2,
+            "components": {}
+          },
+          {
+            "item": "minecraft:honey_bottle",
+            "count": 2,
+            "components": {}
+          },
+          {
+            "item": "minecraft:honey_bottle",
+            "count": 2,
+            "components": {}
+          }
+        ],
+        "inventory": {
+          "9": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "10": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "11": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "12": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "13": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "14": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "15": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "16": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "17": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "18": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "19": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "20": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "21": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "22": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "23": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "24": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "25": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "26": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "27": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "28": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "29": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "30": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "31": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "32": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "33": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "34": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "35": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "36": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "37": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "38": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "39": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "40": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "41": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "42": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "43": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "44": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          }
+        },
+        "cursor": null,
+        "selected": 0
+      },
+      "actions": [
+        {
+          "kind": "click",
+          "slot": 0,
+          "button": 0,
+          "mode": 0,
+          "state_policy": "current"
+        }
+      ],
+      "expected_before": {
+        "slots": {
+          "0": {
+            "item": "minecraft:honey_block",
+            "count": 1,
+            "components": {}
+          },
+          "1": {
+            "item": "minecraft:honey_bottle",
+            "count": 2,
+            "components": {}
+          },
+          "2": {
+            "item": "minecraft:honey_bottle",
+            "count": 2,
+            "components": {}
+          },
+          "3": {
+            "item": "minecraft:honey_bottle",
+            "count": 2,
+            "components": {}
+          },
+          "4": {
+            "item": "minecraft:honey_bottle",
+            "count": 2,
+            "components": {}
+          },
+          "9": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "10": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "11": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "12": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "13": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "14": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "15": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "16": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "17": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "18": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "19": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "20": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "21": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "22": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "23": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "24": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "25": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "26": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "27": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "28": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "29": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "30": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "31": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "32": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "33": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "34": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "35": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "36": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "37": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "38": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "39": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "40": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "41": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "42": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "43": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "44": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          }
+        },
+        "cursor": null,
+        "selected": 0
+      },
+      "expected_after": [
+        {
+          "slots": {
+            "0": {
+              "item": "minecraft:honey_block",
+              "count": 1,
+              "components": {}
+            },
+            "1": {
+              "item": "minecraft:honey_bottle",
+              "count": 1,
+              "components": {}
+            },
+            "2": {
+              "item": "minecraft:honey_bottle",
+              "count": 1,
+              "components": {}
+            },
+            "3": {
+              "item": "minecraft:honey_bottle",
+              "count": 1,
+              "components": {}
+            },
+            "4": {
+              "item": "minecraft:honey_bottle",
+              "count": 1,
+              "components": {}
+            },
+            "9": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "10": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "11": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "12": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "13": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "14": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "15": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "16": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "17": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "18": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "19": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "20": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "21": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "22": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "23": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "24": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "25": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "26": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "27": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "28": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "29": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "30": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "31": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "32": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "33": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "34": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "35": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "36": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "37": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "38": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "39": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "40": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "41": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "42": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "43": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "44": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            }
+          },
+          "cursor": {
+            "item": "minecraft:honey_block",
+            "count": 1,
+            "components": {}
+          },
+          "selected": 0
+        }
+      ],
+      "expected_dropped": [
+        {
+          "item": "minecraft:glass_bottle",
+          "count": 4,
+          "components": {}
+        }
+      ]
+    },
+    {
+      "name": "close_returns_grid_cursor",
+      "gamemode": "survival",
+      "setup": {
+        "grid": [
+          {
+            "item": "minecraft:oak_log",
+            "count": 2,
+            "components": {}
+          },
+          null,
+          {
+            "item": "minecraft:coal",
+            "count": 1,
+            "components": {}
+          },
+          null
+        ],
+        "inventory": {},
+        "cursor": {
+          "item": "minecraft:stone",
+          "count": 3,
+          "components": {}
+        },
+        "selected": 0
+      },
+      "actions": [
+        {
+          "kind": "close"
+        }
+      ],
+      "expected_before": {
+        "slots": {
+          "1": {
+            "item": "minecraft:oak_log",
+            "count": 2,
+            "components": {}
+          },
+          "3": {
+            "item": "minecraft:coal",
+            "count": 1,
+            "components": {}
+          }
+        },
+        "cursor": {
+          "item": "minecraft:stone",
+          "count": 3,
+          "components": {}
+        },
+        "selected": 0
+      },
+      "expected_after": [
+        {
+          "slots": {
+            "36": {
+              "item": "minecraft:stone",
+              "count": 3,
+              "components": {}
+            },
+            "37": {
+              "item": "minecraft:oak_log",
+              "count": 2,
+              "components": {}
+            },
+            "38": {
+              "item": "minecraft:coal",
+              "count": 1,
+              "components": {}
+            }
+          },
+          "cursor": null,
+          "selected": 0
+        }
+      ],
+      "expected_dropped": []
+    },
+    {
+      "name": "close_full_inventory",
+      "gamemode": "survival",
+      "setup": {
+        "grid": [
+          {
+            "item": "minecraft:oak_log",
+            "count": 2,
+            "components": {}
+          },
+          null,
+          null,
+          null
+        ],
+        "inventory": {
+          "9": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "10": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "11": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "12": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "13": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "14": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "15": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "16": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "17": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "18": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "19": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "20": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "21": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "22": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "23": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "24": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "25": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "26": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "27": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "28": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "29": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "30": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "31": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "32": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "33": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "34": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "35": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "36": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "37": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "38": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "39": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "40": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "41": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "42": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "43": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "44": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          }
+        },
+        "cursor": {
+          "item": "minecraft:stone",
+          "count": 3,
+          "components": {}
+        },
+        "selected": 0
+      },
+      "actions": [
+        {
+          "kind": "close"
+        }
+      ],
+      "expected_before": {
+        "slots": {
+          "0": {
+            "item": "minecraft:oak_planks",
+            "count": 4,
+            "components": {}
+          },
+          "1": {
+            "item": "minecraft:oak_log",
+            "count": 2,
+            "components": {}
+          },
+          "9": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "10": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "11": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "12": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "13": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "14": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "15": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "16": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "17": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "18": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "19": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "20": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "21": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "22": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "23": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "24": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "25": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "26": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "27": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "28": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "29": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "30": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "31": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "32": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "33": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "34": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "35": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "36": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "37": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "38": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "39": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "40": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "41": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "42": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "43": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "44": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          }
+        },
+        "cursor": {
+          "item": "minecraft:stone",
+          "count": 3,
+          "components": {}
+        },
+        "selected": 0
+      },
+      "expected_after": [
+        {
+          "slots": {
+            "9": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "10": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "11": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "12": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "13": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "14": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "15": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "16": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "17": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "18": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "19": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "20": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "21": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "22": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "23": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "24": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "25": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "26": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "27": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "28": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "29": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "30": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "31": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "32": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "33": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "34": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "35": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "36": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "37": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "38": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "39": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "40": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "41": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "42": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "43": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "44": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            }
+          },
+          "cursor": null,
+          "selected": 0
+        }
+      ],
+      "expected_dropped": [
+        {
+          "item": "minecraft:oak_log",
+          "count": 2,
+          "components": {}
+        },
+        {
+          "item": "minecraft:stone",
+          "count": 3,
+          "components": {}
+        }
+      ]
+    },
+    {
+      "name": "same_stale_state_repeated",
+      "gamemode": "survival",
+      "setup": {
+        "grid": [
+          {
+            "item": "minecraft:oak_log",
+            "count": 2,
+            "components": {}
+          },
+          null,
+          null,
+          null
+        ],
+        "inventory": {},
+        "cursor": null,
+        "selected": 0
+      },
+      "actions": [
+        {
+          "kind": "click",
+          "slot": 0,
+          "button": 0,
+          "mode": 0,
+          "state_policy": "same_stale"
+        },
+        {
+          "kind": "click",
+          "slot": 0,
+          "button": 0,
+          "mode": 0,
+          "state_policy": "same_stale"
+        }
+      ],
+      "expected_before": {
+        "slots": {
+          "0": {
+            "item": "minecraft:oak_planks",
+            "count": 4,
+            "components": {}
+          },
+          "1": {
+            "item": "minecraft:oak_log",
+            "count": 2,
+            "components": {}
+          }
+        },
+        "cursor": null,
+        "selected": 0
+      },
+      "expected_after": [
+        {
+          "slots": {
+            "0": {
+              "item": "minecraft:oak_planks",
+              "count": 4,
+              "components": {}
+            },
+            "1": {
+              "item": "minecraft:oak_log",
+              "count": 1,
+              "components": {}
+            }
+          },
+          "cursor": {
+            "item": "minecraft:oak_planks",
+            "count": 4,
+            "components": {}
+          },
+          "selected": 0
+        },
+        {
+          "slots": {},
+          "cursor": {
+            "item": "minecraft:oak_planks",
+            "count": 8,
+            "components": {}
+          },
+          "selected": 0
+        }
+      ],
+      "expected_dropped": []
+    },
+    {
+      "name": "honey_selected_merge_priority",
+      "gamemode": "survival",
+      "setup": {
+        "grid": [
+          {
+            "item": "minecraft:honey_bottle",
+            "count": 2,
+            "components": {}
+          },
+          {
+            "item": "minecraft:honey_bottle",
+            "count": 2,
+            "components": {}
+          },
+          {
+            "item": "minecraft:honey_bottle",
+            "count": 2,
+            "components": {}
+          },
+          {
+            "item": "minecraft:honey_bottle",
+            "count": 2,
+            "components": {}
+          }
+        ],
+        "inventory": {
+          "38": {
+            "item": "minecraft:glass_bottle",
+            "count": 60,
+            "components": {}
+          },
+          "45": {
+            "item": "minecraft:glass_bottle",
+            "count": 60,
+            "components": {}
+          },
+          "36": {
+            "item": "minecraft:glass_bottle",
+            "count": 60,
+            "components": {}
+          },
+          "9": {
+            "item": "minecraft:glass_bottle",
+            "count": 60,
+            "components": {}
+          }
+        },
+        "cursor": null,
+        "selected": 2
+      },
+      "actions": [
+        {
+          "kind": "click",
+          "slot": 0,
+          "button": 0,
+          "mode": 0,
+          "state_policy": "current"
+        }
+      ],
+      "expected_before": {
+        "slots": {
+          "0": {
+            "item": "minecraft:honey_block",
+            "count": 1,
+            "components": {}
+          },
+          "1": {
+            "item": "minecraft:honey_bottle",
+            "count": 2,
+            "components": {}
+          },
+          "2": {
+            "item": "minecraft:honey_bottle",
+            "count": 2,
+            "components": {}
+          },
+          "3": {
+            "item": "minecraft:honey_bottle",
+            "count": 2,
+            "components": {}
+          },
+          "4": {
+            "item": "minecraft:honey_bottle",
+            "count": 2,
+            "components": {}
+          },
+          "9": {
+            "item": "minecraft:glass_bottle",
+            "count": 60,
+            "components": {}
+          },
+          "36": {
+            "item": "minecraft:glass_bottle",
+            "count": 60,
+            "components": {}
+          },
+          "38": {
+            "item": "minecraft:glass_bottle",
+            "count": 60,
+            "components": {}
+          },
+          "45": {
+            "item": "minecraft:glass_bottle",
+            "count": 60,
+            "components": {}
+          }
+        },
+        "cursor": null,
+        "selected": 2
+      },
+      "expected_after": [
+        {
+          "slots": {
+            "0": {
+              "item": "minecraft:honey_block",
+              "count": 1,
+              "components": {}
+            },
+            "1": {
+              "item": "minecraft:honey_bottle",
+              "count": 1,
+              "components": {}
+            },
+            "2": {
+              "item": "minecraft:honey_bottle",
+              "count": 1,
+              "components": {}
+            },
+            "3": {
+              "item": "minecraft:honey_bottle",
+              "count": 1,
+              "components": {}
+            },
+            "4": {
+              "item": "minecraft:honey_bottle",
+              "count": 1,
+              "components": {}
+            },
+            "9": {
+              "item": "minecraft:glass_bottle",
+              "count": 60,
+              "components": {}
+            },
+            "36": {
+              "item": "minecraft:glass_bottle",
+              "count": 60,
+              "components": {}
+            },
+            "38": {
+              "item": "minecraft:glass_bottle",
+              "count": 64,
+              "components": {}
+            },
+            "45": {
+              "item": "minecraft:glass_bottle",
+              "count": 60,
+              "components": {}
+            }
+          },
+          "cursor": {
+            "item": "minecraft:honey_block",
+            "count": 1,
+            "components": {}
+          },
+          "selected": 2
+        }
+      ],
+      "expected_dropped": []
+    },
+    {
+      "name": "honey_offhand_merge_priority",
+      "gamemode": "survival",
+      "setup": {
+        "grid": [
+          {
+            "item": "minecraft:honey_bottle",
+            "count": 2,
+            "components": {}
+          },
+          {
+            "item": "minecraft:honey_bottle",
+            "count": 2,
+            "components": {}
+          },
+          {
+            "item": "minecraft:honey_bottle",
+            "count": 2,
+            "components": {}
+          },
+          {
+            "item": "minecraft:honey_bottle",
+            "count": 2,
+            "components": {}
+          }
+        ],
+        "inventory": {
+          "45": {
+            "item": "minecraft:glass_bottle",
+            "count": 60,
+            "components": {}
+          },
+          "36": {
+            "item": "minecraft:glass_bottle",
+            "count": 60,
+            "components": {}
+          },
+          "9": {
+            "item": "minecraft:glass_bottle",
+            "count": 60,
+            "components": {}
+          }
+        },
+        "cursor": null,
+        "selected": 2
+      },
+      "actions": [
+        {
+          "kind": "click",
+          "slot": 0,
+          "button": 0,
+          "mode": 0,
+          "state_policy": "current"
+        }
+      ],
+      "expected_before": {
+        "slots": {
+          "0": {
+            "item": "minecraft:honey_block",
+            "count": 1,
+            "components": {}
+          },
+          "1": {
+            "item": "minecraft:honey_bottle",
+            "count": 2,
+            "components": {}
+          },
+          "2": {
+            "item": "minecraft:honey_bottle",
+            "count": 2,
+            "components": {}
+          },
+          "3": {
+            "item": "minecraft:honey_bottle",
+            "count": 2,
+            "components": {}
+          },
+          "4": {
+            "item": "minecraft:honey_bottle",
+            "count": 2,
+            "components": {}
+          },
+          "9": {
+            "item": "minecraft:glass_bottle",
+            "count": 60,
+            "components": {}
+          },
+          "36": {
+            "item": "minecraft:glass_bottle",
+            "count": 60,
+            "components": {}
+          },
+          "45": {
+            "item": "minecraft:glass_bottle",
+            "count": 60,
+            "components": {}
+          }
+        },
+        "cursor": null,
+        "selected": 2
+      },
+      "expected_after": [
+        {
+          "slots": {
+            "0": {
+              "item": "minecraft:honey_block",
+              "count": 1,
+              "components": {}
+            },
+            "1": {
+              "item": "minecraft:honey_bottle",
+              "count": 1,
+              "components": {}
+            },
+            "2": {
+              "item": "minecraft:honey_bottle",
+              "count": 1,
+              "components": {}
+            },
+            "3": {
+              "item": "minecraft:honey_bottle",
+              "count": 1,
+              "components": {}
+            },
+            "4": {
+              "item": "minecraft:honey_bottle",
+              "count": 1,
+              "components": {}
+            },
+            "9": {
+              "item": "minecraft:glass_bottle",
+              "count": 60,
+              "components": {}
+            },
+            "36": {
+              "item": "minecraft:glass_bottle",
+              "count": 60,
+              "components": {}
+            },
+            "45": {
+              "item": "minecraft:glass_bottle",
+              "count": 64,
+              "components": {}
+            }
+          },
+          "cursor": {
+            "item": "minecraft:honey_block",
+            "count": 1,
+            "components": {}
+          },
+          "selected": 2
+        }
+      ],
+      "expected_dropped": []
+    },
+    {
+      "name": "honey_empty_hotbar_order",
+      "gamemode": "survival",
+      "setup": {
+        "grid": [
+          {
+            "item": "minecraft:honey_bottle",
+            "count": 2,
+            "components": {}
+          },
+          {
+            "item": "minecraft:honey_bottle",
+            "count": 2,
+            "components": {}
+          },
+          {
+            "item": "minecraft:honey_bottle",
+            "count": 2,
+            "components": {}
+          },
+          {
+            "item": "minecraft:honey_bottle",
+            "count": 2,
+            "components": {}
+          }
+        ],
+        "inventory": {},
+        "cursor": null,
+        "selected": 2
+      },
+      "actions": [
+        {
+          "kind": "click",
+          "slot": 0,
+          "button": 0,
+          "mode": 0,
+          "state_policy": "current"
+        }
+      ],
+      "expected_before": {
+        "slots": {
+          "0": {
+            "item": "minecraft:honey_block",
+            "count": 1,
+            "components": {}
+          },
+          "1": {
+            "item": "minecraft:honey_bottle",
+            "count": 2,
+            "components": {}
+          },
+          "2": {
+            "item": "minecraft:honey_bottle",
+            "count": 2,
+            "components": {}
+          },
+          "3": {
+            "item": "minecraft:honey_bottle",
+            "count": 2,
+            "components": {}
+          },
+          "4": {
+            "item": "minecraft:honey_bottle",
+            "count": 2,
+            "components": {}
+          }
+        },
+        "cursor": null,
+        "selected": 2
+      },
+      "expected_after": [
+        {
+          "slots": {
+            "0": {
+              "item": "minecraft:honey_block",
+              "count": 1,
+              "components": {}
+            },
+            "1": {
+              "item": "minecraft:honey_bottle",
+              "count": 1,
+              "components": {}
+            },
+            "2": {
+              "item": "minecraft:honey_bottle",
+              "count": 1,
+              "components": {}
+            },
+            "3": {
+              "item": "minecraft:honey_bottle",
+              "count": 1,
+              "components": {}
+            },
+            "4": {
+              "item": "minecraft:honey_bottle",
+              "count": 1,
+              "components": {}
+            },
+            "36": {
+              "item": "minecraft:glass_bottle",
+              "count": 4,
+              "components": {}
+            }
+          },
+          "cursor": {
+            "item": "minecraft:honey_block",
+            "count": 1,
+            "components": {}
+          },
+          "selected": 2
+        }
+      ],
+      "expected_dropped": []
+    },
+    {
+      "name": "honey_main_merge_before_empty",
+      "gamemode": "survival",
+      "setup": {
+        "grid": [
+          {
+            "item": "minecraft:honey_bottle",
+            "count": 2,
+            "components": {}
+          },
+          {
+            "item": "minecraft:honey_bottle",
+            "count": 2,
+            "components": {}
+          },
+          {
+            "item": "minecraft:honey_bottle",
+            "count": 2,
+            "components": {}
+          },
+          {
+            "item": "minecraft:honey_bottle",
+            "count": 2,
+            "components": {}
+          }
+        ],
+        "inventory": {
+          "9": {
+            "item": "minecraft:glass_bottle",
+            "count": 60,
+            "components": {}
+          }
+        },
+        "cursor": null,
+        "selected": 2
+      },
+      "actions": [
+        {
+          "kind": "click",
+          "slot": 0,
+          "button": 0,
+          "mode": 0,
+          "state_policy": "current"
+        }
+      ],
+      "expected_before": {
+        "slots": {
+          "0": {
+            "item": "minecraft:honey_block",
+            "count": 1,
+            "components": {}
+          },
+          "1": {
+            "item": "minecraft:honey_bottle",
+            "count": 2,
+            "components": {}
+          },
+          "2": {
+            "item": "minecraft:honey_bottle",
+            "count": 2,
+            "components": {}
+          },
+          "3": {
+            "item": "minecraft:honey_bottle",
+            "count": 2,
+            "components": {}
+          },
+          "4": {
+            "item": "minecraft:honey_bottle",
+            "count": 2,
+            "components": {}
+          },
+          "9": {
+            "item": "minecraft:glass_bottle",
+            "count": 60,
+            "components": {}
+          }
+        },
+        "cursor": null,
+        "selected": 2
+      },
+      "expected_after": [
+        {
+          "slots": {
+            "0": {
+              "item": "minecraft:honey_block",
+              "count": 1,
+              "components": {}
+            },
+            "1": {
+              "item": "minecraft:honey_bottle",
+              "count": 1,
+              "components": {}
+            },
+            "2": {
+              "item": "minecraft:honey_bottle",
+              "count": 1,
+              "components": {}
+            },
+            "3": {
+              "item": "minecraft:honey_bottle",
+              "count": 1,
+              "components": {}
+            },
+            "4": {
+              "item": "minecraft:honey_bottle",
+              "count": 1,
+              "components": {}
+            },
+            "9": {
+              "item": "minecraft:glass_bottle",
+              "count": 64,
+              "components": {}
+            }
+          },
+          "cursor": {
+            "item": "minecraft:honey_block",
+            "count": 1,
+            "components": {}
+          },
+          "selected": 2
+        }
+      ],
+      "expected_dropped": []
+    },
+    {
+      "name": "close_selected_merge_priority",
+      "gamemode": "survival",
+      "setup": {
+        "grid": [
+          {
+            "item": "minecraft:glass_bottle",
+            "count": 2,
+            "components": {}
+          },
+          null,
+          null,
+          null
+        ],
+        "inventory": {
+          "38": {
+            "item": "minecraft:glass_bottle",
+            "count": 60,
+            "components": {}
+          },
+          "45": {
+            "item": "minecraft:glass_bottle",
+            "count": 60,
+            "components": {}
+          },
+          "36": {
+            "item": "minecraft:glass_bottle",
+            "count": 60,
+            "components": {}
+          },
+          "9": {
+            "item": "minecraft:glass_bottle",
+            "count": 60,
+            "components": {}
+          }
+        },
+        "cursor": {
+          "item": "minecraft:glass_bottle",
+          "count": 2,
+          "components": {}
+        },
+        "selected": 2
+      },
+      "actions": [
+        {
+          "kind": "close"
+        }
+      ],
+      "expected_before": {
+        "slots": {
+          "1": {
+            "item": "minecraft:glass_bottle",
+            "count": 2,
+            "components": {}
+          },
+          "9": {
+            "item": "minecraft:glass_bottle",
+            "count": 60,
+            "components": {}
+          },
+          "36": {
+            "item": "minecraft:glass_bottle",
+            "count": 60,
+            "components": {}
+          },
+          "38": {
+            "item": "minecraft:glass_bottle",
+            "count": 60,
+            "components": {}
+          },
+          "45": {
+            "item": "minecraft:glass_bottle",
+            "count": 60,
+            "components": {}
+          }
+        },
+        "cursor": {
+          "item": "minecraft:glass_bottle",
+          "count": 2,
+          "components": {}
+        },
+        "selected": 2
+      },
+      "expected_after": [
+        {
+          "slots": {
+            "9": {
+              "item": "minecraft:glass_bottle",
+              "count": 60,
+              "components": {}
+            },
+            "36": {
+              "item": "minecraft:glass_bottle",
+              "count": 60,
+              "components": {}
+            },
+            "38": {
+              "item": "minecraft:glass_bottle",
+              "count": 64,
+              "components": {}
+            },
+            "45": {
+              "item": "minecraft:glass_bottle",
+              "count": 60,
+              "components": {}
+            }
+          },
+          "cursor": null,
+          "selected": 2
+        }
+      ],
+      "expected_dropped": []
+    },
+    {
+      "name": "creative_honey_overflow",
+      "gamemode": "creative",
+      "setup": {
+        "grid": [
+          {
+            "item": "minecraft:honey_bottle",
+            "count": 2,
+            "components": {}
+          },
+          {
+            "item": "minecraft:honey_bottle",
+            "count": 2,
+            "components": {}
+          },
+          {
+            "item": "minecraft:honey_bottle",
+            "count": 2,
+            "components": {}
+          },
+          {
+            "item": "minecraft:honey_bottle",
+            "count": 2,
+            "components": {}
+          }
+        ],
+        "inventory": {
+          "9": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "10": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "11": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "12": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "13": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "14": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "15": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "16": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "17": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "18": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "19": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "20": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "21": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "22": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "23": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "24": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "25": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "26": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "27": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "28": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "29": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "30": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "31": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "32": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "33": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "34": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "35": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "36": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "37": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "38": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "39": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "40": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "41": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "42": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "43": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "44": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          }
+        },
+        "cursor": null,
+        "selected": 0
+      },
+      "actions": [
+        {
+          "kind": "click",
+          "slot": 0,
+          "button": 0,
+          "mode": 0,
+          "state_policy": "current"
+        }
+      ],
+      "expected_before": {
+        "slots": {
+          "0": {
+            "item": "minecraft:honey_block",
+            "count": 1,
+            "components": {}
+          },
+          "1": {
+            "item": "minecraft:honey_bottle",
+            "count": 2,
+            "components": {}
+          },
+          "2": {
+            "item": "minecraft:honey_bottle",
+            "count": 2,
+            "components": {}
+          },
+          "3": {
+            "item": "minecraft:honey_bottle",
+            "count": 2,
+            "components": {}
+          },
+          "4": {
+            "item": "minecraft:honey_bottle",
+            "count": 2,
+            "components": {}
+          },
+          "9": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "10": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "11": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "12": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "13": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "14": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "15": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "16": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "17": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "18": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "19": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "20": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "21": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "22": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "23": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "24": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "25": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "26": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "27": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "28": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "29": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "30": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "31": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "32": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "33": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "34": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "35": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "36": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "37": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "38": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "39": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "40": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "41": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "42": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "43": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "44": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          }
+        },
+        "cursor": null,
+        "selected": 0
+      },
+      "expected_after": [
+        {
+          "slots": {
+            "0": {
+              "item": "minecraft:honey_block",
+              "count": 1,
+              "components": {}
+            },
+            "1": {
+              "item": "minecraft:honey_bottle",
+              "count": 1,
+              "components": {}
+            },
+            "2": {
+              "item": "minecraft:honey_bottle",
+              "count": 1,
+              "components": {}
+            },
+            "3": {
+              "item": "minecraft:honey_bottle",
+              "count": 1,
+              "components": {}
+            },
+            "4": {
+              "item": "minecraft:honey_bottle",
+              "count": 1,
+              "components": {}
+            },
+            "9": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "10": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "11": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "12": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "13": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "14": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "15": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "16": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "17": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "18": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "19": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "20": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "21": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "22": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "23": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "24": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "25": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "26": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "27": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "28": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "29": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "30": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "31": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "32": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "33": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "34": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "35": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "36": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "37": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "38": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "39": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "40": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "41": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "42": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "43": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "44": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            }
+          },
+          "cursor": {
+            "item": "minecraft:honey_block",
+            "count": 1,
+            "components": {}
+          },
+          "selected": 0
+        }
+      ],
+      "expected_dropped": []
+    },
+    {
+      "name": "creative_close_full_inventory",
+      "gamemode": "creative",
+      "setup": {
+        "grid": [
+          {
+            "item": "minecraft:oak_log",
+            "count": 2,
+            "components": {}
+          },
+          null,
+          null,
+          null
+        ],
+        "inventory": {
+          "9": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "10": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "11": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "12": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "13": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "14": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "15": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "16": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "17": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "18": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "19": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "20": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "21": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "22": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "23": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "24": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "25": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "26": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "27": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "28": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "29": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "30": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "31": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "32": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "33": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "34": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "35": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "36": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "37": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "38": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "39": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "40": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "41": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "42": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "43": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "44": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          }
+        },
+        "cursor": {
+          "item": "minecraft:stone",
+          "count": 3,
+          "components": {}
+        },
+        "selected": 0
+      },
+      "actions": [
+        {
+          "kind": "close"
+        }
+      ],
+      "expected_before": {
+        "slots": {
+          "0": {
+            "item": "minecraft:oak_planks",
+            "count": 4,
+            "components": {}
+          },
+          "1": {
+            "item": "minecraft:oak_log",
+            "count": 2,
+            "components": {}
+          },
+          "9": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "10": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "11": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "12": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "13": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "14": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "15": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "16": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "17": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "18": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "19": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "20": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "21": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "22": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "23": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "24": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "25": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "26": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "27": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "28": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "29": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "30": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "31": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "32": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "33": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "34": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "35": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "36": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "37": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "38": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "39": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "40": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "41": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "42": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "43": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          },
+          "44": {
+            "item": "minecraft:stone",
+            "count": 64,
+            "components": {}
+          }
+        },
+        "cursor": {
+          "item": "minecraft:stone",
+          "count": 3,
+          "components": {}
+        },
+        "selected": 0
+      },
+      "expected_after": [
+        {
+          "slots": {
+            "9": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "10": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "11": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "12": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "13": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "14": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "15": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "16": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "17": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "18": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "19": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "20": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "21": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "22": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "23": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "24": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "25": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "26": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "27": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "28": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "29": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "30": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "31": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "32": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "33": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "34": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "35": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "36": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "37": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "38": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "39": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "40": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "41": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "42": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "43": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            },
+            "44": {
+              "item": "minecraft:stone",
+              "count": 64,
+              "components": {}
+            }
+          },
+          "cursor": null,
+          "selected": 0
+        }
+      ],
+      "expected_dropped": [
+        {
+          "item": "minecraft:oak_log",
+          "count": 2,
+          "components": {}
+        },
+        {
+          "item": "minecraft:stone",
+          "count": 3,
+          "components": {}
+        }
+      ]
+    },
+    {
+      "name": "grid_drag_excludes_result",
+      "gamemode": "survival",
+      "setup": {
+        "grid": [
+          null,
+          null,
+          null,
+          null
+        ],
+        "inventory": {},
+        "cursor": {
+          "item": "minecraft:oak_planks",
+          "count": 6,
+          "components": {}
+        },
+        "selected": 0
+      },
+      "actions": [
+        {
+          "kind": "click",
+          "slot": -999,
+          "button": 0,
+          "mode": 5,
+          "state_policy": "current"
+        },
+        {
+          "kind": "click",
+          "slot": 1,
+          "button": 1,
+          "mode": 5,
+          "state_policy": "current"
+        },
+        {
+          "kind": "click",
+          "slot": 3,
+          "button": 1,
+          "mode": 5,
+          "state_policy": "current"
+        },
+        {
+          "kind": "click",
+          "slot": 0,
+          "button": 1,
+          "mode": 5,
+          "state_policy": "current"
+        },
+        {
+          "kind": "click",
+          "slot": -999,
+          "button": 2,
+          "mode": 5,
+          "state_policy": "current"
+        }
+      ],
+      "expected_before": {
+        "slots": {},
+        "cursor": {
+          "item": "minecraft:oak_planks",
+          "count": 6,
+          "components": {}
+        },
+        "selected": 0
+      },
+      "expected_after": [
+        {
+          "slots": {},
+          "cursor": {
+            "item": "minecraft:oak_planks",
+            "count": 6,
+            "components": {}
+          },
+          "selected": 0
+        },
+        {
+          "slots": {},
+          "cursor": {
+            "item": "minecraft:oak_planks",
+            "count": 6,
+            "components": {}
+          },
+          "selected": 0
+        },
+        {
+          "slots": {},
+          "cursor": {
+            "item": "minecraft:oak_planks",
+            "count": 6,
+            "components": {}
+          },
+          "selected": 0
+        },
+        {
+          "slots": {},
+          "cursor": {
+            "item": "minecraft:oak_planks",
+            "count": 6,
+            "components": {}
+          },
+          "selected": 0
+        },
+        {
+          "slots": {
+            "0": {
+              "item": "minecraft:stick",
+              "count": 4,
+              "components": {}
+            },
+            "1": {
+              "item": "minecraft:oak_planks",
+              "count": 3,
+              "components": {}
+            },
+            "3": {
+              "item": "minecraft:oak_planks",
+              "count": 3,
+              "components": {}
+            }
+          },
+          "cursor": null,
+          "selected": 0
+        }
+      ],
+      "expected_dropped": []
+    },
+    {
+      "name": "pickup_all_collects_real_grid",
+      "gamemode": "survival",
+      "setup": {
+        "grid": [
+          {
+            "item": "minecraft:oak_planks",
+            "count": 3,
+            "components": {}
+          },
+          null,
+          {
+            "item": "minecraft:oak_planks",
+            "count": 3,
+            "components": {}
+          },
+          null
+        ],
+        "inventory": {
+          "10": {
+            "item": "minecraft:oak_planks",
+            "count": 7,
+            "components": {}
+          }
+        },
+        "cursor": {
+          "item": "minecraft:oak_planks",
+          "count": 1,
+          "components": {}
+        },
+        "selected": 0
+      },
+      "actions": [
+        {
+          "kind": "click",
+          "slot": 9,
+          "button": 0,
+          "mode": 6,
+          "state_policy": "current"
+        }
+      ],
+      "expected_before": {
+        "slots": {
+          "0": {
+            "item": "minecraft:stick",
+            "count": 4,
+            "components": {}
+          },
+          "1": {
+            "item": "minecraft:oak_planks",
+            "count": 3,
+            "components": {}
+          },
+          "3": {
+            "item": "minecraft:oak_planks",
+            "count": 3,
+            "components": {}
+          },
+          "10": {
+            "item": "minecraft:oak_planks",
+            "count": 7,
+            "components": {}
+          }
+        },
+        "cursor": {
+          "item": "minecraft:oak_planks",
+          "count": 1,
+          "components": {}
+        },
+        "selected": 0
+      },
+      "expected_after": [
+        {
+          "slots": {},
+          "cursor": {
+            "item": "minecraft:oak_planks",
+            "count": 14,
+            "components": {}
+          },
+          "selected": 0
+        }
+      ],
+      "expected_dropped": []
+    }
+  ]
+}

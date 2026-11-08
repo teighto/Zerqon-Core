@@ -1,5 +1,6 @@
 use crate::{
-    ClickMode, ClickRequest, CreativeSlotRequest, ItemCatalog, ItemError, ItemStack, Slot,
+    ClickMode, ClickRequest, CraftingMatch, CraftingRecipes, CraftingRemainders,
+    CreativeSlotRequest, ItemCatalog, ItemError, ItemStack, Slot,
 };
 use std::collections::BTreeSet;
 
@@ -34,7 +35,7 @@ pub enum InventoryError {
     InvalidStateId,
     #[error("invalid inventory slot: {0}")]
     InvalidSlot(i16),
-    #[error("crafting and equipment slot behavior is not implemented: {0}")]
+    #[error("slot behavior is not supported by this menu: {0}")]
     UnsupportedSlot(i16),
     #[error("invalid button for inventory action")]
     InvalidButton,
@@ -46,6 +47,8 @@ pub enum InventoryError {
     DroppingUnavailable,
     #[error("invalid changed-slot prediction")]
     InvalidPrediction,
+    #[error("crafting repetition exceeded its bounded input budget")]
+    CraftingLimit,
     #[error(transparent)]
     Item(#[from] ItemError),
 }
@@ -63,6 +66,18 @@ pub struct InventoryEffects {
 struct DragState {
     kind: u8,
     slots: BTreeSet<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlotAccess {
+    Generic,
+    PersonalCrafting,
+}
+
+#[derive(Clone, Copy)]
+enum ReturnSource {
+    Remainder,
+    Closing,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,6 +102,350 @@ impl Default for PlayerInventory {
 }
 
 impl PlayerInventory {
+    /// Apply a personal-menu action atomically, deriving slot zero from real
+    /// inputs before and after the action. Predictions never supply item value.
+    /// A denied drop rolls back the entire action, including earlier batches.
+    pub fn click_with_crafting(
+        &mut self,
+        catalog: &ItemCatalog,
+        request: &ClickRequest,
+        policy: InventoryPolicy,
+        recipes: &CraftingRecipes,
+        remainders: &CraftingRemainders,
+    ) -> Result<InventoryEffects, InventoryError> {
+        if !policy.can_interact {
+            return Err(InventoryError::InteractionDenied);
+        }
+        if request.container_id != 0 {
+            return Err(InventoryError::WrongContainer);
+        }
+        if !(0..=32767).contains(&request.state_id) {
+            return Err(InventoryError::InvalidStateId);
+        }
+        validate_request(request, SlotAccess::PersonalCrafting)?;
+        let mut next = self.clone();
+        next.update_crafting(catalog, recipes)?;
+        let mut drops = Vec::new();
+        if request.mode != ClickMode::QuickCraft && next.drag.take().is_some() {
+            return Ok(self.commit(next, drops));
+        }
+        let access = SlotAccess::PersonalCrafting;
+        match request.mode {
+            ClickMode::QuickCraft => next.quick_craft(
+                catalog,
+                request.slot,
+                request.button,
+                policy,
+                &mut drops,
+                access,
+            )?,
+            ClickMode::PickupAll => {
+                next.pickup_all(catalog, request.slot, request.button, access)?
+            }
+            ClickMode::Clone if !policy.creative => {}
+            _ if request.slot == 0 => {
+                next.craft_result_action(catalog, request, policy, recipes, remainders, &mut drops)?
+            }
+            ClickMode::Pickup => next.pickup(
+                catalog,
+                request.slot,
+                request.button,
+                policy,
+                &mut drops,
+                access,
+            )?,
+            ClickMode::QuickMove => next.quick_move(catalog, request.slot, access)?,
+            ClickMode::Swap => next.swap(request.slot, request.button, access)?,
+            ClickMode::Clone => next.clone_stack(catalog, request.slot, policy, access)?,
+            ClickMode::Throw => {
+                next.throw(request.slot, request.button, policy, &mut drops, access)?
+            }
+        }
+        next.update_crafting(catalog, recipes)?;
+        Ok(self.commit(next, drops))
+    }
+
+    /// Creative writes may target real menu slots, never the derived result.
+    pub fn creative_set_with_crafting(
+        &mut self,
+        catalog: &ItemCatalog,
+        request: &CreativeSlotRequest,
+        policy: InventoryPolicy,
+        recipes: &CraftingRecipes,
+    ) -> Result<InventoryEffects, InventoryError> {
+        let mut next = self.clone();
+        let effects = next.creative_set(catalog, request, policy)?;
+        next.update_crafting(catalog, recipes)?;
+        Ok(self.commit(next, effects.drops))
+    }
+
+    /// Recompute the derived preview after trusted loading or input updates.
+    pub fn refresh_crafting(
+        &mut self,
+        catalog: &ItemCatalog,
+        recipes: &CraftingRecipes,
+    ) -> Result<InventoryEffects, InventoryError> {
+        let mut next = self.clone();
+        next.update_crafting(catalog, recipes)?;
+        Ok(self.commit(next, Vec::new()))
+    }
+
+    /// Return the cursor, then real crafting inputs, clearing the virtual result.
+    /// Cleanup is allowed when ordinary interaction is denied. When a needed
+    /// drop is forbidden, the original cursor, grid, preview and drag survive.
+    pub fn close_crafting(
+        &mut self,
+        catalog: &ItemCatalog,
+        policy: InventoryPolicy,
+    ) -> Result<InventoryEffects, InventoryError> {
+        let mut next = self.clone();
+        next.validate_real_contents(catalog)?;
+        let mut drops = Vec::new();
+        if let Some(cursor) = next.cursor.take() {
+            next.return_to_inventory(catalog, cursor, policy, &mut drops, ReturnSource::Closing)?;
+        }
+        for slot in 1..=4 {
+            if let Some(input) = next.slots[slot].take() {
+                next.return_to_inventory(
+                    catalog,
+                    input,
+                    policy,
+                    &mut drops,
+                    ReturnSource::Closing,
+                )?;
+            }
+        }
+        next.slots[0] = None;
+        next.drag = None;
+        Ok(self.commit(next, drops))
+    }
+
+    fn validate_real_contents(&self, catalog: &ItemCatalog) -> Result<(), InventoryError> {
+        for slot in self
+            .slots
+            .iter()
+            .skip(1)
+            .chain(std::iter::once(&self.cursor))
+        {
+            validate_slot(catalog, slot)?;
+        }
+        Ok(())
+    }
+
+    fn crafting_grid(&self) -> [Slot; 4] {
+        std::array::from_fn(|index| self.slots[index + 1].clone())
+    }
+
+    fn update_crafting(
+        &mut self,
+        catalog: &ItemCatalog,
+        recipes: &CraftingRecipes,
+    ) -> Result<(), InventoryError> {
+        self.validate_real_contents(catalog)?;
+        self.slots[0] = recipes
+            .find_match(&self.crafting_grid(), catalog)?
+            .map(|matched| matched.output);
+        Ok(())
+    }
+
+    fn craft_result_action(
+        &mut self,
+        catalog: &ItemCatalog,
+        request: &ClickRequest,
+        policy: InventoryPolicy,
+        recipes: &CraftingRecipes,
+        remainders: &CraftingRemainders,
+        drops: &mut Vec<ItemStack>,
+    ) -> Result<(), InventoryError> {
+        let Some(first) = recipes.find_match(&self.crafting_grid(), catalog)? else {
+            return Ok(());
+        };
+        if request.mode == ClickMode::Clone {
+            if policy.creative && self.cursor.is_none() {
+                self.cursor = Some(
+                    first
+                        .output
+                        .with_count(catalog.effective_max_stack(&first.output)?)?,
+                );
+            }
+            return Ok(());
+        }
+        let budget: usize = self.slots[1..=4]
+            .iter()
+            .flatten()
+            .map(|stack| usize::from(stack.count()))
+            .sum();
+        let repeating = request.mode == ClickMode::QuickMove
+            || (request.mode == ClickMode::Throw && request.button == 1);
+        let mut crafted = 0;
+        while let Some(matched) = recipes.find_match(&self.crafting_grid(), catalog)? {
+            if !catalog.same_kind(&first.output, &matched.output)? {
+                break;
+            }
+            let mut leftover = None;
+            match request.mode {
+                ClickMode::Pickup => {
+                    generic_slot(catalog, &self.cursor)?;
+                    let count = if let Some(cursor) = &self.cursor {
+                        if !catalog.same_kind(cursor, &matched.output)? {
+                            break;
+                        }
+                        u16::from(cursor.count()) + u16::from(matched.output.count())
+                    } else {
+                        u16::from(matched.output.count())
+                    };
+                    if count > u16::from(catalog.effective_max_stack(&matched.output)?) {
+                        break;
+                    }
+                    self.cursor = Some(matched.output.with_count(count as u8)?);
+                }
+                ClickMode::QuickMove => {
+                    let indexes: Vec<_> = (9..45).rev().collect();
+                    let remaining =
+                        self.insert_stack(catalog, &matched.output, &indexes, &indexes)?;
+                    if remaining == matched.output.count() {
+                        break;
+                    }
+                    leftover = quantity(&matched.output, remaining)?;
+                }
+                ClickMode::Swap => {
+                    let target = if request.button == 40 {
+                        45
+                    } else {
+                        36 + request.button as usize
+                    };
+                    if self.slots[target].is_some() {
+                        break;
+                    }
+                    self.slots[target] = Some(matched.output.clone());
+                }
+                ClickMode::Throw => {
+                    if self.cursor.is_some() {
+                        break;
+                    }
+                    leftover = Some(matched.output.clone());
+                }
+                _ => return Err(InventoryError::InvalidButton),
+            }
+            if crafted >= budget {
+                return Err(InventoryError::CraftingLimit);
+            }
+            self.consume_recipe(catalog, &matched, remainders, policy, drops)?;
+            if let Some(stack) = leftover {
+                drop_stack(stack, policy, drops)?;
+            }
+            crafted += 1;
+            if !repeating {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn consume_recipe(
+        &mut self,
+        catalog: &ItemCatalog,
+        matched: &CraftingMatch,
+        remainders: &CraftingRemainders,
+        policy: InventoryPolicy,
+        drops: &mut Vec<ItemStack>,
+    ) -> Result<(), InventoryError> {
+        for &index in &matched.consumed_slots {
+            let slot = index + 1;
+            let input = self.slots[slot]
+                .take()
+                .ok_or(ItemError::Invalid("missing consumed crafting input"))?;
+            self.slots[slot] = quantity(&input, input.count() - 1)?;
+            let Some(remainder) = remainders.get(input.item()) else {
+                continue;
+            };
+            catalog.validate_stack(remainder)?;
+            match &self.slots[slot] {
+                None => self.slots[slot] = Some(remainder.clone()),
+                Some(left) if catalog.same_kind(left, remainder)? => {
+                    let count = u16::from(left.count()) + u16::from(remainder.count());
+                    if count > u16::from(catalog.effective_max_stack(left)?) {
+                        return Err(ItemError::Invalid(
+                            "crafting remainder exceeds input stack limit",
+                        )
+                        .into());
+                    }
+                    self.slots[slot] = Some(left.with_count(count as u8)?);
+                }
+                Some(_) => self.return_to_inventory(
+                    catalog,
+                    remainder.clone(),
+                    policy,
+                    drops,
+                    ReturnSource::Remainder,
+                )?,
+            }
+        }
+        Ok(())
+    }
+
+    fn insert_stack(
+        &mut self,
+        catalog: &ItemCatalog,
+        stack: &ItemStack,
+        merge_indexes: &[usize],
+        empty_indexes: &[usize],
+    ) -> Result<u8, InventoryError> {
+        catalog.validate_stack(stack)?;
+        let maximum = catalog.effective_max_stack(stack)?;
+        let mut remaining = stack.count();
+        for &index in merge_indexes {
+            if let Some(target) = &self.slots[index]
+                && catalog.same_kind(target, stack)?
+            {
+                let amount = remaining.min(maximum.saturating_sub(target.count()));
+                self.slots[index] = quantity(target, target.count() + amount)?;
+                remaining -= amount;
+                if remaining == 0 {
+                    return Ok(0);
+                }
+            }
+        }
+        for &index in empty_indexes {
+            if self.slots[index].is_none() {
+                let amount = remaining.min(maximum);
+                self.slots[index] = quantity(stack, amount)?;
+                remaining -= amount;
+                if remaining == 0 {
+                    return Ok(0);
+                }
+            }
+        }
+        Ok(remaining)
+    }
+
+    fn return_to_inventory(
+        &mut self,
+        catalog: &ItemCatalog,
+        stack: ItemStack,
+        policy: InventoryPolicy,
+        drops: &mut Vec<ItemStack>,
+        source: ReturnSource,
+    ) -> Result<(), InventoryError> {
+        let selected = 36 + usize::from(self.selected);
+        let main: Vec<_> = (36..45).chain(9..36).collect();
+        let merge: Vec<_> = std::iter::once(selected)
+            .chain(std::iter::once(45))
+            .chain(main.iter().copied().filter(|index| *index != selected))
+            .collect();
+        let remaining = self.insert_stack(catalog, &stack, &merge, &main)?;
+        if remaining != 0 {
+            // Original Inventory.add discards unplaceable crafting remainders
+            // in Creative. Menu removal uses placeItemBackInInventory instead,
+            // which still drops its overflow even for Creative players.
+            if policy.creative && matches!(source, ReturnSource::Remainder) {
+                return Ok(());
+            }
+            drop_stack(stack.with_count(remaining)?, policy, drops)?;
+        }
+        Ok(())
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -181,7 +540,7 @@ impl PlayerInventory {
         if !(0..=32767).contains(&request.state_id) {
             return Err(InventoryError::InvalidStateId);
         }
-        validate_request(request)?;
+        validate_request(request, SlotAccess::Generic)?;
         if request.mode == ClickMode::Clone && !policy.creative {
             return Err(InventoryError::CreativeRequired);
         }
@@ -191,17 +550,37 @@ impl PlayerInventory {
             return Ok(self.commit(next, drops));
         }
         match request.mode {
-            ClickMode::Pickup => {
-                next.pickup(catalog, request.slot, request.button, policy, &mut drops)?
+            ClickMode::Pickup => next.pickup(
+                catalog,
+                request.slot,
+                request.button,
+                policy,
+                &mut drops,
+                SlotAccess::Generic,
+            )?,
+            ClickMode::QuickMove => next.quick_move(catalog, request.slot, SlotAccess::Generic)?,
+            ClickMode::Swap => next.swap(request.slot, request.button, SlotAccess::Generic)?,
+            ClickMode::Clone => {
+                next.clone_stack(catalog, request.slot, policy, SlotAccess::Generic)?
             }
-            ClickMode::QuickMove => next.quick_move(catalog, request.slot)?,
-            ClickMode::Swap => next.swap(request.slot, request.button)?,
-            ClickMode::Clone => next.clone_stack(catalog, request.slot, policy)?,
-            ClickMode::Throw => next.throw(request.slot, request.button, policy, &mut drops)?,
-            ClickMode::QuickCraft => {
-                next.quick_craft(catalog, request.slot, request.button, policy, &mut drops)?
+            ClickMode::Throw => next.throw(
+                request.slot,
+                request.button,
+                policy,
+                &mut drops,
+                SlotAccess::Generic,
+            )?,
+            ClickMode::QuickCraft => next.quick_craft(
+                catalog,
+                request.slot,
+                request.button,
+                policy,
+                &mut drops,
+                SlotAccess::Generic,
+            )?,
+            ClickMode::PickupAll => {
+                next.pickup_all(catalog, request.slot, request.button, SlotAccess::Generic)?
             }
-            ClickMode::PickupAll => next.pickup_all(catalog, request.slot, request.button)?,
         }
         Ok(self.commit(next, drops))
     }
@@ -234,6 +613,7 @@ impl PlayerInventory {
         button: i8,
         policy: InventoryPolicy,
         drops: &mut Vec<ItemStack>,
+        access: SlotAccess,
     ) -> Result<(), InventoryError> {
         if slot == -999 {
             if self.cursor.is_some() && !policy.allow_drops {
@@ -246,7 +626,7 @@ impl PlayerInventory {
             }
             return Ok(());
         }
-        let index = interactive_index(slot)?;
+        let index = interactive_index(slot, access)?;
         generic_slot(catalog, &self.cursor)?;
         generic_slot(catalog, &self.slots[index])?;
         match (self.slots[index].clone(), self.cursor.clone()) {
@@ -283,12 +663,22 @@ impl PlayerInventory {
         Ok(())
     }
 
-    fn quick_move(&mut self, catalog: &ItemCatalog, slot: i16) -> Result<(), InventoryError> {
-        let source = interactive_index(slot)?;
+    fn quick_move(
+        &mut self,
+        catalog: &ItemCatalog,
+        slot: i16,
+        access: SlotAccess,
+    ) -> Result<(), InventoryError> {
+        let source = interactive_index(slot, access)?;
         let Some(stack) = self.slots[source].clone() else {
             return Ok(());
         };
-        if !catalog.supports_generic_quick_move(&stack)? {
+        let supported = if source <= 4 {
+            catalog.supports_generic_click(&stack)?
+        } else {
+            catalog.supports_generic_quick_move(&stack)?
+        };
+        if !supported {
             return Err(InventoryError::UnsupportedItemBehavior);
         }
         let destinations = match source {
@@ -327,8 +717,8 @@ impl PlayerInventory {
         Ok(())
     }
 
-    fn swap(&mut self, slot: i16, button: i8) -> Result<(), InventoryError> {
-        let source = interactive_index(slot)?;
+    fn swap(&mut self, slot: i16, button: i8, access: SlotAccess) -> Result<(), InventoryError> {
+        let source = interactive_index(slot, access)?;
         let target = if button == 40 {
             45
         } else {
@@ -343,11 +733,12 @@ impl PlayerInventory {
         catalog: &ItemCatalog,
         slot: i16,
         policy: InventoryPolicy,
+        access: SlotAccess,
     ) -> Result<(), InventoryError> {
         if !policy.creative {
             return Err(InventoryError::CreativeRequired);
         }
-        let source = interactive_index(slot)?;
+        let source = interactive_index(slot, access)?;
         if self.cursor.is_none()
             && let Some(stack) = &self.slots[source]
         {
@@ -362,8 +753,9 @@ impl PlayerInventory {
         button: i8,
         policy: InventoryPolicy,
         drops: &mut Vec<ItemStack>,
+        access: SlotAccess,
     ) -> Result<(), InventoryError> {
-        let index = interactive_index(slot)?;
+        let index = interactive_index(slot, access)?;
         if self.cursor.is_some() {
             return Ok(());
         }
@@ -385,6 +777,7 @@ impl PlayerInventory {
         button: i8,
         policy: InventoryPolicy,
         drops: &mut Vec<ItemStack>,
+        access: SlotAccess,
     ) -> Result<(), InventoryError> {
         let stage = (button as u8) & 3;
         let kind = (button as u8) >> 2;
@@ -407,15 +800,20 @@ impl PlayerInventory {
                 });
             }
             1 => {
-                let index = interactive_index(slot)?;
+                let index = if slot == 0 && access == SlotAccess::PersonalCrafting {
+                    0
+                } else {
+                    interactive_index(slot, access)?
+                };
                 generic_slot(catalog, &self.slots[index])?;
                 let maximum = catalog.effective_max_stack(&cursor)?;
-                let eligible = match &self.slots[index] {
-                    None => true,
-                    Some(target) => {
-                        catalog.same_kind(target, &cursor)? && target.count() <= maximum
-                    }
-                };
+                let eligible = index != 0
+                    && match &self.slots[index] {
+                        None => true,
+                        Some(target) => {
+                            catalog.same_kind(target, &cursor)? && target.count() <= maximum
+                        }
+                    };
                 let drag = self
                     .drag
                     .as_mut()
@@ -435,7 +833,7 @@ impl PlayerInventory {
                     if kind <= 1
                         && let Some(&index) = drag.slots.first()
                     {
-                        self.pickup(catalog, index as i16, kind as i8, policy, drops)?;
+                        self.pickup(catalog, index as i16, kind as i8, policy, drops, access)?;
                     }
                     return Ok(());
                 }
@@ -474,8 +872,13 @@ impl PlayerInventory {
         catalog: &ItemCatalog,
         slot: i16,
         button: i8,
+        access: SlotAccess,
     ) -> Result<(), InventoryError> {
-        let index = interactive_index(slot)?;
+        let index = if slot == 0 && access == SlotAccess::PersonalCrafting {
+            0
+        } else {
+            interactive_index(slot, access)?
+        };
         let Some(cursor) = self.cursor.clone() else {
             return Ok(());
         };
@@ -485,7 +888,18 @@ impl PlayerInventory {
         }
         let maximum = catalog.effective_max_stack(&cursor)?;
         if cursor.count() < maximum {
-            for (index, slot) in self.slots.iter().enumerate().take(9).skip(1) {
+            let first_unsupported = if access == SlotAccess::PersonalCrafting {
+                5
+            } else {
+                1
+            };
+            for (index, slot) in self
+                .slots
+                .iter()
+                .enumerate()
+                .take(9)
+                .skip(first_unsupported)
+            {
                 if let Some(stack) = slot
                     && catalog.same_kind(stack, &cursor)?
                 {
@@ -494,11 +908,12 @@ impl PlayerInventory {
             }
         }
         let mut carried = cursor.count();
-        let indexes: Vec<_> = if button == 0 {
-            (9..MENU_SLOT_COUNT).collect()
-        } else {
-            (9..MENU_SLOT_COUNT).rev().collect()
-        };
+        let mut indexes: Vec<_> = (1..MENU_SLOT_COUNT)
+            .filter(|index| *index >= 9 || (access == SlotAccess::PersonalCrafting && *index <= 4))
+            .collect();
+        if button == 1 {
+            indexes.reverse();
+        }
         for pass in 0..2 {
             for &index in &indexes {
                 let Some(target) = self.slots[index].clone() else {
@@ -532,9 +947,9 @@ fn menu_index(slot: i16) -> Result<usize, InventoryError> {
     Ok(slot as usize)
 }
 
-fn interactive_index(slot: i16) -> Result<usize, InventoryError> {
+fn interactive_index(slot: i16, access: SlotAccess) -> Result<usize, InventoryError> {
     let index = menu_index(slot)?;
-    if index < 9 {
+    if index < 9 && !(access == SlotAccess::PersonalCrafting && (1..=4).contains(&index)) {
         return Err(InventoryError::UnsupportedSlot(slot));
     }
     Ok(index)
@@ -564,7 +979,19 @@ fn quantity(stack: &ItemStack, count: u8) -> Result<Slot, InventoryError> {
     }
 }
 
-fn validate_request(request: &ClickRequest) -> Result<(), InventoryError> {
+fn drop_stack(
+    stack: ItemStack,
+    policy: InventoryPolicy,
+    drops: &mut Vec<ItemStack>,
+) -> Result<(), InventoryError> {
+    if !policy.allow_drops {
+        return Err(InventoryError::DroppingUnavailable);
+    }
+    drops.push(stack);
+    Ok(())
+}
+
+fn validate_request(request: &ClickRequest, access: SlotAccess) -> Result<(), InventoryError> {
     let valid_button = match request.mode {
         ClickMode::Pickup | ClickMode::QuickMove | ClickMode::Throw | ClickMode::PickupAll => {
             (0..=1).contains(&request.button)
@@ -578,8 +1005,10 @@ fn validate_request(request: &ClickRequest) -> Result<(), InventoryError> {
     }
     let outside_allowed = request.mode == ClickMode::Pickup
         || (request.mode == ClickMode::QuickCraft && request.button & 3 != 1);
-    if request.slot != -999 || !outside_allowed {
-        interactive_index(request.slot)?;
+    if (request.slot != -999 || !outside_allowed)
+        && !(access == SlotAccess::PersonalCrafting && request.slot == 0)
+    {
+        interactive_index(request.slot, access)?;
     }
     if request.changed_slots.len() > 128 {
         return Err(InventoryError::InvalidPrediction);
