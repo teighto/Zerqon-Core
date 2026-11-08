@@ -12,6 +12,8 @@ import urllib.parse
 import urllib.request
 import zipfile
 
+from license_fetch import read_license_url
+
 MAX_JAR_BYTES = 64 * 1024 * 1024
 MAX_DOCUMENT_BYTES = 2 * 1024 * 1024
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]*\.jar\Z")
@@ -65,11 +67,11 @@ def fetch_document(document, cache):
     cached = cache / (digest + ".txt")
     data = cached.read_bytes() if cached.is_file() else b""
     if hashlib.sha256(data).hexdigest() != digest:
-        with urllib.request.urlopen(url, timeout=30) as response:
-            final = urllib.parse.urlsplit(response.geturl())
+        def validate_redirect(destination):
+            final = urllib.parse.urlsplit(destination)
             if final.scheme != "https" or final.hostname not in {"raw.githubusercontent.com", "www.apache.org"}:
                 raise ValueError("unexpected license redirect")
-            data = response.read(MAX_DOCUMENT_BYTES + 1)
+        data = read_license_url(url, MAX_DOCUMENT_BYTES, validate_redirect)
         if len(data) > MAX_DOCUMENT_BYTES or hashlib.sha256(data).hexdigest() != digest:
             raise ValueError("license source checksum mismatch: " + url)
         cache.mkdir(parents=True, exist_ok=True)

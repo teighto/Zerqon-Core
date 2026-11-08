@@ -11,6 +11,8 @@ import sys
 import tempfile
 import urllib.request
 
+from license_fetch import read_license_url
+
 FALLBACKS = {
     ("perf-event2", "0.7.4"): ("Phantomical/perf-event", "aa2a46d2929f6b063dfb6be71881977dd79dc83f", "LICENSE-MIT", "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"),
     ("perf-event-open-sys2", "5.0.6"): ("Phantomical/perf-event", "6e5e01cfec051b6ed683376bbd27be2198c4fca0", "LICENSE-MIT", "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"),
@@ -47,10 +49,10 @@ def fetched_url(url, digest, cache):
     cached = cache / f"{digest}.txt"
     data = cached.read_bytes() if cached.is_file() else b""
     if hashlib.sha256(data).hexdigest() != digest:
-        with urllib.request.urlopen(url, timeout=30) as response:
-            if not response.geturl().startswith("https://"):
+        def validate_redirect(destination):
+            if not destination.startswith("https://"):
                 raise ValueError("License download redirected away from HTTPS")
-            data = response.read(4 * 1024 * 1024 + 1)
+        data = read_license_url(url, 4 * 1024 * 1024, validate_redirect)
         if len(data) > 4 * 1024 * 1024 or hashlib.sha256(data).hexdigest() != digest:
             raise ValueError(f"License checksum mismatch: {url}")
         cache.mkdir(parents=True, exist_ok=True)
