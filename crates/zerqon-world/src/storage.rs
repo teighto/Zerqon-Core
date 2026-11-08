@@ -123,7 +123,7 @@ impl WorldStore {
                 .snapshot(&[crate::ChunkKey::new(x, z)])?
                 .into_iter()
                 .next()
-                .and_then(|snapshot| snapshot.chunk().map(|chunk| (**chunk).clone()));
+                .and_then(crate::ChunkSnapshot::into_chunk);
             if chunk.is_none() && self.generation_policy() == GenerationPolicy::ExistingOnly {
                 return Err(WorldError::MissingImportedChunk { x, z });
             }

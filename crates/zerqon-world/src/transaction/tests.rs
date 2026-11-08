@@ -177,6 +177,75 @@ fn values(store: &Transactions) -> (u32, u32) {
 }
 
 #[test]
+fn into_chunk_preserves_section_allocations_for_unique_snapshot() {
+    let chunk = Arc::new(chunk(0, 23));
+    let expected_bytes = chunk.to_bytes();
+    let before_buffers: Vec<_> = chunk
+        .sections()
+        .iter()
+        .filter_map(|section| {
+            let (palette, _, words) = section.palette_data();
+            (!words.is_empty()).then_some((palette.as_ptr(), words.as_ptr()))
+        })
+        .collect();
+    assert!(!before_buffers.is_empty());
+    let snapshot = ChunkSnapshot {
+        key: ChunkKey::new(0, 0),
+        chunk: Some(chunk),
+        revision: 1,
+        world: Uuid::new_v4(),
+    };
+    assert_eq!(Arc::strong_count(snapshot.chunk().unwrap()), 1);
+
+    let extracted = snapshot.into_chunk().unwrap();
+
+    let after_buffers: Vec<_> = extracted
+        .sections()
+        .iter()
+        .filter_map(|section| {
+            let (palette, _, words) = section.palette_data();
+            (!words.is_empty()).then_some((palette.as_ptr(), words.as_ptr()))
+        })
+        .collect();
+    assert_eq!(extracted.to_bytes(), expected_bytes);
+    assert_eq!(before_buffers, after_buffers);
+}
+
+#[test]
+fn into_chunk_keeps_shared_snapshot_isolated() {
+    let snapshot = ChunkSnapshot {
+        key: ChunkKey::new(0, 0),
+        chunk: Some(Arc::new(chunk(0, 23))),
+        revision: 1,
+        world: Uuid::new_v4(),
+    };
+    let shared = snapshot.clone();
+    let expected_bytes = shared.chunk().unwrap().to_bytes();
+    assert_eq!(Arc::strong_count(shared.chunk().unwrap()), 2);
+
+    let mut extracted = snapshot.into_chunk().unwrap();
+    assert_eq!(extracted.to_bytes(), expected_bytes);
+    extracted.set_block(0, 64, 0, 99).unwrap();
+
+    assert_eq!(extracted.get_block(0, 64, 0), Some(99));
+    assert_eq!(shared.chunk().unwrap().get_block(0, 64, 0), Some(23));
+    assert_eq!(shared.chunk().unwrap().to_bytes(), expected_bytes);
+    assert_eq!(Arc::strong_count(shared.chunk().unwrap()), 1);
+}
+
+#[test]
+fn into_chunk_preserves_missing_chunk() {
+    let snapshot = ChunkSnapshot {
+        key: ChunkKey::new(-1, 1),
+        chunk: None,
+        revision: 0,
+        world: Uuid::new_v4(),
+    };
+
+    assert!(snapshot.into_chunk().is_none());
+}
+
+#[test]
 fn every_write_and_sync_failure_recovers_one_complete_transaction() {
     let original = baseline();
     let disk = restore(&original);

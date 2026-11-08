@@ -220,7 +220,8 @@ def one_run(binary, world, selection, workers, passes, output, timeout):
                 "whole_process_cpu_seconds": usage.ru_utime + usage.ru_stime,
                 "whole_process_user_cpu_seconds": usage.ru_utime,
                 "whole_process_system_cpu_seconds": usage.ru_stime,
-                "whole_process_peak_rss_bytes": usage.ru_maxrss * 1024,
+                "launcher_inclusive_peak_rss_bytes": usage.ru_maxrss * 1024,
+                "post_exec_peak_rss_bytes": max(final_sample["process_hwm_bytes"] or 0, final_sample["rss_bytes"] or 0, samples["peak_rss_bytes"]),
                 "pre_exit_sample_cpu_seconds": final_sample["cpu_seconds"],
                 "baseline_rss_bytes": baseline["rss_bytes"],
                 "timed_peak_sampled_rss_bytes": samples["peak_rss_bytes"],
@@ -229,7 +230,7 @@ def one_run(binary, world, selection, workers, passes, output, timeout):
                 "sample_interval_seconds": 0.02, "memory_samples": samples["count"], "observed_threads_max": samples["max_threads"],
                 "baseline_private": baseline_private, "after_measurement_private": measured_private,
                 "timed_boundary_io_counters_delta": {key: after["io"].get(key, 0) - value for key, value in baseline["io"].items()},
-                "memory_note": "Sampled timed RSS can miss short peaks; /proc VmHWM is sampled before exit. wait4 whole-process maxRSS includes teardown. Neither is decoded-payload size.",
+                "memory_note": "Post-exec peak is the maximum of native /proc VmHWM sampled after verified, before exit, and observed native RSS. It excludes memory used after that final sample. Timed RSS sampling can miss short peaks. Raw wait4 maxRSS is launcher-inclusive: it can retain pre-exec launcher high-water and includes later teardown; it is not native-program RAM. None of these values is decoded-payload size.",
                 "cpu_note": "Timed CPU is sampled at go/measured process boundaries; whole-process CPU includes untimed setup, verification and teardown. Rust wall measures only the load loop.",
             }
             with output.open("x", encoding="utf-8") as file:
@@ -318,7 +319,7 @@ def main():
             "timed_loop_wall_seconds": distribution([row["measured"]["timed_loop_wall_seconds"] for row in group]),
             "timed_boundary_cpu_seconds": distribution([row["timed_boundary_cpu_seconds"] for row in group]),
             "timed_peak_sampled_rss_bytes": distribution([row["timed_peak_sampled_rss_bytes"] for row in group]),
-            "whole_process_peak_rss_bytes": distribution([row["whole_process_peak_rss_bytes"] for row in group]),
+            "post_exec_peak_rss_bytes": distribution([row["post_exec_peak_rss_bytes"] for row in group]),
             "whole_process_cpu_seconds": distribution([row["whole_process_cpu_seconds"] for row in group]),
         })
     report = {"metadata": metadata, "db_bytes_after": (world / "chunks.redb").stat().st_size, "summary": summary, "results": [str(path.name) for path in sorted(args.output.glob("workers-*.json"))]}

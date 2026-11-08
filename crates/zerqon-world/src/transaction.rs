@@ -55,6 +55,9 @@ impl ChunkSnapshot {
     pub fn chunk(&self) -> Option<&Arc<Chunk>> {
         self.chunk.as_ref()
     }
+    pub(crate) fn into_chunk(self) -> Option<Chunk> {
+        self.chunk.map(Arc::unwrap_or_clone)
+    }
     pub fn revision(&self) -> u64 {
         self.revision
     }

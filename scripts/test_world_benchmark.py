@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import platform
 import signal
+import subprocess
 import sys
 import tempfile
 import textwrap
@@ -104,6 +105,8 @@ emit(measured)
 receive("verify")
 verified = {"event": "verified", "all_selected_chunks_match": True,
             "selection_sha256": selection_hash()}
+verified["self_hwm_bytes"] = next(int(line.split()[1]) * 1024
+    for line in Path("/proc/self/status").read_text().splitlines() if line.startswith("VmHWM:"))
 verified.update(config.get("verified", {}))
 emit(verified)
 receive("exit")
@@ -163,13 +166,50 @@ class WorldBenchmarkTests(unittest.TestCase):
         self.assertEqual(json.loads(self.output.read_text()), result)
         self.assert_children_reaped()
 
-    def test_wait4_includes_teardown_cpu_and_peak_memory(self):
+    def test_wait4_includes_teardown_cpu_and_launcher_inclusive_peak(self):
         self.configure(mode="usage")
         result = self.run_child()
         self.assertGreater(result["whole_process_cpu_seconds"] - result["pre_exit_sample_cpu_seconds"], 0.07)
-        self.assertGreater(result["whole_process_peak_rss_bytes"] - result["process_hwm_before_exit_bytes"], 20 * 1024 * 1024)
+        self.assertGreater(result["launcher_inclusive_peak_rss_bytes"] - result["post_exec_peak_rss_bytes"], 20 * 1024 * 1024)
         self.assertGreater(result["whole_process_wall_seconds"], result["driver_timed_window_wall_seconds"])
         self.assert_children_reaped()
+
+    def test_post_exec_peak_excludes_launcher_memory(self):
+        helper = self.root / "parent.py"
+        helper.write_text(textwrap.dedent('''
+            import importlib.util
+            import os
+            from pathlib import Path
+            import sys
+
+            spec = importlib.util.spec_from_file_location("benchmark", sys.argv[1])
+            driver = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(driver)
+            allocation = bytearray(int(sys.argv[6]) * 1024 * 1024)
+            for offset in range(0, len(allocation), 4096):
+                allocation[offset] = 1
+            result = driver.one_run(Path(sys.argv[2]), Path(sys.argv[3]), Path(sys.argv[4]),
+                                    1, 1, Path(sys.argv[5]), 2)
+            try:
+                os.waitpid(result["pid"], os.WNOHANG)
+            except ChildProcessError:
+                pass
+            else:
+                raise AssertionError("benchmark child was not reaped")
+        '''), encoding="utf-8")
+        results = []
+        for allocation in (0, 64):
+            output = self.root / f"parent-{allocation}.json"
+            subprocess.run([sys.executable, str(helper), DRIVER.__file__, str(self.binary),
+                            str(self.world), str(self.selection), str(output), str(allocation)],
+                           check=True, capture_output=True, text=True, timeout=10)
+            results.append(json.loads(output.read_text()))
+        baseline, loaded = results
+        self.assertIn("post_exec_peak_rss_bytes", loaded)
+        self.assertGreater(loaded["launcher_inclusive_peak_rss_bytes"] - baseline["launcher_inclusive_peak_rss_bytes"], 48 * 1024 * 1024)
+        self.assertGreater(loaded["launcher_inclusive_peak_rss_bytes"] - loaded["post_exec_peak_rss_bytes"], 48 * 1024 * 1024)
+        self.assertLess(abs(loaded["post_exec_peak_rss_bytes"] - baseline["post_exec_peak_rss_bytes"]), 8 * 1024 * 1024)
+        self.assertLess(abs(loaded["post_exec_peak_rss_bytes"] - loaded["verified"]["self_hwm_bytes"]), 4 * 1024 * 1024)
 
     def test_wrong_phase_terminates_and_reaps_child(self):
         self.assert_rejected(mode="wrong_phase")
@@ -317,6 +357,11 @@ class WorldBenchmarkTests(unittest.TestCase):
         rows = [json.loads(path.read_text()) for path in output.glob("workers-*.json")]
         by_pid = {row["pid"]: row for row in rows}
         self.assertEqual([by_pid[pid]["measured"]["workers"] for pid in pids], [1, 4, 4, 1, 1, 4])
+        for summary in report["summary"]:
+            self.assertIn("post_exec_peak_rss_bytes", summary)
+            expected = sorted(row["post_exec_peak_rss_bytes"] for row in rows
+                              if row["measured"]["workers"] == summary["workers"])
+            self.assertEqual(sorted(summary["post_exec_peak_rss_bytes"]["values"]), expected)
         self.assert_children_reaped()
 
     def test_input_mutation_between_real_runs_prevents_summary(self):

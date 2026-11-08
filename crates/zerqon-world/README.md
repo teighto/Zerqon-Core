@@ -66,7 +66,7 @@ python scripts/benchmark-world-load.py \
   --settings .local/ordinary-import/server.settings --output .local/ordinary-results
 ```
 
-The Linux driver starts a fresh process for each run with 1, 4 and the configured number of world workers. It measures storage reads and block decoding after an untimed warmup. Database setup, full chunk hash checks and shutdown are outside that timer. Process CPU and peak RSS are recorded separately, including setup and shutdown. The OS page cache is not flushed.
+The Linux driver starts a fresh process for each run with 1, 4 and the configured number of world workers. It measures storage reads and block decoding after an untimed warmup. Database setup, full chunk hash checks and shutdown are outside that timer. CPU totals include setup and shutdown. Peak RSS comes from the executable's Linux counters after closing the database; the separate raw `wait4` value can include the launcher's earlier memory use. The OS page cache is not flushed.
 
 This workload excludes terrain generation, pregeneration, biome and light processing, entities and network delivery. The selected chunk bodies are checked before and after every run. Output files retain each result, the median and the full observed range; an existing output directory is refused.
 
@@ -76,4 +76,4 @@ This workload excludes terrain generation, pregeneration, biome and light proces
 
 Текущие чанки хранятся в `chunks.redb`. Транзакция сохраняет изменения чанков вместе с результатом операции и проверяет версии прочитанных данных. При переносе старого хранилища исходные `.zqc` сохраняются. Хранилище проверяет CRC и структуру данных и блокирует одновременное открытие мира несколькими процессами. Правила переноса описаны в [документации хранилища](../../docs/WORLD_STORAGE.md).
 
-Для замеров обычного рельефа используйте команды выше: отдельный мир vanilla с заданным seed, импорт блоков, фиксированный набор чанков и подготовка базы. Драйвер Linux повторяет чтение и декодирование с 1, 4 и заданным в конфиге числом потоков. Перед каждым прогоном он прогревает выбранные данные, а до и после сверяет хеши чанков. CPU и пиковая память процесса учитываются отдельно. Кеш ОС принудительно не очищается. Генерация, предгенерация, освещение, биомы, сущности и отправка по сети в этот замер не входят.
+Для замеров обычного рельефа используйте команды выше: отдельный мир vanilla с заданным seed, импорт блоков, фиксированный набор чанков и подготовка базы. Драйвер Linux повторяет чтение и декодирование с 1, 4 и заданным в конфиге числом потоков. Перед каждым прогоном он прогревает выбранные данные, а до и после сверяет хеши чанков. CPU и память учитываются отдельно: пик RSS берётся из счётчиков Rust-процесса после закрытия базы. Сырое значение `wait4` сохранено отдельно, поскольку в него может попасть память запускатора. Кеш ОС принудительно не очищается. Генерация, предгенерация, освещение, биомы, сущности и отправка по сети в этот замер не входят.

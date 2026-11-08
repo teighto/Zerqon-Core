@@ -426,6 +426,7 @@ fn main() -> Result<()> {
     }
     verify_all(&store, &selection)?;
     workers.shutdown()?;
+    drop(store);
     emit(
         json!({"event":"verified", "all_selected_chunks_match":true, "selection_sha256":selection_hash}),
     )?;
