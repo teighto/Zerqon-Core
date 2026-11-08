@@ -26,21 +26,23 @@ Paper details: [PaperMC documentation](https://docs.papermc.io/paper/). A speed 
 
 ### Performance
 
-![Chunk generation measurements](docs/images/performance.png)
+Reading and decoding block data from 256 chunks of a normal vanilla world, seed `20261108`. Each run reads every chunk 250 times after warmup: 64,000 chunk reads in total.
 
-Ryzen 9 9900X, Windows 11, Rust 1.97 release build. Median of three runs with 10,000 flat chunks on 7 November 2026.
+![Ordinary-world block storage measurements](docs/images/performance.png)
 
-| Test | Result |
-|---|---:|
-| Generate chunks on one thread | 22,787 chunks/s |
-| Generate chunks with four workers | 64,288 chunks/s |
-| Decode saved chunks | 115,524 chunks/s |
+Ryzen 9 9900X, 32 GB RAM, Samsung 970 EVO Plus; WSL2 with ext4, Rust 1.97 release build for Linux musl. Measured on 8 November 2026, with three fresh processes for each worker setting.
 
-One flat chunk uses 2,920 bytes for its structure and section allocations; its encoded payload is 1,790 bytes. These figures exclude database overhead, allocator overhead and total process memory. The test measures chunk processing, not gameplay or player capacity.
+| Workers | Chunk reads/s | Time for 64,000 reads | CPU | Peak RSS |
+|---:|---:|---:|---:|---:|
+| 1 | 10,039 | 6.375 s | 105.4% | 11.36 MiB |
+| 4 | 11,807 | 5.421 s | 242.0% | 12.12 MiB |
+| 8 | 17,866 | 3.582 s | 446.7% | 12.24 MiB |
 
-```sh
-cargo run -p zerqon-world --example world_bench --release --locked -- 10000 4
-```
+Speed, time and CPU are medians; RSS is the highest observed value. The error bars show the slowest and fastest runs. CPU at 100% means one logical core. RAM describes this storage test; a game server also needs memory for players, plugins and other services.
+
+Reusing chunk buffers improved throughput by 7–35% in this workload. The timer excludes world import, generation, lighting, entities and network delivery. Normal terrain generation in Rust and pregeneration are not ready yet, so there are no speed figures for them.
+
+[Measurements and run details](docs/benchmarks/ordinary-chunks.json) · [Repeat the test](https://github.com/teighto/Zerqon-Core/tree/main/crates/zerqon-world#ordinary-terrain-block-loading)
 
 ### Start the server
 
@@ -110,19 +112,23 @@ Zerqon, сервер Minecraft на версии 26.3, написанный на
 
 ### Производительность
 
-Ryzen 9 9900X, Windows 11, Rust 1.97, release-сборка. Медиана трёх запусков по 10 000 плоских чанков, 7 ноября 2026 года.
+Чтение и декодирование блоков из 256 чанков обычного мира vanilla, seed `20261108`. После прогрева каждый чанк читается 250 раз: всего 64 000 чтений за прогон.
 
-| Тест | Результат |
-|---|---:|
-| Генерация в один поток | 22 787 чанков/с |
-| Генерация в четыре потока | 64 288 чанков/с |
-| Чтение сохранённых чанков | 115 524 чанков/с |
+![Замеры чтения блоков обычного мира](docs/images/performance.png)
 
-Структура плоского чанка и выделенная память секций занимают 2 920 байт, закодированные данные чанка занимают 1 790 байт. Накладные расходы базы данных, аллокатора и остальная память процесса сюда не входят. Это замер обработки чанков; по нему нельзя определить количество игроков на сервере.
+Ryzen 9 9900X, 32 ГБ RAM, Samsung 970 EVO Plus; WSL2 с ext4, Rust 1.97, release-сборка Linux musl. Замеры от 8 ноября 2026 года, по три отдельных запуска для каждого числа потоков.
 
-```sh
-cargo run -p zerqon-world --example world_bench --release --locked -- 10000 4
-```
+| Потоки | Чтений чанков/с | Время 64 000 чтений | CPU | Пик RSS |
+|---:|---:|---:|---:|---:|
+| 1 | 10 039 | 6.375 с | 105.4% | 11.36 МиБ |
+| 4 | 11 807 | 5.421 с | 242.0% | 12.12 МиБ |
+| 8 | 17 866 | 3.582 с | 446.7% | 12.24 МиБ |
+
+Для скорости, времени и CPU указана медиана; для RSS — наибольшее измеренное значение. Отметки на графике показывают самый медленный и самый быстрый прогоны. 100% CPU означает одно логическое ядро. Память указана для этого теста хранилища; игровому серверу дополнительно нужна память для игроков, плагинов и остальных служб.
+
+После удаления лишней копии чанка чтение ускорилось на 7–35% в этом тесте. Импорт мира, генерация, освещение, сущности и отправка по сети в замер не входят. Обычная генерация на Rust и предгенерация пока не готовы, поэтому цифр их скорости ещё нет.
+
+[Замеры и параметры прогонов](docs/benchmarks/ordinary-chunks.json) · [Как повторить тест](https://github.com/teighto/Zerqon-Core/tree/main/crates/zerqon-world#ordinary-terrain-block-loading)
 
 ### Запуск
 

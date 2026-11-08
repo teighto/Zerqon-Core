@@ -1,0 +1,211 @@
+{
+  "project": "Zerqon",
+  "author": "teighto",
+  "date": "2026-11-08",
+  "minecraft": "26.3",
+  "commit": "e6892278b6a57ac45d1fed7c85a98b3bb5b3ccaf",
+  "baseline_commit": "a2e71d089d9d532292fe8cbb7b7c4ea5e95228f9",
+  "binary_sha256": "dd821166401a9d4c951985ded6d8a3e5d530482c4d8aab4644c83f65e546aa09",
+  "build": {
+    "rust": "1.97.0",
+    "profile": "release",
+    "target": "x86_64-unknown-linux-musl",
+    "lto": "thin",
+    "codegen_units": 1,
+    "frame_pointers": true
+  },
+  "environment": {
+    "cpu": "AMD Ryzen 9 9900X 12-Core Processor",
+    "physical_cores": 12,
+    "logical_cpus": 24,
+    "host_os": "Windows 11 Pro Insider Preview",
+    "host_os_version": "10.0.29695",
+    "host_usable_ram_bytes": 33407369216,
+    "wsl_ram_bytes": 16294535168,
+    "linux_kernel": "6.18.33.2-microsoft-standard-WSL2",
+    "distribution": "Kali GNU/Linux Rolling",
+    "filesystem": "ext4 in WSL2",
+    "host_disk": "Samsung SSD 970 EVO Plus 2TB"
+  },
+  "dataset": {
+    "source_generator": "minecraft:noise",
+    "noise_settings": "minecraft:overworld",
+    "seed": 20261108,
+    "data_version": 5023,
+    "selected_chunks": 256,
+    "chunk_rectangle": [
+      0,
+      0,
+      15,
+      15
+    ],
+    "source_full_chunks_imported": 400,
+    "source_incomplete_chunks_skipped": 1364,
+    "selected_native_encoded_bytes": 5974976,
+    "database_bytes": 16846848,
+    "source_world_bytes": 9867375,
+    "selection_sha256": "3939b0922cfd37ea67691b2bda70320187b76e6aa5616758b565b63c1047f3dd",
+    "retained_source_manifest_sha256": "c13db19698afe635d795ebc4f1d51c1c6c6f6054e46811c71033289f39d8f214",
+    "source_unchanged_by_import": true
+  },
+  "method": {
+    "workload": "warm storage reads and native block decoding from imported ordinary terrain",
+    "passes_per_run": 250,
+    "chunk_reads_per_run": 64000,
+    "runs_per_worker_setting": 3,
+    "worker_order": [
+      [
+        1,
+        4,
+        8
+      ],
+      [
+        4,
+        8,
+        1
+      ],
+      [
+        8,
+        1,
+        4
+      ]
+    ],
+    "queue_capacity": "2 * workers",
+    "outstanding_tickets": "3 * workers",
+    "cache": "untimed full verification and warmup before each run; redb cache limit 16 MiB; OS cache not flushed",
+    "timer": "worker submission, WorldStore::load, block decode, result consumption; setup and shutdown excluded",
+    "ram": "maximum native /proc VmHWM and observed RSS through verification and explicit database shutdown; sampled before exit; launcher-inclusive wait4 maxRSS excluded",
+    "cpu": "go/measured process CPU delta divided by Rust loop wall time; 100 percent means one logical core; phase-boundary sampling is approximate",
+    "validation": "every selected chunk SHA-256 checked before and after every run; successful exit and unchanged executable/selection/settings required",
+    "excludes": [
+      "terrain generation",
+      "pregeneration",
+      "biomes",
+      "lighting",
+      "entities",
+      "network delivery"
+    ]
+  },
+  "results": [
+    {
+      "workers": 1,
+      "runs": [
+        {
+          "run": 1,
+          "seconds": 6.421287369,
+          "chunk_reads_per_second": 9966.848752007629,
+          "cpu_seconds_during_read_window": 6.75,
+          "cpu_percent_one_core": 105.11910793133046,
+          "rust_peak_rss_bytes": 11902976,
+          "physical_read_bytes_during_window": 0
+        },
+        {
+          "run": 2,
+          "seconds": 6.375149776,
+          "chunk_reads_per_second": 10038.97982772664,
+          "cpu_seconds_during_read_window": 6.72,
+          "cpu_percent_one_core": 105.40928819112972,
+          "rust_peak_rss_bytes": 11907072,
+          "physical_read_bytes_during_window": 0
+        },
+        {
+          "run": 3,
+          "seconds": 6.363083349,
+          "chunk_reads_per_second": 10058.016921946813,
+          "cpu_seconds_during_read_window": 6.71,
+          "cpu_percent_one_core": 105.45202116603612,
+          "rust_peak_rss_bytes": 11784192,
+          "physical_read_bytes_during_window": 0
+        }
+      ],
+      "median_chunk_reads_per_second": 10038.97982772664,
+      "minimum_chunk_reads_per_second": 9966.848752007629,
+      "maximum_chunk_reads_per_second": 10058.016921946813,
+      "median_seconds": 6.375149776,
+      "median_cpu_percent_one_core": 105.40928819112972,
+      "maximum_rust_peak_rss_bytes": 11907072,
+      "baseline_median_chunk_reads_per_second": 8345.902095623323,
+      "throughput_change_percent": 20.286335889216623
+    },
+    {
+      "workers": 4,
+      "runs": [
+        {
+          "run": 1,
+          "seconds": 5.445523316,
+          "chunk_reads_per_second": 11752.773110337372,
+          "cpu_seconds_during_read_window": 13.14,
+          "cpu_percent_one_core": 241.29912292161416,
+          "rust_peak_rss_bytes": 12308480,
+          "physical_read_bytes_during_window": 0
+        },
+        {
+          "run": 2,
+          "seconds": 5.401938968,
+          "chunk_reads_per_second": 11847.59775686529,
+          "cpu_seconds_during_read_window": 13.07,
+          "cpu_percent_one_core": 241.95016044098335,
+          "rust_peak_rss_bytes": 12705792,
+          "physical_read_bytes_during_window": 0
+        },
+        {
+          "run": 3,
+          "seconds": 5.42067494,
+          "chunk_reads_per_second": 11806.647826774133,
+          "cpu_seconds_during_read_window": 13.129999999999999,
+          "cpu_percent_one_core": 242.2207593211631,
+          "rust_peak_rss_bytes": 12320768,
+          "physical_read_bytes_during_window": 0
+        }
+      ],
+      "median_chunk_reads_per_second": 11806.647826774133,
+      "minimum_chunk_reads_per_second": 11752.773110337372,
+      "maximum_chunk_reads_per_second": 11847.59775686529,
+      "median_seconds": 5.42067494,
+      "median_cpu_percent_one_core": 241.95016044098335,
+      "maximum_rust_peak_rss_bytes": 12705792,
+      "baseline_median_chunk_reads_per_second": 8761.61185814335,
+      "throughput_change_percent": 34.75428971212209
+    },
+    {
+      "workers": 8,
+      "runs": [
+        {
+          "run": 1,
+          "seconds": 3.5506185930000003,
+          "chunk_reads_per_second": 18025.028125007622,
+          "cpu_seconds_during_read_window": 15.85,
+          "cpu_percent_one_core": 446.40108715839193,
+          "rust_peak_rss_bytes": 12832768,
+          "physical_read_bytes_during_window": 0
+        },
+        {
+          "run": 2,
+          "seconds": 3.593169505,
+          "chunk_reads_per_second": 17811.5727384812,
+          "cpu_seconds_during_read_window": 16.05,
+          "cpu_percent_one_core": 446.6808475822239,
+          "rust_peak_rss_bytes": 12201984,
+          "physical_read_bytes_during_window": 0
+        },
+        {
+          "run": 3,
+          "seconds": 3.582172892,
+          "chunk_reads_per_second": 17866.250996128638,
+          "cpu_seconds_during_read_window": 15.999999999999998,
+          "cpu_percent_one_core": 446.65627490321583,
+          "rust_peak_rss_bytes": 12390400,
+          "physical_read_bytes_during_window": 0
+        }
+      ],
+      "median_chunk_reads_per_second": 17866.250996128638,
+      "minimum_chunk_reads_per_second": 17811.5727384812,
+      "maximum_chunk_reads_per_second": 18025.028125007622,
+      "median_seconds": 3.582172892,
+      "median_cpu_percent_one_core": 446.65627490321583,
+      "maximum_rust_peak_rss_bytes": 12832768,
+      "baseline_median_chunk_reads_per_second": 16641.378138090644,
+      "throughput_change_percent": 7.360405177227292
+    }
+  ]
+}
