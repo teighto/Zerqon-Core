@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -10,6 +11,7 @@ use uuid::Uuid;
 use zerqon_protocol::codec::{
     get_string, get_varint, put_string, put_varint, read_frame, take, write_frame,
 };
+use zerqon_world::{ChunkKey, MAX_PLAYER_RECORD_BYTES, PlayerKey, WorldStore};
 
 struct Server {
     child: Child,
@@ -24,6 +26,15 @@ impl Drop for Server {
 }
 impl Server {
     fn start(directory: &Path) -> Self {
+        Self::start_configured(directory, None)
+    }
+
+    fn start_in_mode(directory: &Path, mode: &str) -> Self {
+        assert!(matches!(mode, "creative" | "survival"));
+        Self::start_configured(directory, Some(mode))
+    }
+
+    fn start_configured(directory: &Path, mode: Option<&str>) -> Self {
         let data = Path::new(env!("CARGO_MANIFEST_DIR")).join(".cache/vanilla/26.3");
         assert!(
             data.join("prepared.json").is_file(),
@@ -43,6 +54,17 @@ impl Server {
             std::fs::write(directory.join("eula.txt"), "eula=true\n").unwrap();
             std::fs::write(directory.join("server.properties"),"server-ip=127.0.0.1\nserver-port=0\nmax-players=4\nonline-mode=false\nview-distance=1\nnetwork-compression-threshold=-1\n").unwrap();
             std::fs::write(directory.join("server.settings"),"network_threads=2\nworld_threads=1\njava_plugins=false\nupdate_check=false\nspawn_mobs=false\n").unwrap();
+        }
+        if let Some(mode) = mode {
+            let path = directory.join("server.properties");
+            let previous = std::fs::read_to_string(&path).unwrap();
+            let mut properties = previous
+                .lines()
+                .filter(|line| !line.starts_with("gamemode="))
+                .collect::<Vec<_>>()
+                .join("\n");
+            properties.push_str(&format!("\ngamemode={mode}\n"));
+            std::fs::write(path, properties).unwrap();
         }
         let mut child = Command::new(exe)
             .env("RUST_LOG", "info")
@@ -131,11 +153,52 @@ struct Snapshot {
     equipment: Vec<u8>,
     hands: [Option<Stack>; 2],
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LoginMode {
+    current: i32,
+    previous: Option<i32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Abilities {
+    flags: u8,
+    flying_speed: f32,
+    walking_speed: f32,
+}
+
+#[derive(Debug, Default)]
+struct TabEntry {
+    name: Option<String>,
+    mode: Option<i32>,
+}
+
 struct Client {
     socket: TcpStream,
     uuid: Uuid,
     entity: i32,
     snapshot: Snapshot,
+    login_mode: Option<LoginMode>,
+    abilities: Option<Abilities>,
+    tab: BTreeMap<Uuid, TabEntry>,
+    block_updates: BTreeMap<[i32; 3], i32>,
+}
+
+fn read_bool(body: &mut &[u8]) -> bool {
+    match take(body, 1).unwrap()[0] {
+        0 => false,
+        1 => true,
+        value => panic!("invalid boolean byte {value}"),
+    }
+}
+
+fn read_block_position(body: &mut &[u8]) -> [i32; 3] {
+    let packed = i64::from_be_bytes(take(body, 8).unwrap().try_into().unwrap());
+    [
+        (packed >> 38) as i32,
+        (packed << 52 >> 52) as i32,
+        (packed << 26 >> 38) as i32,
+    ]
 }
 
 fn read_stack(data: &mut &[u8]) -> Option<Stack> {
@@ -223,6 +286,10 @@ impl Client {
             uuid,
             entity: 0,
             snapshot,
+            login_mode: None,
+            abilities: None,
+            tab: BTreeMap::new(),
+            block_updates: BTreeMap::new(),
         };
         loop {
             let (id, body) = client.read().await;
@@ -233,6 +300,8 @@ impl Client {
         }
         assert_eq!(client.snapshot.slots.len(), 46);
         assert!(client.entity > 0);
+        assert!(client.login_mode.is_some());
+        assert!(client.abilities.is_some());
         client
     }
     async fn read(&mut self) -> (i32, Vec<u8>) {
@@ -258,7 +327,111 @@ impl Client {
     async fn inspect(&mut self, id: i32, body: &[u8]) {
         let mut view = body;
         match id {
-            50 => self.entity = i32::from_be_bytes(take(&mut view, 4).unwrap().try_into().unwrap()),
+            50 => {
+                self.entity = i32::from_be_bytes(take(&mut view, 4).unwrap().try_into().unwrap());
+                assert!(!read_bool(&mut view));
+                let dimensions = get_varint(&mut view).unwrap();
+                assert_eq!(dimensions, 1);
+                assert_eq!(get_string(&mut view, 32767).unwrap(), "minecraft:overworld");
+                for expected in [4, 1, 1] {
+                    assert_eq!(get_varint(&mut view).unwrap(), expected);
+                }
+                assert!(!read_bool(&mut view));
+                assert!(read_bool(&mut view));
+                assert!(!read_bool(&mut view));
+                assert!(get_varint(&mut view).unwrap() >= 0);
+                assert_eq!(get_string(&mut view, 32767).unwrap(), "minecraft:overworld");
+                take(&mut view, 8).unwrap();
+                let current = get_varint(&mut view).unwrap();
+                assert!(matches!(current, 0 | 1));
+                let previous = match get_varint(&mut view).unwrap() {
+                    0 => None,
+                    1 => Some(0),
+                    2 => Some(1),
+                    value => panic!("unsupported previous game mode {value}"),
+                };
+                read_bool(&mut view);
+                read_bool(&mut view);
+                if read_bool(&mut view) {
+                    get_string(&mut view, 32767).unwrap();
+                    read_block_position(&mut view);
+                }
+                assert!(get_varint(&mut view).unwrap() >= 0);
+                get_varint(&mut view).unwrap();
+                assert!(!read_bool(&mut view));
+                assert!(!read_bool(&mut view));
+                assert!(view.is_empty());
+                self.login_mode = Some(LoginMode { current, previous });
+            }
+            65 => {
+                let flags = take(&mut view, 1).unwrap()[0];
+                assert_eq!(flags & !0x0f, 0);
+                let flying_speed =
+                    f32::from_be_bytes(take(&mut view, 4).unwrap().try_into().unwrap());
+                let walking_speed =
+                    f32::from_be_bytes(take(&mut view, 4).unwrap().try_into().unwrap());
+                assert!(view.is_empty());
+                assert_eq!(flying_speed, 0.05);
+                assert_eq!(walking_speed, 0.1);
+                self.abilities = Some(Abilities {
+                    flags,
+                    flying_speed,
+                    walking_speed,
+                });
+            }
+            71 => {
+                let actions = take(&mut view, 1).unwrap()[0];
+                assert_eq!(actions & !0x9d, 0, "unsupported TAB action");
+                let count = get_varint(&mut view).unwrap();
+                assert!((0..=4).contains(&count));
+                for _ in 0..count {
+                    let uuid = Uuid::from_slice(take(&mut view, 16).unwrap()).unwrap();
+                    let entry = self.tab.entry(uuid).or_default();
+                    if actions & 1 != 0 {
+                        entry.name = Some(get_string(&mut view, 16).unwrap().to_owned());
+                        let properties = get_varint(&mut view).unwrap();
+                        assert!((0..=16).contains(&properties));
+                        for _ in 0..properties {
+                            get_string(&mut view, 32767).unwrap();
+                            get_string(&mut view, 32767).unwrap();
+                            if read_bool(&mut view) {
+                                get_string(&mut view, 32767).unwrap();
+                            }
+                        }
+                    }
+                    if actions & 4 != 0 {
+                        let mode = get_varint(&mut view).unwrap();
+                        assert!(matches!(mode, 0 | 1));
+                        entry.mode = Some(mode);
+                    }
+                    if actions & 8 != 0 {
+                        assert!(read_bool(&mut view));
+                    }
+                    if actions & 16 != 0 {
+                        assert!(get_varint(&mut view).unwrap() >= 0);
+                    }
+                    if actions & 128 != 0 {
+                        assert!(read_bool(&mut view));
+                    }
+                }
+                assert!(view.is_empty());
+            }
+            70 => {
+                let count = get_varint(&mut view).unwrap();
+                assert!((0..=4).contains(&count));
+                for _ in 0..count {
+                    let uuid = Uuid::from_slice(take(&mut view, 16).unwrap()).unwrap();
+                    self.tab.remove(&uuid);
+                }
+                assert!(view.is_empty());
+            }
+            8 => {
+                let position = read_block_position(&mut view);
+                let state = get_varint(&mut view).unwrap();
+                assert!(state >= 0);
+                assert!(view.is_empty());
+                self.block_updates.insert(position, state);
+            }
             73 => {
                 let teleport = get_varint(&mut view).unwrap();
                 let mut ack = vec![0];
@@ -405,6 +578,109 @@ impl Client {
         self.send(19, &[0]).await;
         self.ordered_snapshot().await
     }
+
+    async fn tab_mode(&mut self, uuid: Uuid, name: &str) -> i32 {
+        loop {
+            if let Some(entry) = self.tab.get(&uuid)
+                && entry.name.as_deref() == Some(name)
+                && let Some(mode) = entry.mode
+            {
+                return mode;
+            }
+            let (id, body) = self.read().await;
+            self.inspect(id, &body).await;
+        }
+    }
+
+    async fn flight_intent(&mut self, flags: u8) -> Abilities {
+        self.send(40, &[flags]).await;
+        loop {
+            let (id, body) = self.read().await;
+            self.inspect(id, &body).await;
+            if id == 65 {
+                return self.abilities.unwrap();
+            }
+        }
+    }
+
+    async fn rejected_block_action(
+        &mut self,
+        id: i32,
+        body: &[u8],
+        sequence: i32,
+        corrections: &[([i32; 3], i32)],
+    ) {
+        self.block_updates.clear();
+        self.send(id, body).await;
+        let mut rejected = false;
+        loop {
+            let (id, body) = self.read().await;
+            self.inspect(id, &body).await;
+            if id == 124 {
+                rejected |= body
+                    .windows(b"survival block interactions".len())
+                    .any(|part| part == b"survival block interactions");
+            }
+            if id == 4 {
+                let mut remaining = body.as_slice();
+                assert_eq!(get_varint(&mut remaining).unwrap(), sequence);
+                assert!(remaining.is_empty());
+                assert!(rejected, "action was not rejected by the Survival policy");
+                assert_eq!(
+                    self.block_updates,
+                    corrections.iter().copied().collect::<BTreeMap<_, _>>(),
+                    "authoritative correction did not precede its block ACK"
+                );
+                return;
+            }
+        }
+    }
+}
+
+fn assert_login_mode(client: &Client, mode: i32, flags: u8) {
+    assert_eq!(
+        client.login_mode,
+        Some(LoginMode {
+            current: mode,
+            previous: None
+        })
+    );
+    assert_eq!(
+        client.abilities,
+        Some(Abilities {
+            flags,
+            flying_speed: 0.05,
+            walking_speed: 0.1
+        })
+    );
+}
+
+fn block_position_bytes([x, y, z]: [i32; 3]) -> [u8; 8] {
+    (((i64::from(x) & 0x3ffffff) << 38)
+        | ((i64::from(z) & 0x3ffffff) << 12)
+        | (i64::from(y) & 0xfff))
+        .to_be_bytes()
+}
+
+fn destroy_body(action: i32, block: [i32; 3], sequence: i32) -> Vec<u8> {
+    let mut body = Vec::new();
+    put_varint(action, &mut body);
+    body.extend_from_slice(&block_position_bytes(block));
+    body.push(1);
+    put_varint(sequence, &mut body);
+    body
+}
+
+fn place_body(block: [i32; 3], sequence: i32) -> Vec<u8> {
+    let mut body = vec![0];
+    body.extend_from_slice(&block_position_bytes(block));
+    body.push(1);
+    for value in [0.5_f32, 1.0, 0.5] {
+        body.extend_from_slice(&value.to_be_bytes());
+    }
+    body.extend_from_slice(&[0, 0]);
+    put_varint(sequence, &mut body);
+    body
 }
 
 fn stone(count: i32) -> Option<Stack> {
@@ -464,39 +740,69 @@ fn real_count(snapshot: &Snapshot, item: i32) -> i32 {
 }
 
 fn assert_same_inventory(actual: &Snapshot, expected: &Snapshot) {
-    assert_eq!(
-        actual.slots, expected.slots,
-        "real or preview slots changed"
-    );
-    assert_eq!(actual.cursor, expected.cursor, "cursor changed");
-    assert_eq!(actual.selected, expected.selected, "selection changed");
+    assert_same_items(actual, expected);
     assert_eq!(
         actual.state, expected.state,
         "rejected mutation changed state ID"
     );
 }
 
-fn saved_inventory(directory: &Path, uuid: Uuid) -> serde_json::Value {
-    let bytes = std::fs::read(
-        directory
-            .join("world/playerdata")
-            .join(format!("{uuid}.zinv")),
-    )
-    .unwrap();
-    assert!((44..=2 * 1024 * 1024).contains(&bytes.len()));
-    assert_eq!(&bytes[..8], b"ZINV\0\0\0\x01");
+fn assert_same_items(actual: &Snapshot, expected: &Snapshot) {
     assert_eq!(
-        u32::from_be_bytes(bytes[8..12].try_into().unwrap()) as usize,
-        bytes.len() - 44
+        actual.slots, expected.slots,
+        "real or preview slots changed"
     );
-    let value: serde_json::Value = serde_json::from_slice(&bytes[44..]).unwrap();
-    assert_eq!(value["schema"], 2);
-    assert_eq!(value["slots"].as_array().unwrap().len(), 46);
+    assert_eq!(actual.cursor, expected.cursor, "cursor changed");
+    assert_eq!(actual.selected, expected.selected, "selection changed");
+}
+
+struct SavedInventory {
+    payload: Vec<u8>,
+    inventory: serde_json::Value,
+}
+
+fn saved_inventory(directory: &Path, uuid: Uuid) -> SavedInventory {
+    saved_inventory_in_mode(directory, uuid, "creative")
+}
+
+fn saved_inventory_in_mode(directory: &Path, uuid: Uuid, mode: &str) -> SavedInventory {
+    let world = WorldStore::open(directory.join("world")).unwrap();
+    let snapshot = world
+        .snapshot_domain(&[], &[PlayerKey::new(uuid)], &[])
+        .unwrap();
+    assert_eq!(snapshot.players.len(), 1);
+    assert_eq!(snapshot.players[0].key(), PlayerKey::new(uuid));
+    assert!(snapshot.players[0].revision() > 0);
+    let payload = snapshot.players[0].data().unwrap().to_vec();
+    assert!((1..=MAX_PLAYER_RECORD_BYTES).contains(&payload.len()));
+    let record: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+    assert_eq!(record["schema"], 1);
+    assert_eq!(record["world"], world.uuid().unwrap().to_string());
+    assert_eq!(record["game_mode"], mode);
+    assert!(record["previous_game_mode"].is_null());
+    let inventory = record["inventory"].clone();
+    assert_eq!(inventory["schema"], 2);
+    assert_eq!(inventory["minecraft_version"], "26.3");
+    assert_eq!(inventory["protocol"], 777);
+    assert_eq!(inventory["uuid"], uuid.to_string());
+    assert_eq!(inventory["slots"].as_array().unwrap().len(), 46);
     assert!(
-        value["slots"][0].is_null(),
+        inventory["slots"][0].is_null(),
         "derived result was persisted as item value"
     );
-    value
+    SavedInventory { payload, inventory }
+}
+
+fn saved_count(saved: &SavedInventory, item: &str) -> u64 {
+    saved.inventory["slots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .skip(1)
+        .chain(std::iter::once(&saved.inventory["cursor"]))
+        .filter(|stack| stack["item"].as_str() == Some(item))
+        .map(|stack| stack["count"].as_u64().unwrap())
+        .sum()
 }
 
 #[tokio::test]
@@ -556,11 +862,12 @@ async fn native_inventory_creative_clicks_give_swap_drop_rejection_and_restart()
         assert_eq!(given.hands[0], stone(25));
         let uuid = client.uuid;
         assert!(
-            directory
+            !directory
                 .path()
                 .join("world/playerdata")
                 .join(format!("{uuid}.zinv"))
-                .is_file()
+                .exists(),
+            "fresh player created a second inventory authority"
         );
         assert!(
             !directory
@@ -572,6 +879,17 @@ async fn native_inventory_creative_clicks_give_swap_drop_rejection_and_restart()
         drop(client);
         server.stop().await;
         drop(server);
+        let saved = saved_inventory(directory.path(), uuid);
+        assert_eq!(saved.inventory["selected"], 1);
+        assert_eq!(saved.inventory["slots"][37]["item"], "minecraft:stone");
+        assert_eq!(saved.inventory["slots"][37]["count"], 25);
+        let world = WorldStore::open(directory.path().join("world")).unwrap();
+        let forged = world
+            .snapshot_domain(&[], &[PlayerKey::new(Uuid::from_bytes([0x55; 16]))], &[])
+            .unwrap();
+        assert!(forged.players[0].data().is_none());
+        assert_eq!(forged.players[0].revision(), 0);
+        drop(world);
         let mut server = Server::start(directory.path());
         let mut client = Client::join(&server.address, "Tester").await;
         assert_eq!(client.uuid, uuid);
@@ -715,9 +1033,15 @@ async fn native_crafting_result_shift_predictions_and_stale_revisions() {
         assert_eq!(shifted.slots[44], item_stack(OAK_PLANKS, 8));
         assert_eq!(shifted.cursor, item_stack(OAK_PLANKS, 12));
         assert_eq!(real_count(&shifted, OAK_PLANKS), 20);
-        saved_inventory(directory.path(), client.uuid);
+        let uuid = client.uuid;
         drop(client);
         server.stop().await;
+        drop(server);
+        let saved = saved_inventory(directory.path(), uuid);
+        assert_eq!(saved_count(&saved, "minecraft:oak_planks"), 20);
+        assert_eq!(saved_count(&saved, "minecraft:oak_log"), 0);
+        assert_eq!(saved_count(&saved, "minecraft:stone"), 0);
+        assert!(saved.inventory["cursor"].is_null());
     })
     .await
     .expect("native crafting click scenario timed out");
@@ -757,9 +1081,15 @@ async fn native_crafting_honey_remainders_return_to_inputs_and_inventory() {
         assert_eq!(real_count(&second, HONEY_BOTTLE), 0);
         assert_eq!(real_count(&second, HONEY_BLOCK), 2);
         assert_eq!(real_count(&second, GLASS_BOTTLE), 8);
-        saved_inventory(directory.path(), client.uuid);
+        let uuid = client.uuid;
         drop(client);
         server.stop().await;
+        drop(server);
+        let saved = saved_inventory(directory.path(), uuid);
+        assert_eq!(saved_count(&saved, "minecraft:honey_bottle"), 0);
+        assert_eq!(saved_count(&saved, "minecraft:honey_block"), 2);
+        assert_eq!(saved_count(&saved, "minecraft:glass_bottle"), 8);
+        assert!(saved.inventory["cursor"].is_null());
     })
     .await
     .expect("native honey remainder scenario timed out");
@@ -792,20 +1122,39 @@ async fn native_crafting_no_drop_rollback_and_preview_recovery_after_restart() {
         assert_eq!(real_count(&before, OAK_PLANKS), 62);
         assert_eq!(real_count(&before, OAK_LOG), 1);
         let uuid = client.uuid;
-        let path = directory
-            .path()
-            .join("world/playerdata")
-            .join(format!("{uuid}.zinv"));
-        let saved_before = std::fs::read(&path).unwrap();
-        saved_inventory(directory.path(), uuid);
+        drop(client);
+        server.player_left("CraftFull").await;
+        server.stop().await;
+        drop(server);
+        let saved_before = saved_inventory(directory.path(), uuid);
+        assert_eq!(
+            saved_before.inventory["slots"][1]["item"],
+            "minecraft:oak_log"
+        );
+        assert_eq!(saved_before.inventory["slots"][1]["count"], 1);
+        assert_eq!(saved_count(&saved_before, "minecraft:stone"), 2240);
+        assert_eq!(saved_count(&saved_before, "minecraft:oak_planks"), 62);
+        assert_eq!(saved_count(&saved_before, "minecraft:oak_log"), 1);
+
+        let mut server = Server::start(directory.path());
+        let mut client = Client::join(&server.address, "CraftFull").await;
+        assert_eq!(client.uuid, uuid);
+        assert_eq!(client.snapshot.slots, before.slots);
+        assert_eq!(client.snapshot.cursor, before.cursor);
+        assert_eq!(client.snapshot.selected, before.selected);
+        let before = client.snapshot.clone();
         let rejected = client.crafting_click(0, 0, 1, before.state, false).await;
         assert_same_inventory(&rejected, &before);
-        assert_eq!(std::fs::read(&path).unwrap(), saved_before);
         assert_same_inventory(&client.close_crafting().await, &before);
         drop(client);
         server.player_left("CraftFull").await;
         server.stop().await;
         drop(server);
+        let saved_rejected = saved_inventory(directory.path(), uuid);
+        assert_eq!(
+            saved_rejected.payload, saved_before.payload,
+            "rejected craft or overflowing close changed durable player contents"
+        );
 
         let mut server = Server::start(directory.path());
         let mut client = Client::join(&server.address, "CraftFull").await;
@@ -823,9 +1172,14 @@ async fn native_crafting_no_drop_rollback_and_preview_recovery_after_restart() {
         assert_eq!(completed.slots[44], item_stack(OAK_PLANKS, 64));
         assert_eq!(completed.slots[43], item_stack(OAK_PLANKS, 2));
         assert_eq!(real_count(&completed, OAK_PLANKS), 66);
-        saved_inventory(directory.path(), uuid);
         drop(client);
         server.stop().await;
+        drop(server);
+        let saved = saved_inventory(directory.path(), uuid);
+        assert_eq!(saved_count(&saved, "minecraft:oak_planks"), 66);
+        assert_eq!(saved_count(&saved, "minecraft:oak_log"), 0);
+        assert_eq!(saved_count(&saved, "minecraft:stone"), 2176);
+        assert!(saved.inventory["cursor"].is_null());
     })
     .await
     .expect("native no-drop rollback/restart scenario timed out");
@@ -840,9 +1194,8 @@ async fn native_crafting_close_returns_real_items_and_survives_reconnect_restart
         let mut client = Client::join(&server.address, "CraftClose").await;
         let seeded = client.creative_stack(1, item_stack(OAK_LOG, 3)).await;
         let uuid = client.uuid;
-        let saved = saved_inventory(directory.path(), uuid);
-        assert_eq!(saved["slots"][1]["item"], "minecraft:oak_log");
-        assert_eq!(saved["slots"][1]["count"], 3);
+        assert_eq!(seeded.slots[1], item_stack(OAK_LOG, 3));
+        assert_eq!(seeded.slots[0], item_stack(OAK_PLANKS, 4));
         let carrying = client.crafting_click(0, 0, 0, seeded.state, false).await;
         assert_eq!(carrying.cursor, item_stack(OAK_PLANKS, 4));
         assert_eq!(carrying.slots[1], item_stack(OAK_LOG, 2));
@@ -872,7 +1225,6 @@ async fn native_crafting_close_returns_real_items_and_survives_reconnect_restart
             "the virtual preview was duplicated"
         );
         assert_eq!(real_count(&closed, OAK_LOG), 1);
-        assert!(saved_inventory(directory.path(), uuid)["cursor"].is_null());
         drop(client);
         server.player_left("CraftClose").await;
         let client = Client::join(&server.address, "CraftClose").await;
@@ -882,6 +1234,15 @@ async fn native_crafting_close_returns_real_items_and_survives_reconnect_restart
         server.player_left("CraftClose").await;
         server.stop().await;
         drop(server);
+        let saved_closed = saved_inventory(directory.path(), uuid);
+        assert!(saved_closed.inventory["cursor"].is_null());
+        assert!(
+            saved_closed.inventory["slots"].as_array().unwrap()[..5]
+                .iter()
+                .all(serde_json::Value::is_null)
+        );
+        assert_eq!(saved_count(&saved_closed, "minecraft:oak_planks"), 8);
+        assert_eq!(saved_count(&saved_closed, "minecraft:oak_log"), 1);
 
         let mut server = Server::start(directory.path());
         let client = Client::join(&server.address, "CraftClose").await;
@@ -891,6 +1252,12 @@ async fn native_crafting_close_returns_real_items_and_survives_reconnect_restart
         assert_eq!(real_count(&client.snapshot, OAK_LOG), 1);
         drop(client);
         server.stop().await;
+        drop(server);
+        assert_eq!(
+            saved_inventory(directory.path(), uuid).payload,
+            saved_closed.payload,
+            "reconnect or restart changed the closed crafting inventory"
+        );
     })
     .await
     .expect("native crafting close/reconnect/restart scenario timed out");
@@ -908,7 +1275,6 @@ async fn native_crafting_eof_finalizes_grid_and_cursor_before_same_uuid_reconnec
         assert_eq!(committed.cursor, item_stack(OAK_PLANKS, 4));
         assert_eq!(committed.slots[1], item_stack(OAK_LOG, 1));
         let uuid = client.uuid;
-        saved_inventory(directory.path(), uuid);
         drop(client);
         // This lifecycle event means the former session entered closing. The
         // login fence must then wait for its actual finalization, not race a sleep.
@@ -927,16 +1293,198 @@ async fn native_crafting_eof_finalizes_grid_and_cursor_before_same_uuid_reconnec
         assert_eq!(client.snapshot.slots[37], item_stack(OAK_LOG, 1));
         assert_eq!(real_count(&client.snapshot, OAK_PLANKS), 4);
         assert_eq!(real_count(&client.snapshot, OAK_LOG), 1);
+        drop(client);
+        server.stop().await;
+        drop(server);
         let saved = saved_inventory(directory.path(), uuid);
-        assert!(saved["cursor"].is_null());
+        assert!(saved.inventory["cursor"].is_null());
         assert!(
-            saved["slots"].as_array().unwrap()[..5]
+            saved.inventory["slots"].as_array().unwrap()[..5]
                 .iter()
                 .all(serde_json::Value::is_null)
         );
-        drop(client);
-        server.stop().await;
+        assert_eq!(saved_count(&saved, "minecraft:oak_planks"), 4);
+        assert_eq!(saved_count(&saved, "minecraft:oak_log"), 1);
     })
     .await
     .expect("native crafting EOF/reconnect scenario timed out");
+}
+
+#[tokio::test]
+#[ignore = "requires prepared official Minecraft26.3 data"]
+async fn native_survival_policy_blocks_forged_privileges_and_world_edits_but_allows_crafting() {
+    timeout(Duration::from_secs(90), async {
+        let directory = tempfile::tempdir().unwrap();
+        let mut server = Server::start_in_mode(directory.path(), "survival");
+        let mut client = Client::join(&server.address, "Survival").await;
+        let mut observer = Client::join(&server.address, "Observer").await;
+        assert_login_mode(&client, 0, 0);
+        assert_login_mode(&observer, 0, 0);
+        let uuid = client.uuid;
+        let observer_uuid = observer.uuid;
+        assert_eq!(client.tab_mode(uuid, "Survival").await, 0);
+        assert_eq!(client.tab_mode(observer_uuid, "Observer").await, 0);
+        assert_eq!(observer.tab_mode(uuid, "Survival").await, 0);
+        assert_eq!(observer.tab_mode(observer_uuid, "Observer").await, 0);
+
+        let before = client.snapshot.clone();
+        assert_eq!(client.flight_intent(15).await.flags, 0);
+        assert_eq!(client.flight_intent(255).await.flags, 0);
+        assert_same_inventory(&client.ordered_snapshot().await, &before);
+        let rejected = client.creative_stack(36, stone(64)).await;
+        assert_same_inventory(&rejected, &before);
+
+        server.command("give Survival minecraft:oak_log 2");
+        let supplied = client.sync().await;
+        assert_eq!(supplied.slots[36], item_stack(OAK_LOG, 2));
+        let cloned = client.crafting_click(36, 2, 3, supplied.state, false).await;
+        assert_same_items(&cloned, &supplied);
+        assert_eq!(real_count(&cloned, OAK_LOG), 2);
+        let carrying = client.crafting_click(36, 0, 0, cloned.state, false).await;
+        assert_eq!(carrying.cursor, item_stack(OAK_LOG, 2));
+        for (slot, button) in [(-999, 8), (9, 9), (-999, 10)] {
+            let rejected = client
+                .crafting_click(slot, button, 5, carrying.state, false)
+                .await;
+            assert_same_inventory(&rejected, &carrying);
+        }
+        let grid = client.crafting_click(1, 0, 0, carrying.state, false).await;
+        assert_eq!(grid.slots[1], item_stack(OAK_LOG, 2));
+        assert_eq!(grid.slots[0], item_stack(OAK_PLANKS, 4));
+        let crafted = client.crafting_click(0, 0, 0, grid.state, false).await;
+        assert_eq!(crafted.cursor, item_stack(OAK_PLANKS, 4));
+        assert_eq!(crafted.slots[1], item_stack(OAK_LOG, 1));
+        let closed = client.close_crafting().await;
+        assert!(closed.slots[..5].iter().all(Option::is_none));
+        assert!(closed.cursor.is_none());
+        assert_eq!(closed.hands[0], item_stack(OAK_PLANKS, 4));
+        assert_eq!(real_count(&closed, OAK_PLANKS), 4);
+        assert_eq!(real_count(&closed, OAK_LOG), 1);
+
+        let blocks = zerqon_blocks::Catalog::embedded().unwrap();
+        let grass = blocks
+            .resolve("minecraft:grass_block", &BTreeMap::new())
+            .unwrap()
+            .0 as i32;
+        let air = blocks.air().0 as i32;
+        let target = [2, 63, 0];
+        for (action, sequence) in [(0, 100), (3, 101)] {
+            client
+                .rejected_block_action(
+                    41,
+                    &destroy_body(action, target, sequence),
+                    sequence,
+                    &[(target, grass)],
+                )
+                .await;
+        }
+        client
+            .rejected_block_action(
+                66,
+                &place_body(target, 102),
+                102,
+                &[(target, grass), ([2, 64, 0], air)],
+            )
+            .await;
+        assert_same_inventory(&client.ordered_snapshot().await, &closed);
+
+        drop(observer);
+        server.player_left("Observer").await;
+        drop(client);
+        server.player_left("Survival").await;
+        server.stop().await;
+        drop(server);
+        let saved = saved_inventory_in_mode(directory.path(), uuid, "survival");
+        assert_eq!(saved_count(&saved, "minecraft:oak_planks"), 4);
+        assert_eq!(saved_count(&saved, "minecraft:oak_log"), 1);
+        assert_eq!(saved_count(&saved, "minecraft:stone"), 0);
+        saved_inventory_in_mode(directory.path(), observer_uuid, "survival");
+        let world = WorldStore::open(directory.path().join("world")).unwrap();
+        let chunks = world
+            .snapshot_domain(&[ChunkKey::new(0, 0)], &[], &[])
+            .unwrap();
+        assert_eq!(
+            chunks.chunks[0].revision(),
+            0,
+            "denied world edit committed a chunk"
+        );
+        assert!(chunks.chunks[0].chunk().is_none());
+    })
+    .await
+    .expect("native Survival authority scenario timed out");
+}
+
+#[tokio::test]
+#[ignore = "requires prepared official Minecraft26.3 data"]
+async fn native_saved_modes_survive_default_changes_and_creative_flight_is_session_owned() {
+    timeout(Duration::from_secs(90), async {
+        let directory = tempfile::tempdir().unwrap();
+        let mut server = Server::start_in_mode(directory.path(), "survival");
+        let mut existing = Client::join(&server.address, "KeptMode").await;
+        assert_login_mode(&existing, 0, 0);
+        let existing_uuid = existing.uuid;
+        server.command("give KeptMode minecraft:stone 3");
+        assert_eq!(existing.sync().await.slots[36], stone(3));
+        drop(existing);
+        server.player_left("KeptMode").await;
+        let mut existing = Client::join(&server.address, "KeptMode").await;
+        assert_eq!(existing.uuid, existing_uuid);
+        assert_login_mode(&existing, 0, 0);
+        assert_eq!(existing.tab_mode(existing_uuid, "KeptMode").await, 0);
+        assert_eq!(existing.snapshot.slots[36], stone(3));
+        drop(existing);
+        server.player_left("KeptMode").await;
+        server.stop().await;
+        drop(server);
+        let saved_survival = saved_inventory_in_mode(directory.path(), existing_uuid, "survival");
+        assert_eq!(saved_count(&saved_survival, "minecraft:stone"), 3);
+
+        let mut server = Server::start_in_mode(directory.path(), "creative");
+        let mut existing = Client::join(&server.address, "KeptMode").await;
+        let mut fresh = Client::join(&server.address, "FreshMode").await;
+        assert_eq!(existing.uuid, existing_uuid);
+        assert_login_mode(&existing, 0, 0);
+        assert_login_mode(&fresh, 1, 0x0d);
+        let fresh_uuid = fresh.uuid;
+        assert_ne!(fresh_uuid, existing_uuid);
+        assert_eq!(existing.snapshot.slots[36], stone(3));
+        assert_eq!(existing.tab_mode(existing_uuid, "KeptMode").await, 0);
+        assert_eq!(existing.tab_mode(fresh_uuid, "FreshMode").await, 1);
+        assert_eq!(fresh.tab_mode(existing_uuid, "KeptMode").await, 0);
+        assert_eq!(fresh.tab_mode(fresh_uuid, "FreshMode").await, 1);
+        assert_eq!(existing.flight_intent(15).await.flags, 0);
+        assert_eq!(fresh.flight_intent(2).await.flags, 0x0f);
+        assert_eq!(fresh.flight_intent(0).await.flags, 0x0d);
+        assert_eq!(fresh.flight_intent(255).await.flags, 0x0f);
+        assert!(fresh.snapshot.slots.iter().all(Option::is_none));
+        drop(fresh);
+        server.player_left("FreshMode").await;
+        let mut fresh = Client::join(&server.address, "FreshMode").await;
+        assert_eq!(fresh.uuid, fresh_uuid);
+        assert_login_mode(&fresh, 1, 0x0d);
+        assert_eq!(fresh.tab_mode(existing_uuid, "KeptMode").await, 0);
+        assert_eq!(fresh.tab_mode(fresh_uuid, "FreshMode").await, 1);
+        drop(fresh);
+        server.player_left("FreshMode").await;
+        drop(existing);
+        server.player_left("KeptMode").await;
+        server.stop().await;
+        drop(server);
+        let survived = saved_inventory_in_mode(directory.path(), existing_uuid, "survival");
+        assert_eq!(
+            survived.payload, saved_survival.payload,
+            "configured default replaced saved player state"
+        );
+        let creative = saved_inventory_in_mode(directory.path(), fresh_uuid, "creative");
+        assert!(
+            creative.inventory["slots"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(serde_json::Value::is_null)
+        );
+        assert!(creative.inventory["cursor"].is_null());
+    })
+    .await
+    .expect("native persisted mode and flight scenario timed out");
 }

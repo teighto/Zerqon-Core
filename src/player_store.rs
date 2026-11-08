@@ -54,68 +54,25 @@ impl PlayerStore {
         Ok(Self { directory, catalog })
     }
 
+    #[cfg(test)]
     pub fn load(&self, uuid: Uuid) -> Result<PlayerInventory, StoreError> {
+        Ok(self.load_existing(uuid)?.unwrap_or_default())
+    }
+
+    pub fn load_existing(&self, uuid: Uuid) -> Result<Option<PlayerInventory>, StoreError> {
         let path = self.path(uuid)?;
         let Some(bytes) = read_file(&path)? else {
-            return Ok(PlayerInventory::new());
+            return Ok(None);
         };
-        let data = decode_file(&bytes)?;
-        if !matches!(data.schema, 1 | 2) || data.minecraft_version != "26.3" || data.protocol != 777
-        {
-            return Err(StoreError::Invalid(
-                "unsupported inventory schema or Minecraft version",
-            ));
-        }
-        if data.uuid != uuid {
-            return Err(StoreError::Invalid("embedded UUID differs from filename"));
-        }
-        if data.slots.len() != MENU_SLOT_COUNT {
-            return Err(StoreError::Invalid(
-                "inventory must have exactly 46 menu slots",
-            ));
-        }
-        if data.slots[0].is_some() {
-            return Err(StoreError::Invalid(
-                "saved crafting result requires explicit recovery; original file preserved",
-            ));
-        }
-        let mut inventory = PlayerInventory::new();
-        for (index, stack) in data.slots.into_iter().enumerate() {
-            inventory.set_slot(
-                &self.catalog,
-                index as i16,
-                decode_stack(stack, &self.catalog)?,
-            )?;
-        }
-        inventory.set_cursor(&self.catalog, decode_stack(data.cursor, &self.catalog)?)?;
-        inventory.select_hotbar(i16::from(data.selected))?;
-        Ok(inventory)
+        decode_file(&bytes)?.restore(uuid, &self.catalog).map(Some)
     }
 
     /// The caller serializes load/save operations for each UUID.
+    #[cfg(test)]
     pub fn save(&self, uuid: Uuid, inventory: &PlayerInventory) -> Result<(), StoreError> {
         let path = self.path(uuid)?;
         self.load(uuid)?;
-        let data = StoredInventory {
-            schema: 2,
-            minecraft_version: "26.3".into(),
-            protocol: 777,
-            uuid,
-            selected: inventory.selected(),
-            slots: inventory
-                .slots()
-                .iter()
-                .enumerate()
-                .map(|(index, slot)| {
-                    if index == 0 {
-                        Ok(None)
-                    } else {
-                        encode_stack(slot, &self.catalog)
-                    }
-                })
-                .collect::<Result<_, _>>()?,
-            cursor: encode_stack(inventory.cursor(), &self.catalog)?,
-        };
+        let data = StoredInventory::capture(uuid, inventory, &self.catalog)?;
         let payload = serialize_bounded(&data)?;
         reject_inventory_links(&path)?;
         #[cfg(unix)]
@@ -184,7 +141,7 @@ fn reject_inventory_links(path: &Path) -> Result<(), StoreError> {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct StoredInventory {
+pub(crate) struct StoredInventory {
     schema: u32,
     minecraft_version: String,
     protocol: u32,
@@ -193,6 +150,77 @@ struct StoredInventory {
     #[serde(deserialize_with = "slots")]
     slots: Vec<Option<StoredStack>>,
     cursor: Option<StoredStack>,
+}
+
+impl StoredInventory {
+    pub(crate) fn schema(&self) -> u32 {
+        self.schema
+    }
+
+    pub(crate) fn capture(
+        uuid: Uuid,
+        inventory: &PlayerInventory,
+        catalog: &ItemCatalog,
+    ) -> Result<Self, StoreError> {
+        if uuid.is_nil() {
+            return Err(StoreError::Invalid("nil player UUID"));
+        }
+        Ok(Self {
+            schema: 2,
+            minecraft_version: "26.3".into(),
+            protocol: 777,
+            uuid,
+            selected: inventory.selected(),
+            slots: inventory
+                .slots()
+                .iter()
+                .enumerate()
+                .map(|(index, slot)| {
+                    if index == 0 {
+                        Ok(None)
+                    } else {
+                        encode_stack(slot, catalog)
+                    }
+                })
+                .collect::<Result<_, _>>()?,
+            cursor: encode_stack(inventory.cursor(), catalog)?,
+        })
+    }
+
+    pub(crate) fn restore(
+        self,
+        uuid: Uuid,
+        catalog: &ItemCatalog,
+    ) -> Result<PlayerInventory, StoreError> {
+        if !matches!(self.schema, 1 | 2) || self.minecraft_version != "26.3" || self.protocol != 777
+        {
+            return Err(StoreError::Invalid(
+                "unsupported inventory schema or Minecraft version",
+            ));
+        }
+        if uuid.is_nil() || self.uuid != uuid {
+            return Err(StoreError::Invalid(
+                "embedded UUID differs from player identity",
+            ));
+        }
+        if self.slots.len() != MENU_SLOT_COUNT {
+            return Err(StoreError::Invalid(
+                "inventory must have exactly 46 menu slots",
+            ));
+        }
+        if self.slots[0].is_some() {
+            return Err(StoreError::Invalid(
+                "saved crafting result requires explicit recovery; original file preserved",
+            ));
+        }
+        let mut inventory = PlayerInventory::new();
+        for (index, stack) in self.slots.into_iter().enumerate() {
+            inventory.set_slot(catalog, index as i16, decode_stack(stack, catalog)?)?;
+        }
+        inventory.set_cursor(catalog, decode_stack(self.cursor, catalog)?)?;
+        inventory.select_hotbar(i16::from(self.selected))?;
+        Ok(inventory)
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -438,14 +466,23 @@ fn decode_file(bytes: &[u8]) -> Result<StoredInventory, StoreError> {
     Ok(serde_json::from_slice(payload)?)
 }
 
+#[cfg(test)]
 fn serialize_bounded(data: &StoredInventory) -> Result<Vec<u8>, StoreError> {
+    serialize_payload(data, MAX_FILE_BYTES - HEADER_BYTES)
+}
+
+pub(crate) fn serialize_payload(
+    data: &impl Serialize,
+    limit: usize,
+) -> Result<Vec<u8>, StoreError> {
     struct BoundedWriter {
         bytes: Vec<u8>,
         failed: bool,
+        limit: usize,
     }
     impl Write for BoundedWriter {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            if bytes.len() > (MAX_FILE_BYTES - HEADER_BYTES).saturating_sub(self.bytes.len()) {
+            if bytes.len() > self.limit.saturating_sub(self.bytes.len()) {
                 self.failed = true;
                 return Err(io::Error::other("inventory payload limit"));
             }
@@ -459,6 +496,7 @@ fn serialize_bounded(data: &StoredInventory) -> Result<Vec<u8>, StoreError> {
     let mut writer = BoundedWriter {
         bytes: Vec::new(),
         failed: false,
+        limit,
     };
     let result = serde_json::to_writer(&mut writer, data);
     if writer.failed {
@@ -468,6 +506,7 @@ fn serialize_bounded(data: &StoredInventory) -> Result<Vec<u8>, StoreError> {
     Ok(writer.bytes)
 }
 
+#[cfg(test)]
 fn write_file(writer: &mut impl Write, payload: &[u8]) -> Result<(), StoreError> {
     if payload.len() > MAX_FILE_BYTES - HEADER_BYTES {
         return Err(StoreError::Limit);
@@ -595,6 +634,24 @@ mod tests {
             .unwrap();
         inventory.select_hotbar(4).unwrap();
         inventory
+    }
+
+    #[test]
+    fn absent_legacy_file_is_distinct_from_a_saved_empty_inventory() {
+        let root = tempfile::tempdir().unwrap();
+        let store = PlayerStore::new(root.path().into(), catalog(1, 6)).unwrap();
+        let player = Uuid::from_u128(1);
+        assert!(store.load_existing(player).unwrap().is_none());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        store.save(player, &PlayerInventory::new()).unwrap();
+        let path = root.path().join(format!("{player}.zinv"));
+        let original = std::fs::read(&path).unwrap();
+        assert_eq!(
+            store.load_existing(player).unwrap(),
+            Some(PlayerInventory::new())
+        );
+        assert_eq!(std::fs::read(path).unwrap(), original);
+        assert!(store.load_existing(Uuid::nil()).is_err());
     }
 
     #[test]

@@ -5,6 +5,17 @@ use std::{
     sync::{Mutex, atomic::AtomicUsize},
 };
 
+thread_local! {
+    static BEFORE_DOMAIN_WRITER: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+}
+
+pub(super) fn before_domain_writer() {
+    let hook = BEFORE_DOMAIN_WRITER.with(|hook| hook.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 #[derive(Debug, Default)]
 struct Disk {
     live: Mutex<Vec<u8>>,
@@ -128,6 +139,7 @@ fn baseline() -> Vec<u8> {
         transaction.open_table(RECEIPTS).unwrap();
         transaction.open_table(RECEIPT_ORDER).unwrap();
         transaction.open_table(CHUNKS).unwrap();
+        create_domain_tables(&transaction).unwrap();
     }
     transaction.commit().unwrap();
     migration_batch(
@@ -325,4 +337,287 @@ fn sync_failure_after_durable_commit_is_indeterminate_and_never_rollback() {
     let recovered = store(database(restore(&persisted)));
     assert_eq!(values(&recovered), (99, 99));
     assert!(recovered.receipt(operation).unwrap().is_some());
+}
+
+fn mixed_update(store: &Transactions, operation: Uuid) -> Result<DomainReceipt, CommitError> {
+    let key = ChunkKey::new(0, 0);
+    let player = PlayerKey::new(Uuid::from_u128(1));
+    let drop_key = DropKey::new(Uuid::from_u128(2));
+    let reads = store
+        .snapshot_domain(&[key], &[player], &[drop_key])
+        .unwrap();
+    store.commit_domain(
+        operation,
+        &reads,
+        &[ChunkWrite {
+            key,
+            replacement: Arc::new(chunk(0, 77)),
+        }],
+        &[PlayerWrite {
+            key: player,
+            replacement: Arc::from([77]),
+        }],
+        &[DropWrite {
+            key: drop_key,
+            replacement: Some(DropData {
+                chunk: key,
+                data: Arc::from([77]),
+            }),
+        }],
+    )
+}
+
+fn mixed_state(store: &Transactions) -> bool {
+    let key = ChunkKey::new(0, 0);
+    let player = PlayerKey::new(Uuid::from_u128(1));
+    let drop_key = DropKey::new(Uuid::from_u128(2));
+    let state = store
+        .snapshot_domain(&[key], &[player], &[drop_key])
+        .unwrap();
+    let value = state.chunks[0]
+        .chunk()
+        .unwrap()
+        .get_block(0, 64, 0)
+        .unwrap();
+    let indexed = store.scan_drops(Some(key), None, 64).unwrap();
+    match value {
+        0 => {
+            assert!(state.players[0].data().is_none());
+            assert!(state.drops[0].data().is_none());
+            assert!(indexed.is_empty());
+            false
+        }
+        77 => {
+            assert_eq!(state.players[0].data().unwrap().as_ref(), &[77]);
+            assert_eq!(state.drops[0].data().unwrap().as_ref(), &[77]);
+            assert_eq!(state.drops[0].chunk(), Some(key));
+            assert_eq!(state.players[0].revision(), state.chunks[0].revision());
+            assert_eq!(state.drops[0].revision(), state.chunks[0].revision());
+            assert_eq!(indexed.len(), 1);
+            assert_eq!(indexed[0].key(), drop_key);
+            true
+        }
+        other => panic!("partial or unexpected block state {other}"),
+    }
+}
+
+#[test]
+fn mixed_domain_recovers_all_records_and_index_at_every_write_sync_failure() {
+    let original = baseline();
+    let disk = restore(&original);
+    let successful = store(database(Arc::clone(&disk)));
+    reset(&disk);
+    mixed_update(&successful, Uuid::new_v4()).unwrap();
+    let boundaries = disk.events.lock().unwrap().len();
+    assert!(boundaries >= 4);
+    drop(successful);
+    for boundary in 1..=boundaries {
+        let disk = restore(&original);
+        let current = store(database(Arc::clone(&disk)));
+        reset(&disk);
+        disk.fail.store(boundary, Ordering::SeqCst);
+        let operation = Uuid::new_v4();
+        let outcome = mixed_update(&current, operation);
+        assert!(
+            outcome.is_err(),
+            "failure boundary {boundary} was not exercised"
+        );
+        assert!(matches!(
+            current.healthy(),
+            Err(WorldError::StorageUnavailable)
+        ));
+        let persisted = disk.durable.lock().unwrap().clone();
+        drop(current);
+        let recovered = store(database(restore(&persisted)));
+        let committed = mixed_state(&recovered);
+        assert_eq!(
+            recovered.domain_receipt(operation).unwrap().is_some(),
+            committed,
+            "boundary {boundary}"
+        );
+        if matches!(outcome, Err(CommitError::Rejected(_))) {
+            assert!(
+                !committed,
+                "rejected boundary {boundary} persisted its domain"
+            );
+        }
+        drop(recovered);
+        let twice = store(database(restore(&persisted)));
+        assert_eq!(mixed_state(&twice), committed);
+    }
+}
+
+#[test]
+fn mixed_domain_durable_sync_failure_recovers_receipt_without_duplicate_drop() {
+    let original = baseline();
+    let disk = restore(&original);
+    let current = store(database(Arc::clone(&disk)));
+    reset(&disk);
+    disk.fail_after_sync.store(2, Ordering::SeqCst);
+    let operation = Uuid::new_v4();
+    assert!(matches!(
+        mixed_update(&current, operation),
+        Err(CommitError::Indeterminate { .. })
+    ));
+    assert!(matches!(
+        current.domain_receipt(operation),
+        Err(WorldError::StorageUnavailable)
+    ));
+    let persisted = disk.durable.lock().unwrap().clone();
+    drop(current);
+    let recovered = store(database(restore(&persisted)));
+    assert!(mixed_state(&recovered));
+    let receipt = recovered.domain_receipt(operation).unwrap().unwrap();
+    assert_eq!(receipt.players.len(), 1);
+    assert_eq!(receipt.drops.len(), 1);
+    assert_eq!(recovered.scan_drops(None, None, 64).unwrap().len(), 1);
+}
+
+#[test]
+fn existing_only_world_accepts_player_and_drop_records_without_creating_chunks() {
+    let disk = restore(&baseline());
+    let mut current = store(database(disk));
+    current.policy = GenerationPolicy::ExistingOnly;
+    let player = PlayerKey::new(Uuid::from_u128(1));
+    let drop_key = DropKey::new(Uuid::from_u128(2));
+    let reads = current
+        .snapshot_domain(&[], &[player], &[drop_key])
+        .unwrap();
+    current
+        .commit_domain(
+            Uuid::new_v4(),
+            &reads,
+            &[],
+            &[PlayerWrite {
+                key: player,
+                replacement: Arc::from([3]),
+            }],
+            &[DropWrite {
+                key: drop_key,
+                replacement: Some(DropData {
+                    chunk: ChunkKey::new(0, 0),
+                    data: Arc::from([4]),
+                }),
+            }],
+        )
+        .unwrap();
+    let missing = ChunkKey::new(99, 0);
+    let reads = current.snapshot_domain(&[missing], &[player], &[]).unwrap();
+    current
+        .commit_domain(
+            Uuid::new_v4(),
+            &reads,
+            &[],
+            &[PlayerWrite {
+                key: player,
+                replacement: Arc::from([6]),
+            }],
+            &[],
+        )
+        .unwrap();
+    let reads = current.snapshot_domain(&[missing], &[player], &[]).unwrap();
+    assert!(matches!(
+        current.commit_domain(
+            Uuid::new_v4(),
+            &reads,
+            &[ChunkWrite {
+                key: missing,
+                replacement: Arc::new(chunk(99, 8))
+            }],
+            &[PlayerWrite {
+                key: player,
+                replacement: Arc::from([8])
+            }],
+            &[]
+        ),
+        Err(CommitError::Rejected(WorldError::MissingImportedChunk {
+            x: 99,
+            z: 0
+        }))
+    ));
+    assert_eq!(
+        current
+            .snapshot_domain(&[], &[player], &[])
+            .unwrap()
+            .players[0]
+            .data()
+            .unwrap()
+            .as_ref(),
+        &[6]
+    );
+}
+
+#[test]
+fn waiting_domain_writer_cannot_commit_after_a_corrupt_read_latches_failure() {
+    let disk = restore(&baseline());
+    let current = store(database(disk));
+    let good = PlayerKey::new(Uuid::from_u128(1));
+    let corrupt = PlayerKey::new(Uuid::from_u128(2));
+    let reads = current.snapshot_domain(&[], &[good], &[]).unwrap();
+    {
+        let write = current.db.begin_write().unwrap();
+        {
+            let mut created = write.open_table(PLAYER_CREATED).unwrap();
+            created
+                .insert(corrupt.uuid.as_bytes().as_slice(), 1)
+                .unwrap();
+        }
+        write.commit().unwrap();
+    }
+    let held_writer = current.db.begin_write().unwrap();
+    let (reached, waiting) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let operation = Uuid::new_v4();
+    let outcome = std::thread::scope(|scope| {
+        let current = &current;
+        let worker = scope.spawn(move || {
+            BEFORE_DOMAIN_WRITER.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    reached.send(()).unwrap();
+                    released
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                }))
+            });
+            current.commit_domain(
+                operation,
+                &reads,
+                &[],
+                &[PlayerWrite {
+                    key: good,
+                    replacement: Arc::from([9]),
+                }],
+                &[],
+            )
+        });
+        waiting
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(current.snapshot_domain(&[], &[corrupt], &[]).is_err());
+        release.send(()).unwrap();
+        drop(held_writer);
+        worker.join().unwrap()
+    });
+    assert!(
+        matches!(
+            outcome,
+            Err(CommitError::Rejected(WorldError::StorageUnavailable))
+        ),
+        "queued writer committed after semantic failure: {outcome:?}"
+    );
+    let read = current.db.begin_read().unwrap();
+    assert!(
+        read.open_table(PLAYERS)
+            .unwrap()
+            .get(good.uuid.as_bytes().as_slice())
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        read.open_table(RECEIPTS)
+            .unwrap()
+            .get(operation.as_bytes().as_slice())
+            .unwrap()
+            .is_none()
+    );
 }

@@ -16,7 +16,9 @@ pub use metadata::{GenerationPolicy, SpawnPoint, WorldMetadata};
 pub use section::{SECTION_VOLUME, Section};
 pub use storage::WorldStore;
 pub use transaction::{
-    ChunkKey, ChunkSnapshot, ChunkWrite, CommitError, CommitReceipt, CommittedChunk,
+    ChunkKey, ChunkSnapshot, ChunkWrite, CommitError, CommitReceipt, CommittedChunk, CommittedDrop,
+    CommittedPlayer, DomainReceipt, DomainSnapshot, DropData, DropKey, DropSnapshot, DropWrite,
+    MAX_PLAYER_RECORD_BYTES, PlayerKey, PlayerSnapshot, PlayerWrite,
 };
 pub use workers::{ChunkTicket, ChunkWorkers};
 
@@ -28,6 +30,8 @@ pub enum WorldError {
     Storage(String),
     #[error("world storage is unavailable; reopen the world before continuing")]
     StorageUnavailable,
+    #[error("world transaction resource limit exceeded: {0}")]
+    TransactionLimit(&'static str),
     #[error("world commit {operation} has an uncertain outcome: {cause}")]
     CommitIndeterminate {
         operation: uuid::Uuid,

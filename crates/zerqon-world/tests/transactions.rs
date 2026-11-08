@@ -259,3 +259,92 @@ fn corrupted_chunk_value_is_rejected_without_using_preserved_legacy_bytes() {
     assert!(store.save(&Chunk::flat(0, 0, PALETTE)).is_err());
     assert_eq!(fs::read(root.path().join("c.0.0.zqc")).unwrap(), original);
 }
+
+#[test]
+fn receipt_eviction_handles_revision_gaps_without_rolling_back_committed_state() {
+    use redb::TableDefinition;
+    let root = tempfile::tempdir().unwrap();
+    let store = WorldStore::open(root.path()).unwrap();
+    let key = ChunkKey::new(0, 0);
+    let old = Uuid::new_v4();
+    store
+        .commit(old, &store.snapshot(&[key]).unwrap(), &[write(key, 77)])
+        .unwrap();
+    drop(store);
+    const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
+    let db = redb::Database::open(root.path().join("chunks.redb")).unwrap();
+    let transaction = db.begin_write().unwrap();
+    {
+        let mut table = transaction.open_table(META).unwrap();
+        table
+            .insert("revision", 4110u64.to_le_bytes().as_slice())
+            .unwrap();
+    }
+    transaction.commit().unwrap();
+    drop(db);
+    let store = WorldStore::open(root.path()).unwrap();
+    let player = zerqon_world::PlayerKey::new(Uuid::from_u128(1));
+    store
+        .commit_domain(
+            Uuid::new_v4(),
+            &store.snapshot_domain(&[], &[player], &[]).unwrap(),
+            &[],
+            &[zerqon_world::PlayerWrite {
+                key: player,
+                replacement: Arc::from([4]),
+            }],
+            &[],
+        )
+        .unwrap();
+    assert!(store.domain_receipt(old).unwrap().is_none());
+    assert_eq!(
+        store.load(0, 0).unwrap().unwrap().get_block(0, 64, 0),
+        Some(77)
+    );
+}
+
+#[test]
+fn corrupted_receipt_operation_cannot_be_reported_under_another_key() {
+    use redb::{ReadableTable, TableDefinition};
+    let root = tempfile::tempdir().unwrap();
+    let store = WorldStore::open(root.path()).unwrap();
+    let key = ChunkKey::new(0, 0);
+    let operation = Uuid::new_v4();
+    store
+        .commit(
+            operation,
+            &store.snapshot(&[key]).unwrap(),
+            &[write(key, 77)],
+        )
+        .unwrap();
+    drop(store);
+    const RECEIPTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("receipts");
+    let db = redb::Database::open(root.path().join("chunks.redb")).unwrap();
+    let transaction = db.begin_write().unwrap();
+    {
+        let mut table = transaction.open_table(RECEIPTS).unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(
+            table
+                .get(operation.as_bytes().as_slice())
+                .unwrap()
+                .unwrap()
+                .value(),
+        )
+        .unwrap();
+        value["receipt"]["operation"] = serde_json::json!(Uuid::new_v4());
+        table
+            .insert(
+                operation.as_bytes().as_slice(),
+                serde_json::to_vec(&value).unwrap().as_slice(),
+            )
+            .unwrap();
+    }
+    transaction.commit().unwrap();
+    drop(db);
+    let store = WorldStore::open(root.path()).unwrap();
+    assert!(store.domain_receipt(operation).is_err());
+    assert!(matches!(
+        store.check_available(),
+        Err(zerqon_world::WorldError::StorageUnavailable)
+    ));
+}

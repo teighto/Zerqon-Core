@@ -1,4 +1,4 @@
-use crate::entity_packets;
+use crate::{entity_packets, game_mode::GameMode};
 use bytes::Bytes;
 use std::collections::BTreeMap;
 use std::sync::{
@@ -412,7 +412,7 @@ impl Players {
         }
         let id = self.ids.next()?;
         let uuid = identity.uuid;
-        let profile = profile_packet(&identity);
+        let profile = profile_packet(&identity, GameMode::Creative);
         inner.insert(
             uuid,
             Player {
@@ -471,6 +471,22 @@ impl Players {
 impl PlayerHandle {
     pub fn id(&self) -> i32 {
         self.id
+    }
+    pub fn initialize_game_mode(&self, game_mode: GameMode) -> Result<(), PlayerError> {
+        let mut inner = self
+            .players
+            .inner
+            .lock()
+            .map_err(|_| PlayerError::Unavailable)?;
+        let player = inner
+            .get_mut(&self.uuid)
+            .filter(|player| player.id == self.id)
+            .ok_or(PlayerError::Unavailable)?;
+        if player.active {
+            return Err(PlayerError::Invalid);
+        }
+        player.profile = profile_packet(&player.identity, game_mode);
+        Ok(())
     }
     pub fn activate(&self) -> Result<(), PlayerError> {
         let mut inner = self
@@ -554,17 +570,24 @@ fn enqueue(player: &Player, batch: impl Into<PacketBatch>) {
         player.disconnect.send_replace(true);
     }
 }
-fn profile_packet(identity: &Identity) -> Bytes {
+fn profile_packet(identity: &Identity, game_mode: GameMode) -> Bytes {
     if identity.properties.is_empty() {
-        return entity_packets::player_info_add(identity.uuid, &identity.name, true).into();
+        return entity_packets::player_info_add(identity.uuid, &identity.name, true, game_mode)
+            .into();
     }
     let properties: Vec<_> = identity
         .properties
         .iter()
         .map(|(name, value, signature)| (name.as_str(), value.as_str(), signature.as_deref()))
         .collect();
-    entity_packets::player_info_add_properties(identity.uuid, &identity.name, true, &properties)
-        .into()
+    entity_packets::player_info_add_properties(
+        identity.uuid,
+        &identity.name,
+        true,
+        &properties,
+        game_mode,
+    )
+    .into()
 }
 fn spawn_packets(uuid: Uuid, player: &ReplicatedPlayer, kind: i32) -> PacketBatch {
     let mut packets = vec![
@@ -616,6 +639,37 @@ mod tests {
             packets.extend(batch);
         }
         packets
+    }
+
+    #[test]
+    fn initial_mode_is_sent_to_self_and_later_observers_and_cannot_change_after_activation() {
+        fn mode(packets: &[Bytes], uuid: Uuid) -> i32 {
+            let packet = packets
+                .iter()
+                .find(|packet| {
+                    packet.first() == Some(&71)
+                        && packet.get(1) == Some(&0x9d)
+                        && packet.get(3..19) == Some(uuid.as_bytes().as_slice())
+                })
+                .unwrap();
+            let mut body = &packet[19..];
+            zerqon_protocol::codec::get_string(&mut body, 16).unwrap();
+            assert_eq!(get_varint(&mut body).unwrap(), 0);
+            get_varint(&mut body).unwrap()
+        }
+        let players = Players::new(2, 64.0, 159, Arc::new(EntityIds::default()));
+        let (one, mut first, _) = connect(&players, 1, "One");
+        one.initialize_game_mode(GameMode::Survival).unwrap();
+        one.activate().unwrap();
+        assert!(one.initialize_game_mode(GameMode::Creative).is_err());
+        players.tracking_tick().unwrap();
+        assert_eq!(mode(&drain(&mut first), Uuid::from_u128(1)), 0);
+        let (two, mut second, _) = connect(&players, 2, "Two");
+        two.activate().unwrap();
+        players.tracking_tick().unwrap();
+        let observed = drain(&mut second);
+        assert_eq!(mode(&observed, Uuid::from_u128(1)), 0);
+        assert_eq!(mode(&observed, Uuid::from_u128(2)), 1);
     }
 
     #[test]

@@ -541,6 +541,7 @@ struct PlayState {
     rate_start: Instant,
     packet_count: u32,
     inventory_count: u32,
+    flying: bool,
 }
 
 struct ReceivedPacket {
@@ -693,15 +694,20 @@ async fn play(
         pitch: spawn.pitch,
         on_ground: true,
     };
+    let (game_mode, previous_game_mode) = inventory.modes()?;
+    registration.initialize_game_mode(game_mode)?;
     writer
         .send(&packets::login(
             registration.id(),
             state.properties.max_players as i32,
             state.properties.view_distance as i32,
             data.overworld_dimension,
+            game_mode,
+            previous_game_mode,
+            state.properties.online_mode,
         ))
         .await?;
-    writer.send(&packets::abilities()).await?;
+    writer.send(&packets::abilities(game_mode, false)).await?;
     writer
         .send(&crate::entity_packets::health(20.0, 20, 5.0))
         .await?;
@@ -814,6 +820,7 @@ async fn play(
         rate_start,
         packet_count,
         inventory_count,
+        flying: false,
     };
     let control_key = crate::player_control::SessionKey {
         uuid: profile.uuid,
@@ -946,7 +953,7 @@ async fn play(
             && (ordered_work_pending || !deferred.is_empty())
             && matches!(
                 id,
-                1 | 7 | 8 | 18 | 19 | 30 | 31 | 32 | 33 | 41 | 54 | 57 | 66
+                1 | 7 | 8 | 18 | 19 | 30 | 31 | 32 | 33 | 40 | 41 | 54 | 57 | 66
             )
         {
             if is_command {
@@ -965,6 +972,14 @@ async fn play(
         }
         let can_interact = play.teleport_confirmed && sequence > play.last_ack_sequence;
         match id {
+            40 => {
+                let requested = zerqon_protocol::decode_player_abilities(view)?;
+                let (mode, _) = inventory.modes()?;
+                if can_interact {
+                    play.flying = requested && mode == crate::game_mode::GameMode::Creative;
+                }
+                writer.send(&packets::abilities(mode, play.flying)).await?;
+            }
             18 | 19 | 54 | 57 => {
                 play.inventory_count += 1;
                 if play.inventory_count > 64 {
@@ -1200,7 +1215,10 @@ async fn play(
                         request.block.z.div_euclid(16),
                     )) {
                         Err("Block is outside the loaded terrain".into())
-                    } else if action == PlayerAction::StartDestroyBlock {
+                    } else if action == PlayerAction::StartDestroyBlock
+                        || (action == PlayerAction::StopDestroyBlock
+                            && inventory.modes()?.0 != crate::game_mode::GameMode::Creative)
+                    {
                         state
                             .edit_block(
                                 profile.uuid,
@@ -1263,6 +1281,9 @@ async fn inventory_response(
             }
         }
         Err(error) => {
+            if crate::managed_tasks::is_cleanup_failure(&error) {
+                return Err(error.into());
+            }
             tracing::debug!(%error,"Inventory action rejected");
             for packet in inventory.full_sync().await? {
                 writer.send(&packet).await?;

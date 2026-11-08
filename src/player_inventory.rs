@@ -1,13 +1,13 @@
 use crate::{
     crafting_data::CraftingData,
+    game_mode::GameMode,
     lifecycle::{JobGuard, Lifecycle, RegistrationError},
-    player_store::PlayerStore,
+    player_storage::{PersistedPlayer, PlayerStorage, PlayerStorageError},
     players::{InventoryRevision, PacketBatch, Players},
 };
 use bytes::Bytes;
 use std::{
     collections::HashMap,
-    path::PathBuf,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -36,8 +36,8 @@ pub enum InventoryServiceError {
     Item(#[from] zerqon_inventory::ItemError),
     #[error(transparent)]
     Inventory(#[from] zerqon_inventory::InventoryError),
-    #[error(transparent)]
-    Store(#[from] crate::player_store::StoreError),
+    #[error("{0}")]
+    Store(#[from] PlayerStorageError),
     #[error(transparent)]
     Player(#[from] crate::players::PlayerError),
     #[error("inventory worker task failed: {0}")]
@@ -51,7 +51,7 @@ pub enum InventoryServiceError {
 pub struct InventoryService {
     pub gameplay: Arc<RwLock<()>>,
     catalog: Arc<ItemCatalog>,
-    store: Arc<PlayerStore>,
+    store: Arc<PlayerStorage>,
     players: Arc<Players>,
     sessions: Mutex<HashMap<Uuid, Arc<Session>>>,
     stripes: Arc<[Mutex<()>; 64]>,
@@ -63,11 +63,50 @@ pub struct InventoryService {
 struct Session {
     uuid: Uuid,
     id: i32,
-    inventory: Mutex<Option<PlayerInventory>>,
+    inventory: Mutex<Option<SessionInventory>>,
     closed: AtomicBool,
     generation: AtomicU64,
     rate: Mutex<MutationRate>,
     activity: Arc<InventoryActivity>,
+}
+
+#[derive(Clone)]
+struct SessionInventory(PersistedPlayer);
+
+impl std::ops::Deref for SessionInventory {
+    type Target = PlayerInventory;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0.record.inventory
+    }
+}
+
+impl std::ops::DerefMut for SessionInventory {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0.record.inventory
+    }
+}
+
+fn storage_result<T>(
+    store: &PlayerStorage,
+    result: Result<T, PlayerStorageError>,
+) -> Result<T, InventoryServiceError> {
+    result.map_err(|error| {
+        let terminal = matches!(
+            &error,
+            PlayerStorageError::CorruptRecord(_)
+                | PlayerStorageError::Commit(
+                    zerqon_world::CommitError::Conflict
+                        | zerqon_world::CommitError::Indeterminate { .. }
+                )
+        );
+        if terminal || store.check_available().is_err() {
+            crate::managed_tasks::CleanupError(format!("durable player storage failed: {error}"))
+                .into()
+        } else {
+            error.into()
+        }
+    })
 }
 
 #[derive(Default)]
@@ -323,8 +362,7 @@ impl MutationRate {
 }
 impl InventoryService {
     pub fn new(
-        directory: PathBuf,
-        catalog: Arc<ItemCatalog>,
+        store: Arc<PlayerStorage>,
         players: Arc<Players>,
         capacity: usize,
         gameplay: Arc<RwLock<()>>,
@@ -336,8 +374,8 @@ impl InventoryService {
         }
         Ok(Arc::new(Self {
             gameplay,
-            store: Arc::new(PlayerStore::new(directory, Arc::clone(&catalog))?),
-            catalog,
+            catalog: Arc::clone(store.catalog()),
+            store,
             players,
             sessions: Mutex::new(HashMap::new()),
             stripes: Arc::new(std::array::from_fn(|_| Mutex::new(()))),
@@ -399,7 +437,7 @@ impl InventoryService {
                 .lock()
                 .map_err(|_| InventoryServiceError::Unavailable("inventory I/O lock poisoned"))?;
             ensure_open(&session)?;
-            let mut inventory = store.load(uuid)?;
+            let mut inventory = SessionInventory(storage_result(&store, store.load(uuid))?);
             if inventory.slots()[1..5].iter().any(Option::is_some) {
                 inventory.refresh_crafting(&catalog, &crafting.recipes)?;
             }
@@ -461,7 +499,7 @@ impl InventoryService {
         operation: F,
     ) -> Result<PacketBatch, InventoryServiceError>
     where
-        F: FnOnce(&mut PlayerInventory, &ItemCatalog) -> Result<(), InventoryServiceError>
+        F: FnOnce(&mut SessionInventory, &ItemCatalog) -> Result<(), InventoryServiceError>
             + Send
             + 'static,
     {
@@ -484,9 +522,10 @@ impl InventoryService {
             let (packets,equipment)=packets(session.id,&candidate,&catalog)?;
             let generation=session.generation.load(Ordering::Relaxed).checked_add(1).ok_or(InventoryServiceError::Limit("session generation exhausted"))?;
             let previous=current.as_ref().ok_or(InventoryServiceError::Unavailable("inventory is loading"))?;
-            if previous.slots()!=candidate.slots()||previous.cursor()!=candidate.cursor()||previous.selected()!=candidate.selected(){
+            if previous.slots()!=candidate.slots()||previous.cursor()!=candidate.cursor()||previous.selected()!=candidate.selected()
+                || previous.0.record.game_mode != candidate.0.record.game_mode || previous.0.record.previous_game_mode != candidate.0.record.previous_game_mode {
                 session.rate.lock().map_err(|_|InventoryServiceError::Unavailable("rate limiter poisoned"))?.admit(Instant::now())?;
-                store.save(session.uuid,&candidate)?;
+                candidate.0.revision = storage_result(&store, store.save(session.uuid,previous.0.revision,&candidate.0.record))?;
             }
             *current=Some(candidate);
             session.generation.store(generation,Ordering::Release);
@@ -597,10 +636,11 @@ impl InventoryHandle {
                         .as_ref()
                         .ok_or(InventoryServiceError::Unavailable("inventory is loading"))?
                         .clone();
+                    let creative = candidate.0.record.game_mode == GameMode::Creative;
                     match candidate.close_crafting(
                         &catalog,
                         InventoryPolicy {
-                            creative: false,
+                            creative,
                             can_interact: true,
                             allow_drops: false,
                         },
@@ -616,7 +656,10 @@ impl InventoryHandle {
                         .ok_or(InventoryServiceError::Limit("session generation exhausted"))?;
                     // Close is durable cleanup, independent of the mutation rate.
                     // DroppingUnavailable leaves the original grid/cursor intact.
-                    store.save(session.uuid, &candidate)?;
+                    candidate.0.revision = storage_result(
+                        &store,
+                        store.save(session.uuid, candidate.0.revision, &candidate.0.record),
+                    )?;
                     *current = Some(candidate);
                     session.generation.store(generation, Ordering::Release);
                     drop(current);
@@ -628,6 +671,22 @@ impl InventoryHandle {
             }
             changed.await;
         }
+    }
+
+    pub fn modes(&self) -> Result<(GameMode, Option<GameMode>), InventoryServiceError> {
+        ensure_open(&self.session)?;
+        let current = self
+            .session
+            .inventory
+            .lock()
+            .map_err(|_| InventoryServiceError::Unavailable("inventory lock poisoned"))?;
+        let current = current
+            .as_ref()
+            .ok_or(InventoryServiceError::Unavailable("inventory is loading"))?;
+        Ok((
+            current.0.record.game_mode,
+            current.0.record.previous_game_mode,
+        ))
     }
 
     pub fn held_stack(
@@ -661,6 +720,10 @@ impl InventoryHandle {
     ) -> Result<PacketBatch, InventoryServiceError> {
         self.service
             .change(Arc::clone(&self.session), move |inventory, catalog| {
+                let policy = InventoryPolicy {
+                    creative: inventory.0.record.game_mode == GameMode::Creative,
+                    ..policy
+                };
                 let request = zerqon_inventory::ClickRequest {
                     container_id: 0,
                     state_id: i32::from(inventory.state_id()),
@@ -741,6 +804,10 @@ impl InventoryHandle {
         let crafting = Arc::clone(&self.service.crafting);
         self.service
             .change(Arc::clone(&self.session), move |inventory, catalog| {
+                let policy = InventoryPolicy {
+                    creative: inventory.0.record.game_mode == GameMode::Creative,
+                    ..policy
+                };
                 let body = packet
                     .get(body_offset..)
                     .ok_or(InventoryServiceError::Limit("inventory packet offset"))?;
@@ -842,6 +909,15 @@ fn retire_session(service: &InventoryService, session: &Arc<Session>) {
 fn ensure_open(session: &Session) -> Result<(), InventoryServiceError> {
     if session.closed.load(Ordering::Acquire) {
         Err(InventoryServiceError::Unavailable("session is closed"))
+    } else if let Some(error) = session
+        .activity
+        .admission
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .failure
+        .clone()
+    {
+        Err(crate::managed_tasks::CleanupError(error).into())
     } else {
         Ok(())
     }
@@ -971,6 +1047,34 @@ mod tests {
         PlayerInventory, ValidatedPatch, encode_creative_slot_body,
     };
 
+    fn test_service(
+        directory: std::path::PathBuf,
+        catalog: Arc<ItemCatalog>,
+        players: Arc<Players>,
+        capacity: usize,
+        gameplay: Arc<RwLock<()>>,
+        lifecycle: Lifecycle,
+        crafting: Arc<CraftingData>,
+    ) -> Result<Arc<InventoryService>, InventoryServiceError> {
+        let world = Arc::new(
+            zerqon_world::WorldStore::open(directory.join("world"))
+                .map_err(PlayerStorageError::from)?,
+        );
+        let store = Arc::new(PlayerStorage::new(world, catalog, GameMode::Creative)?);
+        InventoryService::new(store, players, capacity, gameplay, lifecycle, crafting)
+    }
+
+    fn durable_inventory(service: &InventoryService, uuid: Uuid) -> PlayerInventory {
+        service.store.load(uuid).unwrap().record.inventory
+    }
+
+    fn save_fixture(service: &InventoryService, session: &Session, state: &mut SessionInventory) {
+        state.0.revision = service
+            .store
+            .save(session.uuid, state.0.revision, &state.0.record)
+            .unwrap();
+    }
+
     impl InventoryHandle {
         async fn apply_packet(
             &self,
@@ -1050,21 +1154,28 @@ mod tests {
     }
 
     struct WorkFixture {
-        _directory: tempfile::TempDir,
+        world: Arc<zerqon_world::WorldStore>,
         service: Arc<InventoryService>,
         handle: Arc<InventoryHandle>,
         _player: crate::players::PlayerHandle,
         _outbound: mpsc::Receiver<PacketBatch>,
+        _directory: tempfile::TempDir,
     }
 
     impl WorkFixture {
         async fn new() -> Self {
+            Self::with_mode(GameMode::Creative).await
+        }
+
+        async fn with_mode(mode: GameMode) -> Self {
             let directory = tempfile::tempdir().unwrap();
             let players = Players::new(2, 64.0, 159, Arc::new(EntityIds::default()));
             let (player, outbound) = reserve(&players, Uuid::from_u128(31));
+            let world =
+                Arc::new(zerqon_world::WorldStore::open(directory.path().join("world")).unwrap());
+            let store = Arc::new(PlayerStorage::new(Arc::clone(&world), catalog(), mode).unwrap());
             let service = InventoryService::new(
-                directory.path().into(),
-                catalog(),
+                store,
                 players,
                 2,
                 Arc::new(RwLock::new(())),
@@ -1080,12 +1191,417 @@ mod tests {
             );
             Self {
                 _directory: directory,
+                world,
                 service,
                 handle,
                 _player: player,
                 _outbound: outbound,
             }
         }
+    }
+
+    #[tokio::test]
+    async fn stored_survival_mode_cannot_be_overridden_by_caller_creative_policy() {
+        let fixture = WorkFixture::with_mode(GameMode::Survival).await;
+        let before = fixture
+            .service
+            .store
+            .load(fixture.handle.session.uuid)
+            .unwrap()
+            .revision;
+        let body = encode_creative_slot_body(
+            &CreativeSlotRequest {
+                slot: 36,
+                stack: Some(ItemStack::new(ItemId(1), 4, ValidatedPatch::default()).unwrap()),
+            },
+            &fixture.service.catalog,
+        )
+        .unwrap();
+        let result = fixture.handle.apply_packet(57, &body, policy()).await;
+        assert!(
+            matches!(
+                result,
+                Err(InventoryServiceError::Inventory(
+                    zerqon_inventory::InventoryError::CreativeRequired
+                ))
+            ),
+            "caller-supplied creative flag changed stored survival authority"
+        );
+        assert_eq!(
+            fixture
+                .service
+                .store
+                .load(fixture.handle.session.uuid)
+                .unwrap()
+                .revision,
+            before
+        );
+        assert_eq!(fixture.handle.modes().unwrap(), (GameMode::Survival, None));
+        fixture
+            .service
+            .give(
+                fixture.handle.session.uuid,
+                fixture.handle.session.id,
+                "stone",
+                2,
+            )
+            .await
+            .unwrap();
+        fixture
+            .handle
+            .apply_packet(54, &[0, 2], policy())
+            .await
+            .unwrap();
+        assert_eq!(fixture.handle.modes().unwrap(), (GameMode::Survival, None));
+        assert!(fixture.service.lifecycle.pending().is_empty());
+    }
+
+    #[tokio::test]
+    async fn stored_creative_mode_and_previous_mode_survive_caller_policy_and_receipt_publication()
+    {
+        let fixture = WorkFixture::new().await;
+        {
+            let mut current = fixture.handle.session.inventory.lock().unwrap();
+            let state = current.as_mut().unwrap();
+            state.0.record.previous_game_mode = Some(GameMode::Survival);
+            save_fixture(&fixture.service, &fixture.handle.session, state);
+        }
+        let before = fixture
+            .service
+            .store
+            .load(fixture.handle.session.uuid)
+            .unwrap()
+            .revision;
+        let body = encode_creative_slot_body(
+            &CreativeSlotRequest {
+                slot: 36,
+                stack: Some(ItemStack::new(ItemId(1), 4, ValidatedPatch::default()).unwrap()),
+            },
+            &fixture.service.catalog,
+        )
+        .unwrap();
+        fixture
+            .handle
+            .apply_packet(
+                57,
+                &body,
+                InventoryPolicy {
+                    creative: false,
+                    ..policy()
+                },
+            )
+            .await
+            .unwrap();
+        let durable = fixture
+            .service
+            .store
+            .load(fixture.handle.session.uuid)
+            .unwrap();
+        assert!(durable.revision > before);
+        assert_eq!(
+            fixture
+                .handle
+                .session
+                .inventory
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .0
+                .revision,
+            durable.revision
+        );
+        assert_eq!(
+            fixture.handle.modes().unwrap(),
+            (GameMode::Creative, Some(GameMode::Survival))
+        );
+        assert_eq!(durable.record.game_mode, GameMode::Creative);
+        assert_eq!(durable.record.previous_game_mode, Some(GameMode::Survival));
+        assert_eq!(
+            durable.record.inventory.slots()[36]
+                .as_ref()
+                .unwrap()
+                .count(),
+            4
+        );
+    }
+
+    #[tokio::test]
+    async fn mode_only_candidates_preserve_record_revision_coherence() {
+        let fixture = WorkFixture::new().await;
+        let uuid = fixture.handle.session.uuid;
+        let initial = fixture.service.store.load(uuid).unwrap().revision;
+        fixture
+            .service
+            .change(Arc::clone(&fixture.handle.session), |state, _| {
+                state.0.record.game_mode = GameMode::Survival;
+                state.0.record.previous_game_mode = Some(GameMode::Creative);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let first = fixture.service.store.load(uuid).unwrap();
+        assert!(first.revision > initial);
+        assert_eq!(
+            fixture.handle.modes().unwrap(),
+            (GameMode::Survival, Some(GameMode::Creative))
+        );
+        assert_eq!(
+            fixture
+                .handle
+                .session
+                .inventory
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .0
+                .revision,
+            first.revision
+        );
+        fixture
+            .service
+            .change(Arc::clone(&fixture.handle.session), |state, _| {
+                state.0.record.previous_game_mode = None;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let second = fixture.service.store.load(uuid).unwrap();
+        assert!(second.revision > first.revision);
+        assert_eq!(second.record.game_mode, GameMode::Survival);
+        assert_eq!(second.record.previous_game_mode, None);
+        assert_eq!(fixture.handle.modes().unwrap(), (GameMode::Survival, None));
+        assert_eq!(
+            fixture
+                .handle
+                .session
+                .inventory
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .0
+                .revision,
+            second.revision
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_commit_error_preserves_applied_state_and_never_autosaves_stale_ram() {
+        let fixture = WorkFixture::new().await;
+        let uuid = fixture.handle.session.uuid;
+        let store = Arc::clone(&fixture.service.store);
+        let result = fixture
+            .service
+            .change(
+                Arc::clone(&fixture.handle.session),
+                move |state, catalog| {
+                    let mut applied = state.0.record.clone();
+                    applied.inventory.set_slot(
+                        catalog,
+                        36,
+                        Some(ItemStack::new(ItemId(1), 40, ValidatedPatch::default()).unwrap()),
+                    )?;
+                    store.save(uuid, state.0.revision, &applied).unwrap();
+                    // Model loss of the acknowledgement after an actual domain write.
+                    // Physical redb sync-failure recovery is tested in zerqon-world.
+                    storage_result(
+                        &store,
+                        Err(PlayerStorageError::Commit(
+                            zerqon_world::CommitError::Indeterminate {
+                                operation: Uuid::new_v4(),
+                                cause: "controlled lost acknowledgement".into(),
+                            },
+                        )),
+                    )
+                },
+            )
+            .await;
+        assert!(matches!(result, Err(error) if crate::managed_tasks::is_cleanup_failure(&error)));
+        assert!(
+            fixture
+                .handle
+                .session
+                .inventory
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .slots()[36]
+                .is_none()
+        );
+        let committed = fixture.service.store.load(uuid).unwrap();
+        assert_eq!(
+            committed.record.inventory.slots()[36]
+                .as_ref()
+                .unwrap()
+                .count(),
+            40
+        );
+        assert!(fixture.handle.close_and_drain().await.is_err());
+        assert!(fixture.handle.full_sync().await.is_err());
+        assert_eq!(
+            fixture.service.store.load(uuid).unwrap().revision,
+            committed.revision
+        );
+        assert_eq!(
+            durable_inventory(&fixture.service, uuid).slots()[36]
+                .as_ref()
+                .unwrap()
+                .count(),
+            40
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_canonical_player_record_is_terminal_without_overwriting_it() {
+        let fixture = WorkFixture::new().await;
+        let uuid = fixture.handle.session.uuid;
+        let key = zerqon_world::PlayerKey::new(uuid);
+        let before = fixture
+            .handle
+            .session
+            .inventory
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .0
+            .revision;
+        let reads = fixture.world.snapshot_domain(&[], &[key], &[]).unwrap();
+        fixture
+            .world
+            .commit_domain(
+                Uuid::new_v4(),
+                &reads,
+                &[],
+                &[zerqon_world::PlayerWrite {
+                    key,
+                    replacement: Arc::from(b"invalid player record".as_slice()),
+                }],
+                &[],
+            )
+            .unwrap();
+        let result = fixture
+            .service
+            .give(uuid, fixture.handle.session.id, "stone", 1)
+            .await;
+        assert!(matches!(result, Err(error) if crate::managed_tasks::is_cleanup_failure(&error)));
+        assert!(
+            fixture.world.check_available().is_ok(),
+            "semantic record error is distinct from a redb I/O latch"
+        );
+        assert!(fixture.handle.full_sync().await.is_err());
+        assert!(fixture.handle.modes().is_err());
+        assert!(fixture.handle.close_and_drain().await.is_err());
+        assert_eq!(
+            fixture
+                .handle
+                .session
+                .inventory
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .0
+                .revision,
+            before
+        );
+        assert_eq!(
+            fixture
+                .world
+                .snapshot_domain(&[], &[key], &[])
+                .unwrap()
+                .players[0]
+                .data()
+                .unwrap()
+                .as_ref(),
+            b"invalid player record"
+        );
+    }
+
+    #[tokio::test]
+    async fn all_inventory_writes_use_domain_and_leave_imported_legacy_bytes_unchanged() {
+        let directory = tempfile::tempdir().unwrap();
+        let catalog = catalog();
+        let uuid = Uuid::from_u128(123);
+        let world =
+            Arc::new(zerqon_world::WorldStore::open(directory.path().join("world")).unwrap());
+        let legacy = crate::player_store::PlayerStore::new(
+            world.root().join("playerdata"),
+            Arc::clone(&catalog),
+        )
+        .unwrap();
+        let mut old = PlayerInventory::new();
+        old.set_slot(
+            &catalog,
+            1,
+            Some(ItemStack::new(ItemId(1), 2, ValidatedPatch::default()).unwrap()),
+        )
+        .unwrap();
+        old.set_slot(
+            &catalog,
+            37,
+            Some(ItemStack::new(ItemId(1), 4, ValidatedPatch::default()).unwrap()),
+        )
+        .unwrap();
+        old.set_cursor(
+            &catalog,
+            Some(ItemStack::new(ItemId(1), 3, ValidatedPatch::default()).unwrap()),
+        )
+        .unwrap();
+        old.select_hotbar(1).unwrap();
+        legacy.save(uuid, &old).unwrap();
+        let path = world.root().join("playerdata").join(format!("{uuid}.zinv"));
+        let original = std::fs::read(&path).unwrap();
+        let players = Players::new(2, 64.0, 159, Arc::new(EntityIds::default()));
+        let (player, _outbound) = reserve(&players, uuid);
+        let store = Arc::new(PlayerStorage::new(world, catalog, GameMode::Survival).unwrap());
+        let service = InventoryService::new(
+            store,
+            players,
+            2,
+            Arc::new(RwLock::new(())),
+            Lifecycle::new(),
+            test_crafting_data(),
+        )
+        .unwrap();
+        let handle = service.open(uuid, player.id()).await.unwrap();
+        assert_eq!(
+            handle.modes().unwrap(),
+            (GameMode::Creative, None),
+            "legacy mode was replaced by the fresh-player default"
+        );
+        service.give(uuid, player.id(), "stone", 6).await.unwrap();
+        handle.apply_packet(54, &[0, 2], policy()).await.unwrap();
+        handle.swap_offhand(policy()).await.unwrap();
+        handle.close_and_drain().await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        let saved = service.store.load(uuid).unwrap();
+        assert_eq!(saved.record.game_mode, GameMode::Creative);
+        assert!(
+            saved.record.inventory.slots()[..5]
+                .iter()
+                .all(Option::is_none)
+        );
+        assert!(saved.record.inventory.cursor().is_none());
+        assert_eq!(
+            saved
+                .record
+                .inventory
+                .slots()
+                .iter()
+                .flatten()
+                .map(|stack| usize::from(stack.count()))
+                .sum::<usize>(),
+            15
+        );
+        drop(handle);
+        let reopened = service.open(uuid, player.id()).await.unwrap();
+        assert_eq!(reopened.modes().unwrap(), (GameMode::Creative, None));
+        assert_eq!(durable_inventory(&service, uuid).selected(), 2);
+        assert_eq!(std::fs::read(path).unwrap(), original);
     }
 
     #[tokio::test]
@@ -1115,11 +1631,7 @@ mod tests {
                     Some(ItemStack::new(ItemId(1), 3, ValidatedPatch::default()).unwrap()),
                 )
                 .unwrap();
-            fixture
-                .service
-                .store
-                .save(fixture.handle.session.uuid, inventory)
-                .unwrap();
+            save_fixture(&fixture.service, &fixture.handle.session, inventory);
         }
         {
             let mut rate = fixture.handle.session.rate.lock().unwrap();
@@ -1131,7 +1643,9 @@ mod tests {
             .service
             .store
             .load(fixture.handle.session.uuid)
-            .unwrap();
+            .unwrap()
+            .record
+            .inventory;
         assert!(
             saved.slots()[..5].iter().all(Option::is_none),
             "close left crafting inputs in persistent grid"
@@ -1143,13 +1657,12 @@ mod tests {
             "derived result became a real returned item"
         );
         assert_eq!(fixture.handle.session.rate.lock().unwrap().count, 32);
-        let before = std::fs::read(
-            fixture
-                ._directory
-                .path()
-                .join(format!("{}.zinv", fixture.handle.session.uuid)),
-        )
-        .unwrap();
+        let before = fixture
+            .service
+            .store
+            .load(fixture.handle.session.uuid)
+            .unwrap()
+            .revision;
         fixture.service.lifecycle.stop();
         fixture
             .service
@@ -1164,13 +1677,12 @@ mod tests {
         first.unwrap();
         second.unwrap();
         assert_eq!(
-            std::fs::read(
-                fixture
-                    ._directory
-                    .path()
-                    .join(format!("{}.zinv", fixture.handle.session.uuid))
-            )
-            .unwrap(),
+            fixture
+                .service
+                .store
+                .load(fixture.handle.session.uuid)
+                .unwrap()
+                .revision,
             before
         );
     }
@@ -1211,11 +1723,7 @@ mod tests {
                     Some(ItemStack::new(ItemId(1), 3, ValidatedPatch::default()).unwrap()),
                 )
                 .unwrap();
-            fixture
-                .service
-                .store
-                .save(fixture.handle.session.uuid, inventory)
-                .unwrap();
+            save_fixture(&fixture.service, &fixture.handle.session, inventory);
             inventory.clone()
         };
         fixture.handle.close_and_drain().await.unwrap();
@@ -1223,7 +1731,9 @@ mod tests {
             .service
             .store
             .load(fixture.handle.session.uuid)
-            .unwrap();
+            .unwrap()
+            .record
+            .inventory;
         assert_eq!(&saved.slots()[1..], &before.slots()[1..]);
         assert_eq!(saved.cursor(), before.cursor());
         assert!(saved.slots()[0].is_none());
@@ -1237,6 +1747,7 @@ mod tests {
     async fn inventory_close_is_owned_across_caller_abort_and_blocks_reopen_until_saved() {
         let WorkFixture {
             _directory,
+            world: _world,
             service,
             handle,
             _player,
@@ -1261,7 +1772,7 @@ mod tests {
                     Some(ItemStack::new(ItemId(1), 2, ValidatedPatch::default()).unwrap()),
                 )
                 .unwrap();
-            service.store.save(uuid, inventory).unwrap();
+            save_fixture(&service, &session, inventory);
         }
         let stripes = Arc::clone(&service.stripes);
         let (started, held) = tokio::sync::oneshot::channel();
@@ -1323,7 +1834,7 @@ mod tests {
         );
         assert!(service.lifecycle.pending().is_empty());
         let reopened = service.open(uuid, id).await.unwrap();
-        let saved = service.store.load(uuid).unwrap();
+        let saved = service.store.load(uuid).unwrap().record.inventory;
         assert!(saved.slots()[..5].iter().all(Option::is_none));
         assert!(saved.cursor().is_none());
         assert_eq!(saved.slots()[36].as_ref().unwrap().count(), 9);
@@ -1344,18 +1855,25 @@ mod tests {
                     Some(ItemStack::new(ItemId(1), 4, ValidatedPatch::default()).unwrap()),
                 )
                 .unwrap();
+            save_fixture(
+                &fixture.service,
+                &fixture.handle.session,
+                current.as_mut().unwrap(),
+            );
         }
-        let path = fixture
-            ._directory
-            .path()
-            .join(format!("{}.zinv", fixture.handle.session.uuid));
-        std::fs::create_dir(&path).unwrap();
+        let mut winner = fixture
+            .service
+            .store
+            .load(fixture.handle.session.uuid)
+            .unwrap();
+        winner.record.inventory.select_hotbar(2).unwrap();
+        winner.revision = fixture
+            .service
+            .store
+            .save(fixture.handle.session.uuid, winner.revision, &winner.record)
+            .unwrap();
         let first = fixture.handle.close_and_drain().await.unwrap_err();
         assert!(crate::managed_tasks::is_cleanup_failure(&first));
-        std::fs::remove_dir(&path).unwrap();
-        let second = fixture.handle.close_and_drain().await.unwrap_err();
-        assert_eq!(first.to_string(), second.to_string());
-        assert!(!path.exists(), "failed finalization was silently retried");
         {
             let current = fixture.handle.session.inventory.lock().unwrap();
             assert_eq!(
@@ -1367,6 +1885,20 @@ mod tests {
             );
             assert!(current.as_ref().unwrap().slots()[36].is_none());
         }
+        // Even repairing the stale RAM view cannot reopen an already settled close.
+        *fixture.handle.session.inventory.lock().unwrap() = Some(SessionInventory(winner.clone()));
+        let second = fixture.handle.close_and_drain().await.unwrap_err();
+        assert_eq!(first.to_string(), second.to_string());
+        assert_eq!(
+            fixture
+                .service
+                .store
+                .load(fixture.handle.session.uuid)
+                .unwrap()
+                .revision,
+            winner.revision,
+            "failed finalization was silently retried"
+        );
         fixture.service.lifecycle.stop();
         assert!(matches!(
             fixture
@@ -1667,6 +2199,8 @@ mod tests {
                 .store
                 .load(fixture.handle.session.uuid)
                 .unwrap()
+                .record
+                .inventory
                 .slots()
                 .iter()
                 .all(Option::is_none)
@@ -1928,6 +2462,8 @@ mod tests {
                 .store
                 .load(fixture.handle.session.uuid)
                 .unwrap()
+                .record
+                .inventory
                 .selected(),
             3
         );
@@ -1943,7 +2479,7 @@ mod tests {
         let uuid = Uuid::from_u128(29);
         let players = Players::new(2, 64.0, 159, Arc::new(EntityIds::default()));
         let (player, _receiver) = reserve(&players, uuid);
-        let service = InventoryService::new(
+        let service = test_service(
             directory.path().into(),
             catalog(),
             players,
@@ -1955,6 +2491,7 @@ mod tests {
         .unwrap();
         let handle = service.open(uuid, player.id()).await.unwrap();
         let global = PacketBudget::new(64).unwrap();
+        let initial_revision = service.store.load(uuid).unwrap().revision;
         let account = global.connection(64).unwrap();
         for (id, offset, selected, allowed) in [
             (255, 1, 3, true),
@@ -1982,7 +2519,7 @@ mod tests {
             );
             assert_eq!(account.snapshot().used_bytes, 0);
             assert_eq!(global.snapshot().used_bytes, 0);
-            assert!(!directory.path().join(format!("{uuid}.zinv")).exists());
+            assert_eq!(service.store.load(uuid).unwrap().revision, initial_revision);
             assert_eq!(
                 handle
                     .session
@@ -2007,7 +2544,7 @@ mod tests {
         let uuid = Uuid::from_u128(27);
         let players = Players::new(2, 64.0, 159, Arc::new(EntityIds::default()));
         let (player, _receiver) = reserve(&players, uuid);
-        let service = InventoryService::new(
+        let service = test_service(
             directory.path().into(),
             catalog(),
             players,
@@ -2074,7 +2611,16 @@ mod tests {
         .await
         .unwrap();
         draining.await.unwrap();
-        assert_eq!(service.store.load(uuid).unwrap().selected(), 3);
+        assert_eq!(
+            service
+                .store
+                .load(uuid)
+                .unwrap()
+                .record
+                .inventory
+                .selected(),
+            3
+        );
         assert_eq!(
             retained_bytes, 3,
             "accepted worker lost the inbound packet reservation"
@@ -2089,7 +2635,7 @@ mod tests {
         let uuid = Uuid::from_u128(76);
         let players = Players::new(20, 64.0, 159, Arc::new(EntityIds::default()));
         let (player, _receiver) = reserve(&players, uuid);
-        let service = InventoryService::new(
+        let service = test_service(
             directory.path().into(),
             catalog,
             players,
@@ -2100,6 +2646,7 @@ mod tests {
         )
         .unwrap();
         let _handle = service.open(uuid, player.id()).await.unwrap();
+        let initial_revision = service.store.load(uuid).unwrap().revision;
         let lease = Arc::clone(&service.gameplay).write_owned().await;
         let pending_service = Arc::clone(&service);
         let id = player.id();
@@ -2110,14 +2657,14 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert!(!directory.path().join(format!("{uuid}.zinv")).exists());
+        assert_eq!(service.store.load(uuid).unwrap().revision, initial_revision);
         drop(lease);
         tokio::time::timeout(Duration::from_secs(2), pending)
             .await
             .unwrap()
             .unwrap()
             .unwrap();
-        let loaded = service.store.load(uuid).unwrap();
+        let loaded = service.store.load(uuid).unwrap().record.inventory;
         assert_eq!(loaded.slots()[36].as_ref().unwrap().count(), 1);
     }
 
@@ -2128,7 +2675,7 @@ mod tests {
         let uuid = Uuid::from_u128(7);
         let players = Players::new(20, 64.0, 159, Arc::new(EntityIds::default()));
         let (player, _receiver) = reserve(&players, uuid);
-        let service = InventoryService::new(
+        let service = test_service(
             directory.path().into(),
             Arc::clone(&catalog),
             players,
@@ -2151,8 +2698,8 @@ mod tests {
         assert!(update.iter().any(|packet| packet[0] == 18));
         assert!(update.iter().any(|packet| packet[0] == 104));
         handle.apply_packet(54, &[0, 2], policy()).await.unwrap();
-        let store = PlayerStore::new(directory.path().into(), Arc::clone(&catalog)).unwrap();
-        let saved = store.load(uuid).unwrap();
+        let store = &service.store;
+        let saved = store.load(uuid).unwrap().record.inventory;
         assert_eq!(saved.selected(), 2);
         assert_eq!(saved.slots()[38].as_ref().unwrap().count(), 23);
         drop(handle);
@@ -2168,7 +2715,7 @@ mod tests {
         let uuid = Uuid::from_u128(8);
         let players = Players::new(20, 64.0, 159, Arc::new(EntityIds::default()));
         let (player, _receiver) = reserve(&players, uuid);
-        let service = InventoryService::new(
+        let service = test_service(
             directory.path().into(),
             Arc::clone(&catalog),
             players,
@@ -2190,10 +2737,10 @@ mod tests {
         )
         .unwrap();
         let item = Some(ItemStack::new(ItemId(1), 1, patch).unwrap());
-        let store = PlayerStore::new(directory.path().into(), Arc::clone(&catalog)).unwrap();
+        let store = &service.store;
         let mut rejected = false;
         for slot in 9..45 {
-            let before = store.load(uuid).unwrap();
+            let before = store.load(uuid).unwrap().record.inventory;
             let body = encode_creative_slot_body(
                 &CreativeSlotRequest {
                     slot,
@@ -2205,7 +2752,7 @@ mod tests {
             match handle.apply_packet(57, &body, policy()).await {
                 Ok(_) => {}
                 Err(InventoryServiceError::Limit(_)) => {
-                    let after = store.load(uuid).unwrap();
+                    let after = store.load(uuid).unwrap().record.inventory;
                     assert_eq!(after.slots(), before.slots());
                     rejected = true;
                     break;
@@ -2222,7 +2769,9 @@ mod tests {
         for slot in 1..=30 {
             oversized.set_slot(&catalog, slot, item.clone()).unwrap();
         }
-        store.save(uuid, &oversized).unwrap();
+        let mut record = store.load(uuid).unwrap();
+        record.record.inventory = oversized;
+        store.save(uuid, record.revision, &record.record).unwrap();
         assert!(matches!(
             service.open(uuid, player.id()).await,
             Err(InventoryServiceError::Limit(_))
@@ -2255,7 +2804,7 @@ mod tests {
         let players = Players::new(20, 64.0, 159, Arc::new(EntityIds::default()));
         let (player, mut rx) = reserve(&players, uuid);
         let (other, mut other_rx) = reserve(&players, other_uuid);
-        let service = InventoryService::new(
+        let service = test_service(
             directory.path().into(),
             Arc::clone(&catalog),
             Arc::clone(&players),
@@ -2308,7 +2857,7 @@ mod tests {
         let uuid = Uuid::from_u128(11);
         let players = Players::new(20, 64.0, 159, Arc::new(EntityIds::default()));
         let (player, _rx) = reserve(&players, uuid);
-        let service = InventoryService::new(
+        let service = test_service(
             directory.path().into(),
             Arc::clone(&catalog),
             players,
@@ -2319,12 +2868,13 @@ mod tests {
         )
         .unwrap();
         let handle = service.open(uuid, player.id()).await.unwrap();
+        let initial_revision = service.store.load(uuid).unwrap().revision;
         handle.session.rate.lock().unwrap().count = 32;
         handle
             .apply_packet(18, &[0, 0, 0, 9, 0, 0, 0, 0], policy())
             .await
             .unwrap();
-        assert!(!directory.path().join(format!("{uuid}.zinv")).exists());
+        assert_eq!(service.store.load(uuid).unwrap().revision, initial_revision);
         let body = encode_creative_slot_body(
             &CreativeSlotRequest {
                 slot: 36,
@@ -2340,10 +2890,7 @@ mod tests {
         handle.session.rate.lock().unwrap().count = 0;
         handle.apply_packet(57, &body, policy()).await.unwrap();
         handle.swap_offhand(policy()).await.unwrap();
-        let saved = PlayerStore::new(directory.path().into(), catalog)
-            .unwrap()
-            .load(uuid)
-            .unwrap();
+        let saved = durable_inventory(&service, uuid);
         assert!(saved.slots()[36].is_none());
         assert_eq!(saved.slots()[45].as_ref().unwrap().count(), 5);
     }
@@ -2355,7 +2902,7 @@ mod tests {
         let uuid = Uuid::from_u128(12);
         let players = Players::new(20, 64.0, 159, Arc::new(EntityIds::default()));
         let (player, _rx) = reserve(&players, uuid);
-        let service = InventoryService::new(
+        let service = test_service(
             directory.path().into(),
             Arc::clone(&catalog),
             players,
@@ -2403,10 +2950,7 @@ mod tests {
             Ok(Err(InventoryServiceError::Unavailable("duplicate session")))
         ));
         let _new_handle = service.open(uuid, id).await.unwrap();
-        let saved = PlayerStore::new(directory.path().into(), catalog)
-            .unwrap()
-            .load(uuid)
-            .unwrap();
+        let saved = durable_inventory(&service, uuid);
         assert_eq!(saved.slots()[36].as_ref().unwrap().count(), 21);
     }
 
@@ -2417,7 +2961,7 @@ mod tests {
         let uuid = Uuid::from_u128(13);
         let players = Players::new(20, 64.0, 159, Arc::new(EntityIds::default()));
         let (player, _rx) = reserve(&players, uuid);
-        let service = InventoryService::new(
+        let service = test_service(
             directory.path().into(),
             Arc::clone(&catalog),
             players,
@@ -2429,24 +2973,23 @@ mod tests {
         .unwrap();
         let handle = service.open(uuid, player.id()).await.unwrap();
         let before = handle.full_sync().await.unwrap();
+        let initial_revision = service.store.load(uuid).unwrap().revision;
         assert!(matches!(
             service.give(uuid, player.id(), "stone", 4096).await,
             Err(InventoryServiceError::Limit(_))
         ));
         assert_eq!(handle.full_sync().await.unwrap(), before);
-        assert!(!directory.path().join(format!("{uuid}.zinv")).exists());
+        assert_eq!(service.store.load(uuid).unwrap().revision, initial_revision);
     }
 
-    #[cfg(windows)]
     #[tokio::test]
-    async fn failed_atomic_write_keeps_memory_revision_and_original_file() {
-        use std::os::windows::fs::OpenOptionsExt;
+    async fn durable_conflict_keeps_the_winner_and_closes_stale_session_admission() {
         let directory = tempfile::tempdir().unwrap();
         let catalog = catalog();
         let uuid = Uuid::from_u128(14);
         let players = Players::new(20, 64.0, 159, Arc::new(EntityIds::default()));
         let (player, _rx) = reserve(&players, uuid);
-        let service = InventoryService::new(
+        let service = test_service(
             directory.path().into(),
             catalog,
             players,
@@ -2458,19 +3001,58 @@ mod tests {
         .unwrap();
         let handle = service.open(uuid, player.id()).await.unwrap();
         service.give(uuid, player.id(), "stone", 1).await.unwrap();
-        let before = handle.full_sync().await.unwrap();
-        let path = directory.path().join(format!("{uuid}.zinv"));
-        let bytes = std::fs::read(&path).unwrap();
-        let _lock = std::fs::OpenOptions::new()
-            .read(true)
-            .share_mode(1)
-            .open(&path)
+        let old_revision = handle
+            .session
+            .inventory
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .0
+            .revision;
+        let mut winner = service.store.load(uuid).unwrap();
+        winner
+            .record
+            .inventory
+            .set_slot(
+                &service.catalog,
+                36,
+                Some(ItemStack::new(ItemId(1), 40, ValidatedPatch::default()).unwrap()),
+            )
             .unwrap();
-        assert!(matches!(
-            service.give(uuid, player.id(), "stone", 1).await,
-            Err(InventoryServiceError::Store(_))
-        ));
-        assert_eq!(handle.full_sync().await.unwrap(), before);
-        assert_eq!(std::fs::read(path).unwrap(), bytes);
+        winner.revision = service
+            .store
+            .save(uuid, winner.revision, &winner.record)
+            .unwrap();
+        let result = service.give(uuid, player.id(), "stone", 1).await;
+        assert!(matches!(result, Err(error) if crate::managed_tasks::is_cleanup_failure(&error)));
+        {
+            let current = handle.session.inventory.lock().unwrap();
+            let current = current.as_ref().unwrap();
+            assert_eq!(current.0.revision, old_revision);
+            assert_eq!(current.slots()[36].as_ref().unwrap().count(), 1);
+        }
+        assert!(handle.full_sync().await.is_err());
+        assert!(handle.modes().is_err());
+        assert!(handle.held_stack(zerqon_inventory::Hand::Main).is_err());
+        assert!(handle.close_and_drain().await.is_err());
+        assert_eq!(service.store.load(uuid).unwrap().revision, winner.revision);
+        assert_eq!(
+            durable_inventory(&service, uuid).slots()[36]
+                .as_ref()
+                .unwrap()
+                .count(),
+            40
+        );
+        drop(handle);
+        let reopened = service.open(uuid, player.id()).await.unwrap();
+        assert_eq!(
+            reopened
+                .held_stack(zerqon_inventory::Hand::Main)
+                .unwrap()
+                .unwrap()
+                .count(),
+            40
+        );
     }
 }

@@ -7,7 +7,10 @@ use std::{
     time::Duration,
 };
 use uuid::Uuid;
-use zerqon_world::{Chunk, ChunkKey, ChunkWrite, FlatPalette, WorldStore};
+use zerqon_world::{
+    Chunk, ChunkKey, ChunkWrite, DropData, DropKey, DropWrite, FlatPalette, PlayerKey, PlayerWrite,
+    WorldStore,
+};
 
 const PALETTE: FlatPalette = FlatPalette {
     air: 0,
@@ -160,6 +163,130 @@ fn killed_multi_chunk_writer_recovers_one_revision_and_matching_receipt() {
 }
 
 #[test]
+fn killed_mixed_writer_recovers_player_block_drop_and_chunk_index_together() {
+    let chunk_key = ChunkKey::new(0, 0);
+    let old_drop_chunk = ChunkKey::new(1, 0);
+    let player_key = PlayerKey::new(Uuid::from_u128(1));
+    let drop_key = DropKey::new(Uuid::from_u128(2));
+    let commit = |store: &WorldStore, operation: Uuid, value: u8, location: ChunkKey| {
+        let reads = store
+            .snapshot_domain(&[chunk_key], &[player_key], &[drop_key])
+            .unwrap();
+        let mut chunk = Chunk::flat(0, 0, PALETTE);
+        chunk.set_block(0, 64, 0, u32::from(value)).unwrap();
+        store
+            .commit_domain(
+                operation,
+                &reads,
+                &[ChunkWrite {
+                    key: chunk_key,
+                    replacement: Arc::new(chunk),
+                }],
+                &[PlayerWrite {
+                    key: player_key,
+                    replacement: Arc::from([value]),
+                }],
+                &[DropWrite {
+                    key: drop_key,
+                    replacement: Some(DropData {
+                        chunk: location,
+                        data: Arc::from([value]),
+                    }),
+                }],
+            )
+            .unwrap()
+    };
+    if let Some(root) = child_root() {
+        let store = WorldStore::open(root).unwrap();
+        signal("ready");
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).unwrap();
+        signal("committing");
+        commit(&store, Uuid::from_u128(OPERATION), 22, chunk_key);
+        signal("committed");
+        line.clear();
+        std::io::stdin().read_line(&mut line).unwrap();
+        return;
+    }
+    for (mode, delay) in [("during", 0), ("during", 1), ("after", 0)] {
+        let root = tempfile::tempdir().unwrap();
+        let store = WorldStore::open(root.path()).unwrap();
+        let before = commit(&store, Uuid::new_v4(), 11, old_drop_chunk);
+        drop(store);
+        let (mut child, lines) = spawn_child(
+            "killed_mixed_writer_recovers_player_block_drop_and_chunk_index_together",
+            root.path(),
+        );
+        wait_for(&lines, "ready");
+        writeln!(child.0.stdin.as_mut().unwrap(), "go").unwrap();
+        wait_for(
+            &lines,
+            if mode == "after" {
+                "committed"
+            } else {
+                "committing"
+            },
+        );
+        if delay != 0 {
+            std::thread::sleep(Duration::from_millis(delay));
+        }
+        child.0.kill().unwrap();
+        assert!(!child.0.wait().unwrap().success());
+        let recovered = WorldStore::open(root.path()).unwrap();
+        let state = recovered
+            .snapshot_domain(&[chunk_key], &[player_key], &[drop_key])
+            .unwrap();
+        let value = state.players[0].data().unwrap()[0];
+        assert!(matches!(value, 11 | 22));
+        assert_eq!(
+            state.chunks[0].chunk().unwrap().get_block(0, 64, 0),
+            Some(u32::from(value))
+        );
+        assert_eq!(state.drops[0].data().unwrap().as_ref(), &[value]);
+        assert_eq!(state.chunks[0].revision(), state.players[0].revision());
+        assert_eq!(state.drops[0].revision(), state.players[0].revision());
+        let expected_chunk = if value == 22 {
+            chunk_key
+        } else {
+            old_drop_chunk
+        };
+        let empty_chunk = if value == 22 {
+            old_drop_chunk
+        } else {
+            chunk_key
+        };
+        assert_eq!(state.drops[0].chunk(), Some(expected_chunk));
+        assert_eq!(
+            recovered
+                .drops_in_chunk(expected_chunk, None, 64)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            recovered
+                .drops_in_chunk(empty_chunk, None, 64)
+                .unwrap()
+                .is_empty()
+        );
+        let receipt = recovered
+            .domain_receipt(Uuid::from_u128(OPERATION))
+            .unwrap();
+        if value == 22 {
+            let receipt = receipt.unwrap();
+            assert_eq!(receipt.revision, state.players[0].revision());
+            assert!(receipt.revision > before.revision);
+        } else {
+            assert!(receipt.is_none());
+            assert_eq!(state.players[0].revision(), before.revision);
+        }
+        if mode == "after" {
+            assert_eq!(value, 22);
+        }
+    }
+}
+
+#[test]
 fn missing_or_corrupt_active_database_never_falls_back_to_preserved_chunks() {
     for corrupt in [false, true] {
         let root = tempfile::tempdir().unwrap();
@@ -214,20 +341,19 @@ fn corrupt_legacy_chunk_cannot_publish_an_active_database() {
 }
 
 #[test]
-fn interrupted_guard_only_migration_preserves_and_recovers_original_chunks() {
-    let identity = tempfile::tempdir().unwrap();
-    drop(WorldStore::open(identity.path()).unwrap());
-    let guard = fs::read(identity.path().join("IMPORT_INCOMPLETE")).unwrap();
+fn interrupted_v2_guard_only_migration_preserves_and_recovers_original_chunks() {
+    let guard = b"ZERQON_STORAGE_V2\nThis world uses chunks.redb. Older Zerqon versions must not open it.\n";
     let root = tempfile::tempdir().unwrap();
     let original = Chunk::flat(-2, 3, PALETTE).to_bytes();
     fs::write(root.path().join("c.-2.3.zqc"), &original).unwrap();
-    fs::write(root.path().join("IMPORT_INCOMPLETE"), &guard).unwrap();
+    fs::write(root.path().join("IMPORT_INCOMPLETE"), guard).unwrap();
     let store = WorldStore::open(root.path()).unwrap();
     assert_eq!(store.load(-2, 3).unwrap().unwrap().to_bytes(), original);
     assert_eq!(fs::read(root.path().join("c.-2.3.zqc")).unwrap(), original);
-    assert_eq!(
-        fs::read(root.path().join("IMPORT_INCOMPLETE")).unwrap(),
-        guard
+    assert!(
+        fs::read(root.path().join("IMPORT_INCOMPLETE"))
+            .unwrap()
+            .starts_with(b"ZERQON_STORAGE_V3\n")
     );
     assert!(root.path().join("storage-format.json").is_file());
 }
@@ -267,7 +393,7 @@ fn copied_database_cannot_accept_another_open_stores_snapshot_tokens() {
 }
 
 #[test]
-fn killed_migration_keeps_originals_and_can_restart_without_partial_data() {
+fn killed_migration_preserves_originals_and_never_reimports_under_v3_guard() {
     if let Some(root) = child_root() {
         signal("migrating");
         let store = WorldStore::open(&root).unwrap();
@@ -288,7 +414,7 @@ fn killed_migration_keeps_originals_and_can_restart_without_partial_data() {
             })
             .collect();
         let (mut child, lines) = spawn_child(
-            "killed_migration_keeps_originals_and_can_restart_without_partial_data",
+            "killed_migration_preserves_originals_and_never_reimports_under_v3_guard",
             root.path(),
         );
         wait_for(&lines, "migrating");
@@ -305,6 +431,16 @@ fn killed_migration_keeps_originals_and_can_restart_without_partial_data() {
         }
         for (name, bytes) in &originals {
             assert_eq!(fs::read(root.path().join(name)).unwrap(), *bytes);
+        }
+        if !root.path().join("chunks.redb").exists()
+            && fs::read(root.path().join("IMPORT_INCOMPLETE"))
+                .is_ok_and(|guard| guard.starts_with(b"ZERQON_STORAGE_V3\n"))
+        {
+            assert!(
+                WorldStore::open(root.path()).is_err(),
+                "ambiguous V3 loss cannot resurrect legacy chunks"
+            );
+            continue;
         }
         let recovered = WorldStore::open(root.path()).unwrap();
         for x in 0..64 {

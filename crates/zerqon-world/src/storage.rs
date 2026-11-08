@@ -52,8 +52,10 @@ impl WorldStore {
         }
         let incomplete = root.join("IMPORT_INCOMPLETE").try_exists()?;
         let storage_guard = incomplete
-            && crate::metadata::read_regular(&root.join("IMPORT_INCOMPLETE"), 4096)?
-                == crate::transaction::GUARD;
+            && crate::transaction::is_storage_guard(&crate::metadata::read_regular(
+                &root.join("IMPORT_INCOMPLETE"),
+                4096,
+            )?);
         if incomplete && !importing && !storage_guard {
             return Err(WorldError::Corrupt(
                 "world import is incomplete; import again into a new destination",
@@ -249,6 +251,71 @@ impl WorldStore {
     }
     pub fn metadata(&self) -> Option<&WorldMetadata> {
         self.metadata.as_ref()
+    }
+
+    /// Read up to 64 keys and 64 MiB of payload from one transaction.
+    /// Input limits do not make the store unavailable; stored corruption does.
+    pub fn snapshot_domain(
+        &self,
+        chunks: &[crate::ChunkKey],
+        players: &[crate::PlayerKey],
+        drops: &[crate::DropKey],
+    ) -> Result<crate::DomainSnapshot, WorldError> {
+        self.transactions
+            .as_ref()
+            .ok_or_else(|| WorldError::Storage("transactions unavailable during import".into()))?
+            .snapshot_domain(chunks, players, drops)
+    }
+    /// Atomically CAS all read revisions and publish up to 16 writes / 16 MiB.
+    /// A queued writer rechecks availability after acquiring redb's writer;
+    /// already admitted work may finish if a separate reader fails later.
+    pub fn commit_domain(
+        &self,
+        operation: uuid::Uuid,
+        reads: &crate::DomainSnapshot,
+        chunks: &[crate::ChunkWrite],
+        players: &[crate::PlayerWrite],
+        drops: &[crate::DropWrite],
+    ) -> Result<crate::DomainReceipt, crate::CommitError> {
+        self.transactions
+            .as_ref()
+            .ok_or_else(|| WorldError::Storage("transactions unavailable during import".into()))?
+            .commit_domain(operation, reads, chunks, players, drops)
+    }
+    /// Resolve a recent operation after reopening an unavailable store.
+    /// Receipts are bounded: absence after eviction is not proof of rollback.
+    pub fn domain_receipt(
+        &self,
+        operation: uuid::Uuid,
+    ) -> Result<Option<crate::DomainReceipt>, WorldError> {
+        self.transactions
+            .as_ref()
+            .ok_or_else(|| WorldError::Storage("transactions unavailable during import".into()))?
+            .domain_receipt(operation)
+    }
+    /// Page 1..64 drop rows in UUID order, including tombstones, after an exclusive cursor.
+    /// Pages also obey the 64 MiB read budget; retry a smaller page on TransactionLimit.
+    pub fn scan_drops(
+        &self,
+        after: Option<crate::DropKey>,
+        limit: usize,
+    ) -> Result<Vec<crate::DropSnapshot>, WorldError> {
+        self.transactions
+            .as_ref()
+            .ok_or_else(|| WorldError::Storage("transactions unavailable during import".into()))?
+            .scan_drops(None, after, limit)
+    }
+    /// Read one bounded live-drop page through the chunk index and a single read transaction.
+    pub fn drops_in_chunk(
+        &self,
+        chunk: crate::ChunkKey,
+        after: Option<crate::DropKey>,
+        limit: usize,
+    ) -> Result<Vec<crate::DropSnapshot>, WorldError> {
+        self.transactions
+            .as_ref()
+            .ok_or_else(|| WorldError::Storage("transactions unavailable during import".into()))?
+            .scan_drops(Some(chunk), after, limit)
     }
     pub fn generation_policy(&self) -> GenerationPolicy {
         self.metadata

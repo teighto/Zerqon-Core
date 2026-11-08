@@ -1,4 +1,4 @@
-use crate::game_data::GameData;
+use crate::{game_data::GameData, game_mode::GameMode};
 use std::collections::HashMap;
 use uuid::Uuid;
 use zerqon_protocol::codec::{put_string, put_varint};
@@ -25,7 +25,15 @@ pub fn configuration_brand(brand: &str) -> Vec<u8> {
     out
 }
 
-pub fn login(entity_id: i32, max_players: i32, view_distance: i32, dimension_type: i32) -> Vec<u8> {
+pub fn login(
+    entity_id: i32,
+    max_players: i32,
+    view_distance: i32,
+    dimension_type: i32,
+    game_mode: GameMode,
+    previous: Option<GameMode>,
+    online_mode: bool,
+) -> Vec<u8> {
     let mut out = vec![50];
     out.extend_from_slice(&entity_id.to_be_bytes());
     out.extend_from_slice(&[0, 1]);
@@ -37,7 +45,9 @@ pub fn login(entity_id: i32, max_players: i32, view_distance: i32, dimension_typ
     put_varint(dimension_type, &mut out);
     put_string("minecraft:overworld", &mut out);
     out.extend_from_slice(&0_i64.to_be_bytes());
-    out.extend_from_slice(&[1, 0, 0, 1, 0, 0, 63, 0, 0]);
+    put_varint(i32::from(game_mode), &mut out);
+    put_varint(previous.map_or(0, |mode| i32::from(mode) + 1), &mut out);
+    out.extend_from_slice(&[0, 1, 0, 0, 63, u8::from(online_mode), 0]);
     out
 }
 
@@ -58,8 +68,13 @@ pub fn position_rotated(teleport: i32, xyz: [f64; 3], rotation: [f32; 2]) -> Vec
     out
 }
 
-pub fn abilities() -> Vec<u8> {
-    let mut out = vec![65, 0x0d];
+pub fn abilities(game_mode: GameMode, flying: bool) -> Vec<u8> {
+    let flags = if game_mode == GameMode::Creative {
+        0x0d | (u8::from(flying) << 1)
+    } else {
+        0
+    };
+    let mut out = vec![65, flags];
     out.extend_from_slice(&0.05_f32.to_be_bytes());
     out.extend_from_slice(&0.1_f32.to_be_bytes());
     out

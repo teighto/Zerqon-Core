@@ -446,6 +446,61 @@
       "frame": "022103"
     },
     {
+      "name": "abilities_flags0",
+      "kind": "player_abilities",
+      "packet_id": 40,
+      "body": "00",
+      "fields": {
+        "flying": false
+      },
+      "packet": "2800",
+      "frame": "022800"
+    },
+    {
+      "name": "abilities_flags2",
+      "kind": "player_abilities",
+      "packet_id": 40,
+      "body": "02",
+      "fields": {
+        "flying": true
+      },
+      "packet": "2802",
+      "frame": "022802"
+    },
+    {
+      "name": "abilities_flags13",
+      "kind": "player_abilities",
+      "packet_id": 40,
+      "body": "0d",
+      "fields": {
+        "flying": false
+      },
+      "packet": "280d",
+      "frame": "02280d"
+    },
+    {
+      "name": "abilities_flags15",
+      "kind": "player_abilities",
+      "packet_id": 40,
+      "body": "0f",
+      "fields": {
+        "flying": true
+      },
+      "packet": "280f",
+      "frame": "02280f"
+    },
+    {
+      "name": "abilities_flags255",
+      "kind": "player_abilities",
+      "packet_id": 40,
+      "body": "ff",
+      "fields": {
+        "flying": true
+      },
+      "packet": "28ff",
+      "frame": "0228ff"
+    },
+    {
       "name": "action_0",
       "kind": "player_action",
       "packet_id": 41,

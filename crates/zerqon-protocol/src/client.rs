@@ -41,6 +41,16 @@ pub fn decode_keepalive(body: &[u8]) -> Result<i64, ProtocolError> {
     })?))
 }
 
+/// Decode flying intent; the server must separately enforce flight permission.
+pub fn decode_player_abilities(body: &[u8]) -> Result<bool, ProtocolError> {
+    let [flags] = body else {
+        return Err(ProtocolError::Invalid(
+            "player abilities must contain exactly 1 byte",
+        ));
+    };
+    Ok(flags & 2 != 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -64,6 +74,34 @@ mod tests {
         let mut extra = bytes.to_vec();
         extra.push(0);
         assert!(decode_keepalive(&extra).is_err());
+    }
+
+    #[test]
+    fn player_abilities_reads_only_flying_intent_and_ignores_reserved_bits() {
+        for (flags, flying) in [
+            (0, false),
+            (1, false),
+            (2, true),
+            (4, false),
+            (8, false),
+            (13, false),
+            (15, true),
+            (253, false),
+            (255, true),
+        ] {
+            assert_eq!(
+                decode_player_abilities(&[flags]).unwrap(),
+                flying,
+                "{flags}"
+            );
+        }
+    }
+
+    #[test]
+    fn player_abilities_requires_exactly_one_flags_byte() {
+        for body in [&[][..], &[0, 0][..], &[2, 0][..], &[255, 0][..]] {
+            assert!(decode_player_abilities(body).is_err(), "{body:?}");
+        }
     }
 
     fn signed(command: &str) -> Vec<u8> {

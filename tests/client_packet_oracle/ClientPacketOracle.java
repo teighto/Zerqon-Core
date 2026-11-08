@@ -35,6 +35,7 @@ import net.minecraft.network.protocol.game.ServerboundChatCommandPacket;
 import net.minecraft.network.protocol.game.ServerboundChatCommandSignedPacket;
 import net.minecraft.network.protocol.game.ServerboundContainerClickPacket;
 import net.minecraft.network.protocol.game.ServerboundMovePlayerPacket;
+import net.minecraft.network.protocol.game.ServerboundPlayerAbilitiesPacket;
 import net.minecraft.network.protocol.game.ServerboundPlayerActionPacket;
 import net.minecraft.network.protocol.game.ServerboundSetCarriedItemPacket;
 import net.minecraft.network.protocol.game.ServerboundSetCreativeModeSlotPacket;
@@ -53,7 +54,7 @@ public final class ClientPacketOracle {
     private static final Map<String,Integer> IDS = Map.ofEntries(
         Map.entry("accept_teleportation",0),Map.entry("attack",1),Map.entry("chat_command",7),Map.entry("chat_command_signed",8),
         Map.entry("container_click",18),Map.entry("keep_alive",28),Map.entry("move_player_pos",30),Map.entry("move_player_pos_rot",31),
-        Map.entry("move_player_rot",32),Map.entry("move_player_status_only",33),Map.entry("player_action",41),Map.entry("set_carried_item",54),
+        Map.entry("move_player_rot",32),Map.entry("move_player_status_only",33),Map.entry("player_abilities",40),Map.entry("player_action",41),Map.entry("set_carried_item",54),
         Map.entry("set_creative_mode_slot",57),Map.entry("use_item_on",66));
 
     private ClientPacketOracle(Path data) throws Exception {
@@ -86,6 +87,7 @@ public final class ClientPacketOracle {
                 case "move_player_pos_rot" -> ServerboundMovePlayerPacket.PosRot.STREAM_CODEC.decode(input);
                 case "move_player_rot" -> ServerboundMovePlayerPacket.Rot.STREAM_CODEC.decode(input);
                 case "move_player_status_only" -> ServerboundMovePlayerPacket.StatusOnly.STREAM_CODEC.decode(input);
+                case "player_abilities" -> ServerboundPlayerAbilitiesPacket.STREAM_CODEC.decode(input);
                 case "player_action" -> ServerboundPlayerActionPacket.STREAM_CODEC.decode(input);
                 case "set_carried_item" -> ServerboundSetCarriedItemPacket.STREAM_CODEC.decode(input);
                 case "set_creative_mode_slot" -> ServerboundSetCreativeModeSlotPacket.STREAM_CODEC.decode(input);
@@ -103,6 +105,7 @@ public final class ClientPacketOracle {
             result.addProperty("id",packet.id());result.add("position",numbers(packet.x(),packet.y(),packet.z()));result.add("rotation",numbers(packet.yRot(),packet.xRot()));
         }else if(value instanceof ServerboundAttackPacket packet){result.addProperty("entity_id",packet.entityId());
         }else if(value instanceof ServerboundKeepAlivePacket packet){result.addProperty("nonce",packet.getId());
+        }else if(value instanceof ServerboundPlayerAbilitiesPacket packet){result.addProperty("flying",packet.isFlying());
         }else if(value instanceof ServerboundChatCommandPacket packet){result.addProperty("command",packet.command());
         }else if(value instanceof ServerboundChatCommandSignedPacket packet){
             result.addProperty("command",packet.command());result.addProperty("timestamp_ms",packet.timeStamp().toEpochMilli());result.addProperty("salt",packet.salt());
@@ -123,7 +126,10 @@ public final class ClientPacketOracle {
         var output=new RegistryFriendlyByteBuf(Unpooled.buffer(),registries);
         byte[]body;
         try{codec.encode(output,value);body=new byte[output.readableBytes()];output.readBytes(body);}finally{output.release();}
-        JsonElement expected=fields(value);require(expected.equals(fields(decode(kind,body))),"Original decode changed fields: "+name);
+        fixtureBody(cases,name,kind,body,fields(value));
+    }
+    private void fixtureBody(JsonArray cases,String name,String kind,byte[]body,JsonElement expected)throws Exception{
+        require(expected.equals(fields(decode(kind,body))),"Original decode changed fields: "+name);
         JsonObject fixture=new JsonObject();fixture.addProperty("name",name);fixture.addProperty("kind",kind);fixture.addProperty("packet_id",IDS.get(kind));fixture.addProperty("body",HexFormat.of().formatHex(body));fixture.add("fields",expected);
         var packet=new RegistryFriendlyByteBuf(Unpooled.buffer(),registries);
         try{packet.writeVarInt(IDS.get(kind));packet.writeBytes(body);byte[]payload=new byte[packet.readableBytes()];packet.readBytes(payload);fixture.addProperty("packet",HexFormat.of().formatHex(payload));packet.clear();packet.writeVarInt(payload.length);packet.writeBytes(payload);byte[]frame=new byte[packet.readableBytes()];packet.readBytes(frame);fixture.addProperty("frame",HexFormat.of().formatHex(frame));}finally{packet.release();}
@@ -149,6 +155,10 @@ public final class ClientPacketOracle {
             fixture(cases,"move_posrot_flags"+flags,"move_player_pos_rot",ServerboundMovePlayerPacket.PosRot.STREAM_CODEC,new ServerboundMovePlayerPacket.PosRot(-17.25,-60,33.5,180,-45.5f,ground,collision));
             fixture(cases,"move_rot_flags"+flags,"move_player_rot",ServerboundMovePlayerPacket.Rot.STREAM_CODEC,new ServerboundMovePlayerPacket.Rot(720.25f,89.5f,ground,collision));
             fixture(cases,"move_status_flags"+flags,"move_player_status_only",ServerboundMovePlayerPacket.StatusOnly.STREAM_CODEC,new ServerboundMovePlayerPacket.StatusOnly(ground,collision));
+        }
+        for(int flags:new int[]{0,2,13,15,255}){
+            byte[]body={(byte)flags};
+            fixtureBody(cases,"abilities_flags"+flags,"player_abilities",body,fields(decode("player_abilities",body)));
         }
         for(var action:ServerboundPlayerActionPacket.Action.values())fixture(cases,"action_"+action.ordinal(),"player_action",ServerboundPlayerActionPacket.STREAM_CODEC,new ServerboundPlayerActionPacket(action,new BlockPos(-17,-60,33),Direction.values()[action.ordinal()%6],130));
         fixture(cases,"carried_last","set_carried_item",ServerboundSetCarriedItemPacket.STREAM_CODEC,new ServerboundSetCarriedItemPacket(8));

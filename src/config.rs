@@ -1,3 +1,4 @@
+use crate::game_mode::GameMode;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -6,7 +7,7 @@ use std::{
     path::Path,
 };
 
-pub const DEFAULT_PROPERTIES: &str = "server-ip=127.0.0.1\nserver-port=25565\nmotd=Zerqon 26.3\nmax-players=20\nonline-mode=true\nview-distance=4\nnetwork-compression-threshold=256\nlevel-name=world\n";
+pub const DEFAULT_PROPERTIES: &str = "server-ip=127.0.0.1\nserver-port=25565\nmotd=Zerqon 26.3\nmax-players=20\nonline-mode=true\ngamemode=creative\nview-distance=4\nnetwork-compression-threshold=256\nlevel-name=world\n";
 const MAX_CONFIG_BYTES: usize = 1024 * 1024;
 const PROPERTY_KEYS: &[&str] = &[
     "server-ip",
@@ -14,6 +15,7 @@ const PROPERTY_KEYS: &[&str] = &[
     "motd",
     "max-players",
     "online-mode",
+    "gamemode",
     "view-distance",
     "network-compression-threshold",
     "level-name",
@@ -177,6 +179,7 @@ pub struct Properties {
     pub motd: String,
     pub max_players: usize,
     pub online_mode: bool,
+    pub game_mode: GameMode,
     pub view_distance: u8,
     pub compression_threshold: Option<usize>,
     pub level_name: String,
@@ -223,6 +226,15 @@ impl Properties {
                 2_097_151,
             )?),
         };
+        let game_mode = match get("gamemode", "creative") {
+            "creative" => GameMode::Creative,
+            "survival" => GameMode::Survival,
+            _ => {
+                return Err(ConfigError::Invalid(
+                    "gamemode must be creative or survival".into(),
+                ));
+            }
+        };
         let motd = get("motd", "Zerqon 26.3").to_owned();
         if motd.len() > 4096 {
             return Err(ConfigError::Invalid("motd exceeds 4096 bytes".into()));
@@ -239,6 +251,7 @@ impl Properties {
             motd,
             max_players: number("max-players", "20", 1, 65536)?,
             online_mode,
+            game_mode,
             view_distance: number("view-distance", "4", 1, 32)? as u8,
             compression_threshold,
             level_name,
@@ -540,6 +553,29 @@ mod tests {
             let settings: Settings =
                 toml::from_str(&format!("update_check_interval_hours={interval}\n")).unwrap();
             assert!(settings.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn initial_game_mode_is_explicit_and_old_properties_keep_creative() {
+        use crate::game_mode::GameMode;
+        assert_eq!(Properties::parse("").unwrap().game_mode, GameMode::Creative);
+        for (name, expected) in [
+            ("creative", GameMode::Creative),
+            ("survival", GameMode::Survival),
+        ] {
+            assert_eq!(
+                Properties::parse(&format!("gamemode={name}\n"))
+                    .unwrap()
+                    .game_mode,
+                expected
+            );
+        }
+        for invalid in ["spectator", "adventure", "unknown", "CREATIVE", "0", ""] {
+            assert!(
+                Properties::parse(&format!("gamemode={invalid}\n")).is_err(),
+                "{invalid}"
+            );
         }
     }
 

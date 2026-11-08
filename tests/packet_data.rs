@@ -4,10 +4,13 @@
 mod entity_packets;
 #[path = "../src/game_data.rs"]
 mod game_data;
+#[path = "../src/game_mode.rs"]
+mod game_mode;
 #[path = "../src/packets.rs"]
 mod packets;
 
 use game_data::GameData;
+use game_mode::GameMode;
 use serde_json::json;
 use std::{fs, path::Path};
 use zerqon_protocol::codec::{get_string, get_varint, take};
@@ -37,6 +40,56 @@ fn fixture(path: &Path) {
         .to_string(),
     )
     .unwrap();
+}
+
+#[test]
+fn login_reports_authentication_separately_from_secure_chat_enforcement() {
+    for online in [false, true] {
+        let packet = packets::login(7, 20, 4, 1, GameMode::Creative, None, online);
+        assert_eq!(&packet[packet.len() - 2..], &[u8::from(online), 0]);
+    }
+}
+
+#[test]
+fn login_preserves_current_and_optional_previous_game_modes() {
+    for mode in [GameMode::Creative, GameMode::Survival] {
+        for previous in [None, Some(GameMode::Creative), Some(GameMode::Survival)] {
+            let packet = packets::login(7, 20, 4, 1, mode, previous, false);
+            let mut body = packet.as_slice();
+            assert_eq!(get_varint(&mut body).unwrap(), 50);
+            assert_eq!(take(&mut body, 4).unwrap(), 7_i32.to_be_bytes());
+            assert_eq!(take(&mut body, 2).unwrap(), &[0, 1]);
+            assert_eq!(get_string(&mut body, 64).unwrap(), "minecraft:overworld");
+            for expected in [20, 4, 4] {
+                assert_eq!(get_varint(&mut body).unwrap(), expected);
+            }
+            assert_eq!(take(&mut body, 3).unwrap(), &[0, 1, 0]);
+            assert_eq!(get_varint(&mut body).unwrap(), 1);
+            assert_eq!(get_string(&mut body, 64).unwrap(), "minecraft:overworld");
+            assert_eq!(take(&mut body, 8).unwrap(), 0_i64.to_be_bytes());
+            assert_eq!(get_varint(&mut body).unwrap(), i32::from(mode));
+            assert_eq!(
+                get_varint(&mut body).unwrap(),
+                previous.map_or(0, |mode| i32::from(mode) + 1)
+            );
+            assert_eq!(body, &[0, 1, 0, 0, 63, 0, 0]);
+        }
+    }
+}
+
+#[test]
+fn survival_abilities_never_grant_creative_privileges_or_flight() {
+    for (mode, flying, flags) in [
+        (GameMode::Creative, false, 0x0d),
+        (GameMode::Creative, true, 0x0f),
+        (GameMode::Survival, false, 0),
+        (GameMode::Survival, true, 0),
+    ] {
+        assert_eq!(
+            packets::abilities(mode, flying),
+            [65, flags, 0x3d, 0x4c, 0xcc, 0xcd, 0x3d, 0xcc, 0xcc, 0xcd]
+        );
+    }
 }
 
 #[test]
@@ -403,10 +456,81 @@ fn export_vanilla_decoder_fixtures() {
         ),
         (
             "login".into(),
-            packets::login(7, 20, 4, data.overworld_dimension),
+            packets::login(
+                7,
+                20,
+                4,
+                data.overworld_dimension,
+                GameMode::Creative,
+                None,
+                false,
+            ),
+        ),
+        (
+            "login_online".into(),
+            packets::login(
+                7,
+                20,
+                4,
+                data.overworld_dimension,
+                GameMode::Creative,
+                None,
+                true,
+            ),
+        ),
+        (
+            "login_survival".into(),
+            packets::login(
+                7,
+                20,
+                4,
+                data.overworld_dimension,
+                GameMode::Survival,
+                None,
+                false,
+            ),
+        ),
+        (
+            "login_survival_previous_creative".into(),
+            packets::login(
+                7,
+                20,
+                4,
+                data.overworld_dimension,
+                GameMode::Survival,
+                Some(GameMode::Creative),
+                false,
+            ),
+        ),
+        (
+            "login_creative_previous_survival".into(),
+            packets::login(
+                7,
+                20,
+                4,
+                data.overworld_dimension,
+                GameMode::Creative,
+                Some(GameMode::Survival),
+                false,
+            ),
         ),
         ("position".into(), packets::position(5, 1.0, 64.0, -2.0)),
-        ("abilities".into(), packets::abilities()),
+        (
+            "abilities".into(),
+            packets::abilities(GameMode::Creative, false),
+        ),
+        (
+            "abilities_creative_flying".into(),
+            packets::abilities(GameMode::Creative, true),
+        ),
+        (
+            "abilities_survival".into(),
+            packets::abilities(GameMode::Survival, false),
+        ),
+        (
+            "abilities_survival_requested_flight".into(),
+            packets::abilities(GameMode::Survival, true),
+        ),
         ("chat".into(), packets::system_chat("Zerqon Привет 😀")),
         ("boss_add".into(), packets::bossbar_add(id, "TPS 20", 1.0)),
         ("boss_remove".into(), packets::bossbar_remove(id)),
@@ -422,7 +546,11 @@ fn export_vanilla_decoder_fixtures() {
         ),
         (
             "player_info_add".into(),
-            entity_packets::player_info_add(id, "TestPlayer", true),
+            entity_packets::player_info_add(id, "TestPlayer", true, GameMode::Creative),
+        ),
+        (
+            "player_info_survival".into(),
+            entity_packets::player_info_add(id, "TestPlayer", true, GameMode::Survival),
         ),
         (
             "player_info_properties".into(),
@@ -431,6 +559,17 @@ fn export_vanilla_decoder_fixtures() {
                 "TestPlayer",
                 true,
                 &[("textures", "texture-value", Some("signed-value"))],
+                GameMode::Creative,
+            ),
+        ),
+        (
+            "player_info_survival_properties".into(),
+            entity_packets::player_info_add_properties(
+                id,
+                "TestPlayer",
+                true,
+                &[("textures", "texture-value", Some("signed-value"))],
+                GameMode::Survival,
             ),
         ),
         (

@@ -1,13 +1,31 @@
 #[path = "../src/entity_packets.rs"]
 mod entity_packets;
+#[path = "../src/game_mode.rs"]
+mod game_mode;
 
 use uuid::Uuid;
 use zerqon_protocol::codec::{get_string, get_varint, take};
 
 #[test]
+fn player_info_can_initialize_survival_mode() {
+    let packet = entity_packets::player_info_add(
+        Uuid::from_u128(42),
+        "TestPlayer",
+        true,
+        game_mode::GameMode::Survival,
+    );
+    let mut body = &packet[19..];
+    assert_eq!(get_string(&mut body, 16).unwrap(), "TestPlayer");
+    assert_eq!(get_varint(&mut body).unwrap(), 0);
+    assert_eq!(get_varint(&mut body).unwrap(), 0);
+    assert_eq!(body, &[1, 0, 1]);
+}
+
+#[test]
 fn player_info_initializes_tab_profile_listing_and_creative_mode() {
     let uuid = Uuid::from_u128(42);
-    let packet = entity_packets::player_info_add(uuid, "TestPlayer", true);
+    let packet =
+        entity_packets::player_info_add(uuid, "TestPlayer", true, game_mode::GameMode::Creative);
     let mut body = packet.as_slice();
     assert_eq!(get_varint(&mut body).unwrap(), 71);
     assert_eq!(take(&mut body, 1).unwrap(), &[0x9d]);
@@ -27,6 +45,7 @@ fn authenticated_properties_keep_their_values_and_optional_signatures() {
             ("textures", "texture-value", Some("signed-value")),
             ("extra", "value", None),
         ],
+        game_mode::GameMode::Creative,
     );
     let mut body = &packet[19..];
     assert_eq!(get_string(&mut body, 16).unwrap(), "TestPlayer");

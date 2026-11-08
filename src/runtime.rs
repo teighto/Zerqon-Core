@@ -171,6 +171,7 @@ impl State {
         };
         let target = Position::new(clicked.x, clicked.y, clicked.z);
         let held = inventory.held_stack(hand)?;
+        let (game_mode, _) = inventory.modes()?;
         let near = [
             f64::from(clicked.x),
             f64::from(clicked.y),
@@ -268,7 +269,7 @@ impl State {
                         actor_position.xyz[2],
                     ],
                     block_range: 5.0,
-                    creative: true,
+                    creative: game_mode == crate::game_mode::GameMode::Creative,
                     bounds: Bounds::default(),
                     blockers: &blockers,
                 };
@@ -595,9 +596,14 @@ impl State {
         };
         let inventories = if let Some(catalog) = &items {
             let crafting = crafting.as_ref().ok_or("crafting data unavailable")?;
-            Some(InventoryService::new(
-                directory.join(&properties.level_name).join("playerdata"),
+            let world = world.as_ref().ok_or("world unavailable")?;
+            let storage = Arc::new(crate::player_storage::PlayerStorage::new(
+                Arc::clone(&world.store),
                 Arc::clone(catalog),
+                properties.game_mode,
+            )?);
+            Some(InventoryService::new(
+                storage,
                 Arc::clone(&players),
                 properties.max_players,
                 Arc::clone(&gameplay),

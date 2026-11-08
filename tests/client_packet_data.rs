@@ -1,6 +1,9 @@
 use serde_json::{Value, json};
 use zerqon_inventory::*;
-use zerqon_protocol::{decode_command, decode_keepalive, decode_teleport_ack, encode_teleport_ack};
+use zerqon_protocol::{
+    decode_command, decode_keepalive, decode_player_abilities, decode_teleport_ack,
+    encode_teleport_ack,
+};
 
 fn bytes(value: &str) -> Vec<u8> {
     value
@@ -65,6 +68,7 @@ fn decode(
             json!({"id":packet.id,"position":packet.xyz,"rotation":packet.rotation})
         }
         "keep_alive" => json!({"nonce":decode_keepalive(body)?}),
+        "player_abilities" => json!({"flying":decode_player_abilities(body)?}),
         "chat_command" | "chat_command_signed" => {
             json!({"command":decode_command(body,kind=="chat_command_signed")?})
         }
@@ -136,5 +140,5 @@ fn original_client_packet_goldens_match_shared_rust_decoders() {
         );
         checked += 1;
     }
-    assert_eq!(checked, 75);
+    assert_eq!(checked, 80);
 }

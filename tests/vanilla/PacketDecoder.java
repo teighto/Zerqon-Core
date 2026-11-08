@@ -29,6 +29,7 @@ import net.minecraft.network.protocol.game.ClientboundSystemChatPacket;
 import net.minecraft.network.protocol.game.ClientboundAddEntityPacket;
 import net.minecraft.network.protocol.game.ClientboundEntityPositionSyncPacket;
 import net.minecraft.network.protocol.game.ClientboundPlayerInfoUpdatePacket;
+import net.minecraft.network.protocol.game.ClientboundPlayerAbilitiesPacket;
 import net.minecraft.network.protocol.game.ClientboundSetEntityDataPacket;
 import net.minecraft.network.protocol.game.ClientboundSetHealthPacket;
 import net.minecraft.network.protocol.game.ClientboundRemoveEntitiesPacket;
@@ -100,9 +101,9 @@ public final class PacketDecoder {
             default -> throw new AssertionError("Unexpected configuration ID " + id);
         };
         return "game." + switch (name) {
-            case "login" -> "ClientboundLoginPacket";
+            case "login", "login_online", "login_survival", "login_survival_previous_creative", "login_creative_previous_survival" -> "ClientboundLoginPacket";
             case "position" -> "ClientboundPlayerPositionPacket";
-            case "abilities" -> "ClientboundPlayerAbilitiesPacket";
+            case "abilities", "abilities_creative_flying", "abilities_survival", "abilities_survival_requested_flight" -> "ClientboundPlayerAbilitiesPacket";
             case "chat" -> "ClientboundSystemChatPacket";
             case "chunk" -> "ClientboundLevelChunkWithLightPacket";
             case "center" -> "ClientboundSetChunkCacheCenterPacket";
@@ -111,7 +112,7 @@ public final class PacketDecoder {
             case "spawn" -> "ClientboundSetDefaultSpawnPositionPacket";
             case "event" -> "ClientboundGameEventPacket";
             case "commands" -> "ClientboundCommandsPacket";
-            case "player_info_add", "player_info_properties" -> "ClientboundPlayerInfoUpdatePacket";
+            case "player_info_add", "player_info_properties", "player_info_survival", "player_info_survival_properties" -> "ClientboundPlayerInfoUpdatePacket";
             case "player_info_remove" -> "ClientboundPlayerInfoRemovePacket";
             case "entity_player", "entity_pig" -> "ClientboundAddEntityPacket";
             case "entity_position" -> "ClientboundEntityPositionSyncPacket";
@@ -164,7 +165,7 @@ public final class PacketDecoder {
                 int id = buffer.readVarInt();
                 Class<?> type = Class.forName("net.minecraft.network.protocol." + packetClass(name, id));
                 String codecField = name.startsWith("brand_") ? "CONFIG_STREAM_CODEC" : "STREAM_CODEC";
-                var codec = (StreamCodec<RegistryFriendlyByteBuf, ?>) type.getField(codecField).get(null);
+                var codec = (StreamCodec<RegistryFriendlyByteBuf, Object>) type.getField(codecField).get(null);
                 Object packet = codec.decode(buffer);
                 require(!buffer.isReadable(), name + " has trailing bytes");
                 if (packet instanceof ClientboundCustomPayloadPacket custom) {
@@ -186,18 +187,50 @@ public final class PacketDecoder {
                 }
                 if (packet instanceof ClientboundLevelChunkWithLightPacket chunk) checkChunk(chunk, registries);
                 if (packet instanceof ClientboundLoginPacket login) {
+                    require(id == 50, "Login packet ID");
                     require(login.playerId() == 7 && login.maxPlayers() == 20, "Login identity and capacity");
-                    require(login.commonPlayerSpawnInfo().gameType().getId() == 1, "Creative mode");
+                    int expectedMode = name.startsWith("login_survival") ? 0 : 1;
+                    int expectedPrevious = switch (name) {
+                        case "login_survival_previous_creative" -> 1;
+                        case "login_creative_previous_survival" -> 0;
+                        default -> -1;
+                    };
+                    require(login.commonPlayerSpawnInfo().gameType().getId() == expectedMode, "Login game mode: " + name);
+                    require(login.commonPlayerSpawnInfo().previousGameType().map(mode -> mode.getId()).orElse(-1) == expectedPrevious, "Login previous mode: " + name);
                     require(login.commonPlayerSpawnInfo().dimensionType().value().height() == 384, "Dimension registry ID");
+                    require(login.onlineMode() == name.equals("login_online"), "Configured authentication mode: " + name);
+                    require(!login.enforcesSecureChat(), "Secure chat enforcement is independent of authentication");
+                }
+                if (packet instanceof ClientboundPlayerAbilitiesPacket abilities) {
+                    require(id == 65, "Abilities packet ID");
+                    boolean creative = !name.startsWith("abilities_survival");
+                    boolean flying = name.equals("abilities_creative_flying");
+                    require(abilities.isInvulnerable() == creative && abilities.canFly() == creative && abilities.canInstabuild() == creative, "Server-owned ability flags: " + name);
+                    require(abilities.isFlying() == flying, "Permitted flying state: " + name);
+                    require(abilities.getFlyingSpeed() == 0.05f && abilities.getWalkingSpeed() == 0.1f, "Abilities speeds: " + name);
                 }
                 if (packet instanceof ClientboundSystemChatPacket chat) require(chat.content().getString().equals("Zerqon Привет 😀"), "NBT Unicode text");
                 if (packet instanceof ClientboundPlayerInfoUpdatePacket info) {
+                    require(id == 71, "TAB update packet ID");
                     var entry = info.entries().getFirst();
                     require(info.entries().size() == 1 && entry.profile().name().equals("TestPlayer"), "TAB profile");
-                    require(entry.listed() && entry.showHat() && entry.gameMode().getId() == 1, "TAB flags");
-                    if (name.equals("player_info_properties")) {
+                    int expectedMode = name.startsWith("player_info_survival") ? 0 : 1;
+                    require(entry.listed() && entry.showHat() && entry.gameMode().getId() == expectedMode, "TAB flags: " + name);
+                    if (name.endsWith("properties")) {
                         var texture=entry.profile().properties().get("textures").iterator().next();
                         require(texture.value().equals("texture-value") && texture.signature().equals("signed-value"), "Authenticated property preservation");
+                    }
+                }
+                if (packet instanceof ClientboundLoginPacket || packet instanceof ClientboundPlayerAbilitiesPacket || packet instanceof ClientboundPlayerInfoUpdatePacket) {
+                    var encoded = new RegistryFriendlyByteBuf(Unpooled.buffer(), registries);
+                    try {
+                        encoded.writeVarInt(id);
+                        codec.encode(encoded, packet);
+                        byte[] roundTrip = new byte[encoded.readableBytes()];
+                        encoded.readBytes(roundTrip);
+                        require(Arrays.equals(fixtureBytes, roundTrip), "Original mode packet round trip: " + name);
+                    } finally {
+                        encoded.release();
                     }
                 }
                 if (packet instanceof ClientboundPlayerInfoRemovePacket removed) require(removed.profileIds().size() == 1, "TAB removal");

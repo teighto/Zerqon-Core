@@ -123,7 +123,32 @@ fn play_state(epoch: u64) -> PlayState {
         rate_start: Instant::now(),
         packet_count: 0,
         inventory_count: 0,
+        flying: false,
     }
+}
+
+#[tokio::test]
+#[ignore = "requires prepared official Minecraft 26.3 data"]
+async fn terminal_inventory_failure_preserves_its_cause_without_sending_a_stale_snapshot() {
+    let mut fixture = Fixture::new().await;
+    let result = inventory_response(
+        Err(crate::managed_tasks::CleanupError("durable commit outcome is unknown".into()).into()),
+        &fixture.inventory,
+        &mut fixture.writer,
+    )
+    .await;
+    let delivered = ready_frame(&mut fixture.client).await;
+    fixture.cleanup().await;
+    let error = result.expect_err("terminal storage failure was treated as an ordinary rejection");
+    assert!(
+        error
+            .to_string()
+            .contains("durable commit outcome is unknown")
+    );
+    assert!(
+        delivered.is_none(),
+        "terminal failure published a stale inventory snapshot"
+    );
 }
 
 async fn ready_frame(client: &mut DuplexStream) -> Option<Vec<u8>> {

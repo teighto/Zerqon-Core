@@ -1050,12 +1050,19 @@ mod command_tests {
         fixture.state.sessions.drain().await;
         let after_quit = fixture.quit_count().await;
         fixture.shutdown().await.unwrap();
-        let saved = crate::player_store::PlayerStore::new(
-            fixture.directory.path().join("world/playerdata"),
-            Arc::clone(fixture.state.items.as_ref().unwrap()),
+        let catalog = Arc::clone(fixture.state.items.as_ref().unwrap());
+        drop(fixture.state);
+        let world = zerqon_world::WorldStore::open(fixture.directory.path().join("world")).unwrap();
+        let player = Uuid::from_u128(42);
+        let snapshot = world
+            .snapshot_domain(&[], &[zerqon_world::PlayerKey::new(player)], &[])
+            .unwrap();
+        let saved = crate::player_record::PlayerRecord::decode(
+            snapshot.players[0].data().unwrap(),
+            world.uuid().unwrap(),
+            player,
+            &catalog,
         )
-        .unwrap()
-        .load(Uuid::from_u128(42))
         .unwrap();
         assert_eq!(
             before_quit, "0",
@@ -1063,7 +1070,7 @@ mod command_tests {
         );
         assert!(retained_slot);
         assert_eq!(after_quit, "1");
-        assert_eq!(saved.selected(), 3);
+        assert_eq!(saved.inventory.selected(), 3);
     }
 
     #[tokio::test]

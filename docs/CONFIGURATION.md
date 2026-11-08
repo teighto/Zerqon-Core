@@ -22,8 +22,9 @@ server/
 ├── .cache/vanilla/26.3/    # locally prepared official data
 ├── config/                # reserved configuration directory
 ├── logs/latest.log
-└── world/                 # Zerqon chunk storage
-    └── playerdata/        # inventories saved by player UUID
+└── world/
+    ├── chunks.redb        # chunks, inventories and player modes
+    └── playerdata/        # preserved inventory files from older builds, if present
 ```
 
 `--directory PATH` selects the server directory. Relative `data_directory` paths resolve from it. Game data is prepared automatically inside `.cache/vanilla/26.3`. Keep the Java plugin libraries from the distribution in that server directory's `libraries/` folder.
@@ -41,6 +42,7 @@ Before running managed Java, Zerqon checks the JRE files against the sizes and S
 | `motd` | `Zerqon 26.3` | Server-list text, up to 4,096 UTF-8 bytes |
 | `max-players` | `20` | Maximum simultaneous players, 1–65,536 |
 | `online-mode` | `true` | Authenticate players; `false` is for isolated development tests |
+| `gamemode` | `creative` | Initial mode for new players: `creative` or `survival`; existing players keep their saved mode |
 | `view-distance` | `4` | Chunk view radius, 1–32 |
 | `network-compression-threshold` | `256` | Compression threshold in bytes; `-1` disables it |
 | `level-name` | `world` | World subdirectory name; path separators are rejected |
@@ -116,13 +118,13 @@ When running through Cargo, place operational flags after `--`, for example `car
 
 Use `help`, `version`, `tps`, `plugins` and `stop` in the console. `op NAME` grants access to a connected player by UUID. `deop NAME` or `deop UUID` removes it. Names in `ops.json` are labels; matching a name does not grant access. Old name-only files are rejected. In-game `/tpsbar` toggles a boss bar; `/setblock X Y Z STATE-ID` changes and saves a block. Core commands use operator levels. A full permission-provider API is still being developed.
 
-`/give PLAYER minecraft:ITEM [COUNT]` gives items to a connected player and requires operator level 2. The default count is 1; the limit is 4,096. If the full amount does not fit, nothing is added. Inventories are saved under the world's `playerdata/` directory and restored by UUID.
+`/give PLAYER minecraft:ITEM [COUNT]` gives items to a connected player and requires operator level 2. The default count is 1; the limit is 4,096. If the full amount does not fit, nothing is added. Inventories and player modes are saved by UUID in the world's `chunks.redb` database.
 
 The personal 2×2 crafting grid supports 478 ordinary shaped and shapeless recipes. Left/right pickup, shift crafting, hotbar swaps and recipe remainders use server-owned inventory state. The result slot is a preview and is recalculated after reconnect; it is not saved as an extra item. Closing the window or disconnecting returns the grid and cursor to the inventory before Quit. If that would require dropping items into the world, the items stay saved in the grid/cursor for the next session. Crafting actions that require drops are rejected without consuming ingredients. World item drops, special recipes, recipe-book actions and other containers still need work.
 
-Old inventory saves are upgraded on the next save without losing their grid, cursor or item components. A legacy file with a nonempty saved result slot is rejected and preserved for explicit recovery. Do not delete that file to bypass the check.
+An older `playerdata/UUID.zinv` is imported on that player's first login. Its grid, cursor and item components are preserved, and its mode remains Creative. The original file stays unchanged; later logins use the database. A legacy file with a nonempty saved result slot is rejected and preserved for explicit recovery. Do not delete that file to bypass the check.
 
-Players currently use Creative mode. Ordinary blocks, logs, dry slabs and stairs can be placed and broken, including stair connections across chunk boundaries. Placement uses the item in the selected hand and checks range and entity collisions. Unsupported interactions are rejected with a chat message. Survival, fluids, random block ticks and interactive containers still need work. Current chunks are saved in `chunks.redb`; see [world storage](WORLD_STORAGE.md) before restoring a backup or moving to an older build.
+Creative is the default for new players. In Creative, ordinary blocks, logs, dry slabs and stairs can be placed and broken, including stair connections across chunk boundaries. Placement checks the held item, range and entity collisions. `gamemode=survival` enables ordinary inventory actions and personal crafting from items supplied with `/give`; it refuses creative item creation and flight requests. Mining, Survival placement, loot, health, hunger and respawn are still being developed. Runtime `/gamemode` changes, fluids, random block ticks and interactive containers are not implemented yet. See [world storage](WORLD_STORAGE.md) before restoring a backup or moving to an older build.
 
 `/tps` reports the recent coordinator tick rate and average measured tick work. The built-in Rust CPU profiler uses `/spark profiler start` and `/spark profiler stop` on Linux. It saves reports in `profiles/`; see [Profiling](PROFILING.md). The append-only `logs/latest.log` is not automatically rotated. `RUST_LOG` selects log verbosity, for example `info` or `zerqon=debug`.
 
@@ -148,13 +150,13 @@ Horizon сначала сообщает тот же бренд, что и vanill
 
 Linux-дистрибутив собирается для `x86_64-unknown-linux-musl`. Для `python scripts/package-release.py` нужны `musl-gcc` из пакета `musl-tools` и цель Rust, добавленная командой `rustup target add x86_64-unknown-linux-musl`. Обычный `cargo run --release` использует платформу сборщика. Готовому Rust-файлу glibc не нужна, но автоматически загружаемой Java она пока нужна; автоматическая подготовка Java на Alpine ещё не поддерживается.
 
-Команда `/give ИГРОК minecraft:ПРЕДМЕТ [КОЛИЧЕСТВО]` выдаёт предметы подключённому игроку; нужен второй уровень оператора. По умолчанию выдаётся один предмет, максимум — 4 096. Если места не хватает на всё количество, команда ничего не добавляет. Инвентарь сохраняется по UUID в `world/playerdata/`.
+Команда `/give ИГРОК minecraft:ПРЕДМЕТ [КОЛИЧЕСТВО]` выдаёт предметы подключённому игроку; нужен второй уровень оператора. По умолчанию выдаётся один предмет, максимум 4 096. Если места не хватает на всё количество, команда ничего не добавляет. Инвентарь и режим игрока сохраняются по UUID в `world/chunks.redb`.
 
 В личной сетке 2×2 работают 478 обычных рецептов. Сервер проверяет взятие результата, Shift-крафт, обмен с хотбаром и остатки ингредиентов. Результат в выходном слоте вычисляется заново после входа и не сохраняется как дополнительный предмет. При закрытии окна или отключении сетка и курсор возвращаются в инвентарь до события Quit. Если для этого пришлось бы выбросить предметы в мир, они остаются сохранёнными в сетке и на курсоре. Крафт, требующий выбрасывания, отклоняется без расхода ингредиентов. Предметы в мире, специальные рецепты, книга рецептов и другие контейнеры ещё дорабатываются.
 
-Старые сохранения обновляются при следующей записи с сохранением сетки, курсора и компонентов предметов. Если старый файл содержит предмет в выходном слоте крафта, загрузка останавливается, а файл сохраняется для отдельного восстановления. Удалять его для обхода проверки не нужно.
+Старый файл `playerdata/UUID.zinv` переносится в базу при первом входе игрока. Сетка, курсор и компоненты предметов сохраняются; режим остаётся творческим. Исходный файл не меняется, следующие входы используют запись в базе. Если старый файл содержит предмет в выходном слоте крафта, загрузка останавливается для отдельного восстановления. Удалять его для обхода проверки не нужно.
 
-Сейчас используется творческий режим. Можно ставить и ломать обычные блоки, брёвна, сухие плиты и лестницы. Соединения лестниц обновляются и на границе чанков. Сервер проверяет предмет в руке, расстояние и пересечение с игроками и мобами. Неподдержанная операция возвращает сообщение в чат. Выживание, жидкости, случайные тики блоков и контейнеры ещё дорабатываются. Чанки сохраняются в `chunks.redb`; правила переноса и восстановления описаны в [документации хранилища](WORLD_STORAGE.md).
+Новые игроки по умолчанию входят в творческом режиме. В нём можно ставить и ломать обычные блоки, брёвна, сухие плиты и лестницы. Сервер проверяет предмет в руке, расстояние и пересечение с игроками и мобами; соединения лестниц обновляются и на границах чанков. Настройка `gamemode=survival` в `server.properties` выбирает режим выживания для новых игроков, уже сохранённые игроки сохраняют свой режим. В Survival работают инвентарь и личный крафт из предметов, выданных через `/give`; создание предметов творческими пакетами и запросы полёта запрещены. Добыча, установка блоков в Survival, лут, здоровье, голод и возрождение ещё дорабатываются. Команда `/gamemode`, жидкости, случайные тики блоков и контейнеры пока не реализованы. Правила переноса и восстановления описаны в [документации хранилища](WORLD_STORAGE.md).
 
 `cargo run --release -- --init` создаёт конфиги и завершает работу, `cargo run --release -- --check-config` проверяет значения без запуска сети. Настройки применяются после перезапуска. `server.properties` содержит адрес, порт, MOTD, онлайн-проверку аккаунтов и параметры Minecraft. `server.settings` — TOML с настройками потоков, кеша, очередей и плагинов. Неизвестные и повторяющиеся ключи отвергаются.
 

@@ -1,8 +1,9 @@
+use crate::game_mode::GameMode;
 use uuid::Uuid;
 use zerqon_protocol::codec::{put_string, put_varint};
 
-pub fn player_info_add(uuid: Uuid, name: &str, listed: bool) -> Vec<u8> {
-    player_info_add_properties(uuid, name, listed, &[])
+pub fn player_info_add(uuid: Uuid, name: &str, listed: bool, game_mode: GameMode) -> Vec<u8> {
+    player_info_add_properties(uuid, name, listed, &[], game_mode)
 }
 
 pub fn player_info_add_properties(
@@ -10,6 +11,7 @@ pub fn player_info_add_properties(
     name: &str,
     listed: bool,
     properties: &[(&str, &str, Option<&str>)],
+    game_mode: GameMode,
 ) -> Vec<u8> {
     let mut packet = vec![71, 0x9d, 1];
     packet.extend_from_slice(uuid.as_bytes());
@@ -23,7 +25,8 @@ pub fn player_info_add_properties(
             put_string(signature, &mut packet);
         }
     }
-    packet.extend_from_slice(&[1, u8::from(listed), 0, 1]);
+    put_varint(i32::from(game_mode), &mut packet);
+    packet.extend_from_slice(&[u8::from(listed), 0, 1]);
     packet
 }
 
