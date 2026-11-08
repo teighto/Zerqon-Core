@@ -26,7 +26,7 @@ impl UpdateAvailable {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct NotificationState {
     announced: Option<Version>,
 }

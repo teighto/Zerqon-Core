@@ -122,6 +122,7 @@ pub struct State {
     pub players: Arc<Players>,
     pub queries: Arc<crate::server_queries::ServerQueries>,
     pub native_read_budget: crate::native_query_runtime::NativeReadBudget,
+    pub player_control_budget: crate::player_control::ControlBudget,
     pub lifecycle: crate::lifecycle::Lifecycle,
     pub sessions: crate::player_session::SessionRegistry,
     player_events: Mutex<HashMap<(Uuid, i32), PlayerEventReceipt>>,
@@ -552,9 +553,18 @@ impl State {
             let gameplay = Arc::clone(&gameplay);
             let players = Arc::clone(&players);
             let shutdown = shutdown.clone();
+            let world_lifecycle = lifecycle.clone();
             Some(Arc::new(
                 startup_work(lifecycle, stop, "open world", move || {
-                    World::new(&path, &settings, data, gameplay, players, shutdown)
+                    World::new(
+                        &path,
+                        &settings,
+                        data,
+                        gameplay,
+                        players,
+                        shutdown,
+                        world_lifecycle,
+                    )
                 })
                 .await?,
             ))
@@ -751,6 +761,7 @@ impl State {
             players,
             queries,
             native_read_budget,
+            player_control_budget: crate::player_control::ControlBudget::default(),
             lifecycle: lifecycle.clone(),
             sessions: crate::player_session::SessionRegistry::default(),
             player_events: Mutex::new(HashMap::new()),
@@ -1262,7 +1273,7 @@ impl State {
             "list"=>Ok(vec![format!("Players ({}): {}",self.online(),self.players.names().join(", "))]),
             "version"=>Ok(vec![format!("Zerqon {} | Minecraft 26.3 | teighto",env!("CARGO_PKG_VERSION"))]),
             "help"=>Ok(vec!["Commands: /help /version /tps /tpsbar /plugins; operator: /give player item [count], /summon pig|cow|zombie [x y z], /setblock x y z state, /stop".into()]),
-            "plugins"=>{let rust=self.plugins.list().iter().map(|plugin|format!("{} ({})",plugin.name,if plugin.enabled{"enabled"}else{"disabled"})).collect::<Vec<_>>().join(", ");let java=if let Some(java)=&self.java{java.list().await?.iter().map(|plugin|format!("{} ({})",plugin.name,if plugin.enabled{"enabled"}else{"disabled"})).collect::<Vec<_>>().join(", ")}else{"disabled".into()};let callbacks=self.plugins.stats();let reads=self.native_read_budget.snapshot();Ok(vec![format!("Rust: {rust}; Java: {java} | Rust callbacks: {}; event bytes: {}; native read memory: {}/{} bytes",callbacks.callbacks,callbacks.bytes,reads.reserved_bytes,reads.limit_bytes)])},
+            "plugins"=>{let rust=self.plugins.list().iter().map(|plugin|format!("{} ({})",plugin.name,if plugin.enabled{"enabled"}else{"disabled"})).collect::<Vec<_>>().join(", ");let java=if let Some(java)=&self.java{java.list().await?.iter().map(|plugin|format!("{} ({})",plugin.name,if plugin.enabled{"enabled"}else{"disabled"})).collect::<Vec<_>>().join(", ")}else{"disabled".into()};let callbacks=self.plugins.stats();let reads=self.native_read_budget.snapshot();let controls=self.player_control_budget.snapshot();Ok(vec![format!("Rust: {rust}; Java: {java} | Rust callbacks: {}; event bytes: {}; native read memory: {}/{} bytes; control memory: {}/{} bytes",callbacks.callbacks,callbacks.bytes,reads.reserved_bytes,reads.limit_bytes,controls.reserved_bytes,controls.limit_bytes)])},
             "stop"=>{if level<4{return Ok(vec!["Permission denied".into()]);}let _=self.shutdown.send(true);Ok(vec!["Stopping Zerqon".into()])},
             "setblock"=>{
                 if level<2{return Ok(vec!["Permission denied".into()]);}
@@ -1352,6 +1363,56 @@ pub fn block_update(x: i32, y: i32, z: i32, state: u32) -> Vec<u8> {
     packet
 }
 
+pub struct PreparedChunk {
+    bytes: Vec<u8>,
+    _output: tokio::sync::OwnedSemaphorePermit,
+    _completion: PreparedChunkCompletion,
+}
+
+#[derive(Clone, Default)]
+pub struct ChunkSnapshotFence(Arc<AtomicBool>);
+
+impl ChunkSnapshotFence {
+    pub fn started(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+
+    fn mark(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+enum ChunkPreparation {
+    Ready(PreparedChunk),
+    Missing,
+    Expired,
+}
+
+impl PreparedChunk {
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl std::fmt::Debug for PreparedChunk {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedChunk")
+            .field("bytes", &self.bytes.len())
+            .finish()
+    }
+}
+
+struct PreparedChunkCompletion(Option<crate::lifecycle::JobGuard>);
+
+impl Drop for PreparedChunkCompletion {
+    fn drop(&mut self) {
+        if let Some(job) = self.0.take() {
+            job.finish(Ok(()));
+        }
+    }
+}
+
 pub struct World {
     players: Arc<Players>,
     shutdown: watch::Sender<bool>,
@@ -1361,8 +1422,10 @@ pub struct World {
     cache: Arc<Mutex<ChunkCache>>,
     workers: ChunkWorkers,
     inflight: Arc<Semaphore>,
+    packet_output: Arc<Semaphore>,
     data: Arc<GameData>,
     stripes: Arc<[Mutex<()>; 64]>,
+    lifecycle: crate::lifecycle::Lifecycle,
 }
 impl World {
     pub fn descriptor(&self, name: &str) -> Result<crate::plugin_services::NativeWorld> {
@@ -1480,6 +1543,7 @@ impl World {
         gameplay: Arc<RwLock<()>>,
         players: Arc<Players>,
         shutdown: watch::Sender<bool>,
+        lifecycle: crate::lifecycle::Lifecycle,
     ) -> Result<Self> {
         let store = WorldStore::open(path)?;
         if let Some(metadata) = store.metadata() {
@@ -1501,50 +1565,155 @@ impl World {
             )?)),
             workers: ChunkWorkers::new(settings.world_threads, settings.work_queue_capacity)?,
             inflight: Arc::new(Semaphore::new(settings.work_queue_capacity)),
+            packet_output: Arc::new(Semaphore::new(32 * 1024 * 1024)),
             data,
             stripes: Arc::new(std::array::from_fn(|_| Mutex::new(()))),
+            lifecycle,
         })
     }
-    pub async fn packet(&self, x: i32, z: i32) -> Result<Vec<u8>> {
+    pub async fn packet(self: &Arc<Self>, x: i32, z: i32) -> Result<Vec<u8>> {
+        let prepared = self
+            .prepare_packet(
+                x,
+                z,
+                &self.lifecycle.token(),
+                tokio::time::Instant::now() + Duration::from_secs(30),
+            )
+            .await?;
+        Ok(prepared.bytes)
+    }
+
+    pub async fn prepare_packet(
+        self: &Arc<Self>,
+        x: i32,
+        z: i32,
+        parent: &crate::lifecycle::StopToken,
+        deadline: tokio::time::Instant,
+    ) -> Result<PreparedChunk> {
+        self.prepare_packet_with_fence(x, z, parent, deadline, ChunkSnapshotFence::default())
+            .await
+    }
+
+    pub async fn prepare_packet_with_fence(
+        self: &Arc<Self>,
+        x: i32,
+        z: i32,
+        parent: &crate::lifecycle::StopToken,
+        deadline: tokio::time::Instant,
+        snapshot: ChunkSnapshotFence,
+    ) -> Result<PreparedChunk> {
         self.check_available()?;
-        let permit = Arc::clone(&self.inflight).acquire_owned().await?;
-        let store = Arc::clone(&self.store);
-        let cache = Arc::clone(&self.cache);
-        let data = Arc::clone(&self.data);
-        let stripes = Arc::clone(&self.stripes);
-        let ticket = self.workers.try_submit(move || {
-            let _guard = stripes[stripe(x, z)]
-                .lock()
-                .map_err(|_| zerqon_world::WorldError::Corrupt("chunk lock poisoned"))?;
-            store.check_available()?;
-            let cached = cache
-                .lock()
-                .map_err(|_| zerqon_world::WorldError::Corrupt("cache lock poisoned"))?
-                .get(x, z);
-            let chunk = if let Some(chunk) = cached {
-                chunk
-            } else {
-                let chunk = Arc::new(
-                    store
-                        .load(x, z)?
-                        .unwrap_or_else(|| Chunk::flat(x, z, data.flat)),
-                );
-                validate_chunk(&chunk, &data)?;
-                cache
-                    .lock()
-                    .map_err(|_| zerqon_world::WorldError::Corrupt("cache lock poisoned"))?
-                    .insert(Arc::clone(&chunk));
-                chunk
-            };
-            crate::packets::chunk(&chunk, &data)
-                .map_err(|_| zerqon_world::WorldError::Corrupt("unknown block state"))
-        })?;
-        let result = tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            ticket.wait_timeout(Duration::from_secs(30))
-        })
-        .await??;
-        Ok(result)
+        parent.check()?;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(zerqon_world::WorldError::Timeout.into());
+        }
+        let world = Arc::clone(self);
+        let operation = crate::managed_tasks::run(
+            &self.lifecycle,
+            parent,
+            "prepare chunk packet",
+            move |stop| async move {
+                let output = crate::managed_tasks::cancellable(&stop, async {
+                    Ok::<_, Box<dyn std::error::Error + Send + Sync>>(
+                        Arc::clone(&world.packet_output)
+                            .acquire_many_owned(4 * 1024 * 1024)
+                            .await?,
+                    )
+                })
+                .await?;
+                let permit = crate::managed_tasks::cancellable(&stop, async {
+                    Ok::<_, Box<dyn std::error::Error + Send + Sync>>(
+                        Arc::clone(&world.inflight).acquire_owned().await?,
+                    )
+                })
+                .await?;
+                stop.check()?;
+                world.check_available()?;
+                if tokio::time::Instant::now() >= deadline {
+                    return Ok(ChunkPreparation::Expired);
+                }
+                let completion = PreparedChunkCompletion(Some(
+                    world.lifecycle.register_cleanup("prepared chunk packet")?,
+                ));
+                tokio::task::spawn_blocking(move || {
+                    let work_permit = permit;
+                    stop.check()?;
+                    world.check_available()?;
+                    if tokio::time::Instant::now() >= deadline {
+                        return Ok(ChunkPreparation::Expired);
+                    }
+                    let store = Arc::clone(&world.store);
+                    let cache = Arc::clone(&world.cache);
+                    let data = Arc::clone(&world.data);
+                    let stripes = Arc::clone(&world.stripes);
+                    let failed = Arc::clone(&world.failed);
+                    let ticket = world.workers.try_submit(move || {
+                        snapshot.mark();
+                        let _guard = stripes[stripe(x, z)].lock().map_err(|_| {
+                            zerqon_world::WorldError::Corrupt("chunk lock poisoned")
+                        })?;
+                        store.check_available()?;
+                        if failed.load(Ordering::Acquire) {
+                            return Err(zerqon_world::WorldError::StorageUnavailable);
+                        }
+                        let cached = cache
+                            .lock()
+                            .map_err(|_| zerqon_world::WorldError::Corrupt("cache lock poisoned"))?
+                            .get(x, z);
+                        let chunk = if let Some(chunk) = cached {
+                            chunk
+                        } else {
+                            let chunk = Arc::new(
+                                store
+                                    .load(x, z)?
+                                    .unwrap_or_else(|| Chunk::flat(x, z, data.flat)),
+                            );
+                            validate_chunk(&chunk, &data)?;
+                            cache
+                                .lock()
+                                .map_err(|_| {
+                                    zerqon_world::WorldError::Corrupt("cache lock poisoned")
+                                })?
+                                .insert(Arc::clone(&chunk));
+                            chunk
+                        };
+                        crate::packets::chunk(&chunk, &data)
+                            .map_err(|_| zerqon_world::WorldError::Corrupt("unknown block state"))
+                    })?;
+                    let result = ticket.wait();
+                    drop(work_permit);
+                    let bytes = match result {
+                        Ok(bytes) => bytes,
+                        Err(zerqon_world::WorldError::MissingImportedChunk { .. }) => {
+                            return Ok(ChunkPreparation::Missing);
+                        }
+                        Err(error) => return Err(error.into()),
+                    };
+                    if bytes.len() > 2_097_151 {
+                        return Err("chunk packet exceeds protocol length limit".into());
+                    }
+                    Ok::<_, Box<dyn std::error::Error + Send + Sync>>(ChunkPreparation::Ready(
+                        PreparedChunk {
+                            bytes,
+                            _output: output,
+                            _completion: completion,
+                        },
+                    ))
+                })
+                .await?
+            },
+        );
+        tokio::pin!(operation);
+        tokio::select! {
+            biased;
+            result = &mut operation => match result?? {
+                ChunkPreparation::Ready(packet) => Ok(packet),
+                ChunkPreparation::Missing => Err(zerqon_world::WorldError::MissingImportedChunk { x, z }.into()),
+                ChunkPreparation::Expired => Err(zerqon_world::WorldError::Timeout.into()),
+            },
+            _ = parent.cancelled() => Err(crate::lifecycle::Stopped.into()),
+            _ = tokio::time::sleep_until(deadline) => Err(zerqon_world::WorldError::Timeout.into()),
+        }
     }
     pub async fn set_block(&self, x: i32, y: i32, z: i32, block: u32) -> Result<()> {
         self.check_available()?;

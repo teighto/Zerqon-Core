@@ -80,6 +80,10 @@ Set the bind address and port in `server.properties`, and thread counts in `serv
 
 The packet-memory limits cover received buffers until those buffers are freed. Queued inventory decoding keeps its buffer counted even if the player disconnects. A connection closes when another packet would exceed either limit. These settings do not limit total process RAM. Incoming frames and decoded payloads are also limited to the smaller of `max_packet_bytes` and 64 KiB.
 
+While a plugin handles a player's command or Join event, the connection continues to handle keepalive replies and send outgoing packets. Later gameplay waits in order, with room for 64 packets, including at most four commands. Exceeding either queue limit closes the connection. Disconnect cleanup waits for an accepted command to finish before sending Quit.
+
+Chunk preparation reserves 4 MiB per result from a separate 32 MiB pool per world. It keeps that reservation until the packet is sent or discarded. Internal player messages share a 4 MiB pool, with a 64 KiB reservation per message and up to 16 accepted messages per connection. These limits are fixed in this version and are separate from the chunk cache and incoming packet limits. `/plugins` reports the current internal message reservation as `control memory`.
+
 The update checker runs in the background, starting with one check at startup. It uses no GitHub token, skips drafts and prereleases, and downloads no software. New-version notices appear once in the console and once per operator session and version, in English, with the GitHub release link. Failed checks back off; status-only mode never starts the checker. Set `update_check = false` to disable all update-check requests.
 
 ## Client connections
@@ -125,6 +129,10 @@ Players currently use Creative mode. Ordinary blocks, logs, dry slabs and stairs
 `server_brand = "zerqon"` задаёт название сервера в F3. Можно указать свой текст, например `server_brand = "teighto"`, и перезапустить сервер. Допускаются кириллица и эмодзи; пустая строка, переносы строк и управляющие символы запрещены. Предел длины, как в Java, составляет 128 единиц UTF-16.
 
 `packet_memory_mib = 64` ограничивает память входящих пакетов на весь сервер, `connection_packet_memory_mib = 2` задаёт лимит одного соединения. Значения указываются в МиБ; общий предел допускает 1–4096, предел соединения 1–64 и не может быть больше общего. Буфер учитывается до его освобождения. Отключение игрока не снимает учёт с буфера, который ещё ждёт разбора в очереди инвентаря. При превышении лимита соединение закрывается. Это не ограничение всей оперативной памяти процесса. Размер входящего пакета после распаковки также не превышает меньшее из `max_packet_bytes` и 64 КиБ.
+
+Пока плагин обрабатывает команду игрока или событие Join, соединение продолжает принимать ответы keepalive и отправлять пакеты. Следующие игровые действия ждут своей очереди. В ней помещается до 64 пакетов, из них не более четырёх команд. При переполнении соединение закрывается. Если команда уже принята, сервер ждёт её завершения перед Quit даже после отключения игрока.
+
+Для подготовки пакетов чанков выделен отдельный резерв 32 МиБ на мир, по 4 МиБ на результат. Резерв удерживается до отправки или удаления результата. Внутренние сообщения игрокам используют общий резерв 4 МиБ, по 64 КиБ на сообщение; одно соединение принимает до 16 таких сообщений одновременно. В этой версии эти лимиты фиксированы и не входят в настройки кеша и входящих пакетов. Текущий резерв сообщений виден в `/plugins` как `control memory`.
 
 `allow_java_clients` и `allow_horizon_clients` по умолчанию включены. Первый разрешает обычный профиль подключения Java Edition, второй — профиль Horizon. Если выключить оба, вход игроков будет закрыт, но сервер останется виден в списке серверов.
 

@@ -5,11 +5,15 @@ use crate::{
     player_inventory::InventoryHandle,
     player_session::LoginAdmission,
     players::{Identity, PacketBatch, PlayerError, PlayerHandle, Position},
-    runtime::{BlockInteraction, CommandSource, State, World},
+    runtime::{BlockInteraction, State, World},
     world_view,
 };
 use md5::{Digest, Md5};
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{
+    collections::{HashSet, VecDeque},
+    sync::Arc,
+    time::Duration,
+};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::TcpStream,
@@ -28,6 +32,10 @@ use zerqon_protocol::{
 
 #[cfg(test)]
 mod budget_wire_tests;
+#[cfg(test)]
+mod chunk_publication_tests;
+#[cfg(test)]
+mod control_write_tests;
 
 struct Reader {
     io: Box<dyn AsyncRead + Unpin + Send>,
@@ -42,6 +50,7 @@ struct Writer {
     compression: Option<usize>,
     deadline: Duration,
     shutdown: watch::Receiver<bool>,
+    _control_transport: Option<crate::player_control::TransportGuard>,
 }
 impl Reader {
     async fn packet(&mut self) -> Result<InboundPacket> {
@@ -52,6 +61,23 @@ impl Reader {
     }
 }
 impl Writer {
+    async fn send_control(
+        &mut self,
+        request: crate::player_control::QueuedMessage,
+        key: crate::player_control::SessionKey,
+    ) -> Result<()> {
+        if let Some(writing) = request.begin_write(key) {
+            match self.send(writing.packet()).await {
+                Ok(()) => writing.finish_written(),
+                Err(error) => {
+                    writing.finish_closed();
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn send(&mut self, packet: &[u8]) -> Result<()> {
         if *self.shutdown.borrow() {
             return Err("server stopping".into());
@@ -88,6 +114,7 @@ pub async fn handle(socket: TcpStream, state: Arc<State>) -> Result<()> {
         compression: None,
         deadline,
         shutdown: state.shutdown.subscribe(),
+        _control_transport: None,
     };
     let packet = reader.packet().await?;
     let mut view = packet.as_slice();
@@ -491,6 +518,138 @@ fn offline_uuid(name: &str) -> Uuid {
     Uuid::from_bytes(bytes)
 }
 
+struct PlayState {
+    radius: i32,
+    loaded: HashSet<(i32, i32)>,
+    center: (i32, i32),
+    position: (f64, f64, f64),
+    rotation: (f32, f32),
+    desired: HashSet<(i32, i32)>,
+    stream: Option<AbortTask<Result<()>>>,
+    stream_epoch: u64,
+    streaming: bool,
+    chunk_count: i32,
+    last_keepalive: Instant,
+    outstanding: Option<(i64, Instant)>,
+    nonce: i64,
+    bar: Uuid,
+    show_bar: bool,
+    teleport_confirmed: bool,
+    teleport_id: i32,
+    last_ack_sequence: u64,
+    boundary_notice: bool,
+    rate_start: Instant,
+    packet_count: u32,
+    inventory_count: u32,
+}
+
+struct ReceivedPacket {
+    sequence: u64,
+    packet: Result<InboundPacket>,
+    counted: bool,
+}
+
+struct PendingNotice {
+    next: crate::updates::NotificationState,
+    completion: std::pin::Pin<
+        Box<dyn std::future::Future<Output = crate::player_control::ControlOutcome> + Send>,
+    >,
+}
+
+struct PendingChunk {
+    epoch: u64,
+    x: i32,
+    z: i32,
+    snapshot: crate::runtime::ChunkSnapshotFence,
+    completion: std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<crate::runtime::PreparedChunk>> + Send>,
+    >,
+}
+
+impl PendingChunk {
+    fn new(
+        world: &Arc<World>,
+        x: i32,
+        z: i32,
+        epoch: u64,
+        deadline: Instant,
+        stop: crate::lifecycle::StopToken,
+    ) -> Self {
+        let world = Arc::clone(world);
+        let snapshot = crate::runtime::ChunkSnapshotFence::default();
+        let worker_snapshot = snapshot.clone();
+        Self {
+            epoch,
+            x,
+            z,
+            snapshot,
+            completion: Box::pin(async move {
+                world
+                    .prepare_packet_with_fence(x, z, &stop, deadline, worker_snapshot)
+                    .await
+            }),
+        }
+    }
+}
+
+async fn send_outbound_batch(
+    writer: &mut Writer,
+    inventory: &InventoryHandle,
+    batch: PacketBatch,
+) -> Result<()> {
+    if inventory.allow_outbound(&batch) {
+        for packet in batch {
+            writer.send(&packet).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn hold_or_send_outbound(
+    writer: &mut Writer,
+    inventory: &InventoryHandle,
+    batch: PacketBatch,
+    snapshot: Option<&crate::runtime::ChunkSnapshotFence>,
+    held: &mut Option<PacketBatch>,
+) -> Result<()> {
+    if snapshot.is_some_and(crate::runtime::ChunkSnapshotFence::started) {
+        if held.is_some() {
+            return Err("chunk publication already holds an outbound batch".into());
+        }
+        *held = Some(batch);
+        Ok(())
+    } else {
+        send_outbound_batch(writer, inventory, batch).await
+    }
+}
+
+async fn publish_prepared_chunk(
+    writer: &mut Writer,
+    inventory: &InventoryHandle,
+    play: &mut PlayState,
+    preparing: PendingChunk,
+    result: Result<crate::runtime::PreparedChunk>,
+    held: &mut Option<PacketBatch>,
+) -> Result<()> {
+    match result {
+        Ok(packet) => {
+            if preparing.epoch == play.stream_epoch
+                && play.desired.contains(&(preparing.x, preparing.z))
+            {
+                writer.send(packet.bytes()).await?;
+                play.loaded.insert((preparing.x, preparing.z));
+                play.chunk_count += 1;
+            }
+        }
+        Err(error) if World::missing_imported_chunk(error.as_ref()) => {}
+        Err(error) => return Err(error),
+    }
+    if let Some(batch) = held.take() {
+        send_outbound_batch(writer, inventory, batch).await?;
+    }
+    Ok(())
+}
+
 async fn play(
     (mut reader, mut writer): (Reader, Writer),
     state: Arc<State>,
@@ -502,10 +661,21 @@ async fn play(
 ) -> Result<()> {
     let (incoming_tx, mut incoming) = mpsc::channel(32);
     let _reader_task = AbortTask(tokio::spawn(async move {
-        loop {
+        let mut sequence = 0_u64;
+        while let Some(next) = sequence.checked_add(1) {
+            sequence = next;
             let packet = reader.packet().await;
             let failed = packet.is_err();
-            if incoming_tx.send(packet).await.is_err() || failed {
+            if incoming_tx
+                .send(ReceivedPacket {
+                    sequence,
+                    packet,
+                    counted: false,
+                })
+                .await
+                .is_err()
+                || failed
+            {
                 break;
             }
         }
@@ -587,149 +757,462 @@ async fn play(
         writer.send(&packets::position(1, 0.5, 64.0, 0.5)).await?;
     }
     writer.send(&packets::game_event(13, 0.0)).await?;
-    session.join().await?;
-    tracing::info!(player=%profile.name,"Player joined");
     let radius = i32::from(state.properties.view_distance);
-    let mut loaded = HashSet::new();
-    let mut center = world_view::center(initial.xyz[0], initial.xyz[2]);
-    let mut position = (initial.xyz[0], initial.xyz[1], initial.xyz[2]);
-    let mut rotation = (initial.yaw, initial.pitch);
-    let mut desired = world_view::desired(center, radius);
+    let loaded = HashSet::new();
+    let center = world_view::center(initial.xyz[0], initial.xyz[2]);
+    let position = (initial.xyz[0], initial.xyz[1], initial.xyz[2]);
+    let rotation = (initial.yaw, initial.pitch);
+    let desired = world_view::desired(center, radius);
     let (chunk_sender, mut chunk_events) = mpsc::channel(4);
-    let mut stream = Some(stream_chunks(
-        chunk_sender.clone(),
-        center,
-        &desired,
-        &loaded,
-    ));
-    let mut streaming = true;
-    let mut chunk_count = 0;
+    let stream: Option<AbortTask<Result<()>>> = None;
+    let streaming = false;
+    let chunk_count = 0;
     let mut maintenance = tokio::time::interval(Duration::from_secs(1));
     maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut last_keepalive = Instant::now();
-    let mut outstanding: Option<(i64, Instant)> = None;
-    let mut nonce = 0i64;
+    let last_keepalive = Instant::now();
+    let outstanding: Option<(i64, Instant)> = None;
+    let nonce = 0i64;
     let bar = Uuid::new_v4();
-    let mut show_bar = false;
-    let mut teleport_confirmed = false;
-    let mut teleport_id = 1i32;
-    let mut boundary_notice = false;
-    let mut rate_start = Instant::now();
-    let mut packet_count = 0u32;
-    let mut inventory_count = 0u32;
+    let show_bar = false;
+    let teleport_confirmed = false;
+    let teleport_id = 1i32;
+    let last_ack_sequence = 0_u64;
+    let mut command: Option<crate::player_session::CommandReceipt> = None;
+    let mut join = Some(Box::pin(session.join()));
+    let mut deferred = VecDeque::<ReceivedPacket>::new();
+    let mut deferred_commands = 0_usize;
+    let boundary_notice = false;
+    let rate_start = Instant::now();
+    let packet_count = 0u32;
+    let inventory_count = 0u32;
     let mut shutdown = state.shutdown.subscribe();
     let updates = state.updates.clone();
     let mut update_notifications = crate::updates::NotificationState::default();
+    let mut pending_notice: Option<PendingNotice> = None;
+    let mut pending_chunk: Option<PendingChunk> = None;
+    let mut held_outbound: Option<PacketBatch> = None;
+    let mut play = PlayState {
+        radius,
+        loaded,
+        center,
+        position,
+        rotation,
+        desired,
+        stream,
+        stream_epoch: 0,
+        streaming,
+        chunk_count,
+        last_keepalive,
+        outstanding,
+        nonce,
+        bar,
+        show_bar,
+        teleport_confirmed,
+        teleport_id,
+        last_ack_sequence,
+        boundary_notice,
+        rate_start,
+        packet_count,
+        inventory_count,
+    };
+    let control_key = crate::player_control::SessionKey {
+        uuid: profile.uuid,
+        session_id: registration.id(),
+    };
+    let (control_sender, mut control_receiver, control_transport) = crate::player_control::channel(
+        control_key,
+        state.player_control_budget.clone(),
+        state.lifecycle.clone(),
+        16,
+    )?;
+    writer._control_transport = Some(control_transport);
+    let _control_binding = session.bind_control(control_sender)?;
     loop {
-        tokio::select! {
+        let command_running = command.is_some();
+        let joining = join.is_some();
+        let ordered_work_pending = command_running || joining;
+        let notice_pending = pending_notice.is_some();
+        let chunk_pending = pending_chunk.is_some();
+        let hold_publication = pending_chunk
+            .as_ref()
+            .is_some_and(|chunk| chunk.snapshot.started());
+        let (received, from_deferred) = tokio::select! {
             _=shutdown.changed()=>{writer.send(&disconnect(32,"Server stopping")).await?;return Ok(());},
             _=disconnected.changed()=>return Err("outbound queue exceeded".into()),
-            batch=outbound.recv()=>{let Some(batch)=batch else{return Ok(());};if inventory.allow_outbound(&batch){for packet in batch{writer.send(&packet).await?;}}},
-            event=chunk_events.recv()=>{
-                if write_chunk_event(event.ok_or("chunk stream stopped")?,&mut writer,world,&mut loaded,&mut chunk_count).await?{streaming=false;}
+            outcome=async { pending_notice.as_mut().expect("notice branch is enabled").completion.as_mut().await }, if notice_pending => {
+                let notice = pending_notice.take().expect("notice branch is enabled");
+                match outcome {
+                    crate::player_control::ControlOutcome::Written { .. } => update_notifications = notice.next,
+                    crate::player_control::ControlOutcome::Rejected { .. } => {},
+                    crate::player_control::ControlOutcome::ConnectionClosed { .. } => return Err("player control transport closed".into()),
+                }
+                continue;
+            },
+            request=control_receiver.recv()=>{
+                let request = request.ok_or("player control receiver stopped")?;
+                writer.send_control(request, control_key).await?;
+                continue;
+            },
+            result=async { join.as_mut().expect("join branch is enabled").await }, if joining => {
+                result?;
+                join = None;
+                tracing::info!(player=%profile.name,"Player joined");
+                play.stream_epoch = play.stream_epoch.checked_add(1).ok_or("chunk stream epoch exhausted")?;
+                play.stream = Some(stream_chunks(chunk_sender.clone(), play.stream_epoch, play.center, &play.desired, &play.loaded));
+                play.streaming = true;
+                continue;
+            },
+            result=async { command.as_mut().expect("command branch is enabled").wait().await }, if command_running => {
+                let replies = result?;
+                command = None;
+                match replies {
+                    Ok(replies) => for reply in replies { writer.send(&packets::system_chat(&reply)).await?; },
+                    Err(error) => writer.send(&packets::system_chat(&format!("Command failed: {error}"))).await?,
+                }
+                continue;
+            },
+            result=async { pending_chunk.as_mut().expect("chunk branch is enabled").completion.as_mut().await }, if chunk_pending => {
+                let preparing = pending_chunk.take().expect("chunk branch is enabled");
+                publish_prepared_chunk(&mut writer, inventory, &mut play, preparing, result, &mut held_outbound).await?;
+                continue;
+            },
+            batch=outbound.recv(), if held_outbound.is_none() && !hold_publication=>{
+                let Some(batch)=batch else{return Ok(());};
+                hold_or_send_outbound(&mut writer, inventory, batch, pending_chunk.as_ref().map(|chunk| &chunk.snapshot), &mut held_outbound).await?;
+                continue;
+            },
+            event=chunk_events.recv(), if !chunk_pending=>{
+                let event = event.ok_or("chunk stream stopped")?;
+                if event.epoch != play.stream_epoch { continue; }
+                if let ChunkEvent::Chunk { x, z } = event.event {
+                    pending_chunk = Some(PendingChunk::new(world, x, z, event.epoch, Instant::now()+writer.deadline, state.lifecycle.token()));
+                } else if write_chunk_event(event.event,&mut writer,world,&mut play.loaded,&mut play.chunk_count).await?{play.streaming=false;}
+                continue;
             },
             _=maintenance.tick()=>{
-                let notice = updates.as_ref().and_then(|updates| {
-                    let update = updates.borrow();
-                    update_notifications.next(state.is_operator(profile.uuid), update.as_ref())
-                });
-                if let Some(message) = notice { writer.send(&packets::system_chat(&message)).await?; }
-                if outstanding.is_some_and(|(_,sent)|sent.elapsed()>Duration::from_secs(30)){return Err("keepalive timeout".into());}
-                if outstanding.is_none()&&last_keepalive.elapsed()>=Duration::from_secs(10){nonce=nonce.wrapping_add(1);let mut packet=vec![45];packet.extend_from_slice(&nonce.to_be_bytes());writer.send(&packet).await?;outstanding=Some((nonce,Instant::now()));last_keepalive=Instant::now();}
-                if show_bar{let (title,progress)=tpsbar_metrics(&state);for packet in packets::bossbar_update(bar,&title,progress){writer.send(&packet).await?;}}
-                if stream.as_ref().is_some_and(|task|task.0.is_finished())&&let Some(mut task)=stream.take(){(&mut task.0).await??;}
-                if !streaming&&stream.is_none(){
-                    let next=world_view::center(position.0,position.2);
-                    if next!=center{center=next;desired=world_view::desired(center,radius);streaming=true;stream=Some(stream_chunks(chunk_sender.clone(),center,&desired,&loaded));}
+                if !notice_pending {
+                    let mut next = update_notifications.clone();
+                    let notice = updates.as_ref().and_then(|updates| {
+                        let update = updates.borrow();
+                        next.next(state.is_operator(profile.uuid), update.as_ref())
+                    });
+                    if let Some(message) = notice
+                        && let Some(control) = state.sessions.control(control_key)
+                    {
+                        match control.try_system_message(&message, Instant::now() + writer.deadline, &state.lifecycle.token()) {
+                            Ok(receipt) => pending_notice = Some(PendingNotice { next, completion: Box::pin(receipt.wait()) }),
+                            Err(crate::player_control::ControlError::Busy) => {},
+                            Err(error) => return Err(error.into()),
+                        }
+                    }
                 }
+                if play.outstanding.is_some_and(|(_,sent)|sent.elapsed()>Duration::from_secs(30)){return Err("keepalive timeout".into());}
+                if play.outstanding.is_none()&&play.last_keepalive.elapsed()>=Duration::from_secs(10){play.nonce=play.nonce.wrapping_add(1);let mut packet=vec![45];packet.extend_from_slice(&play.nonce.to_be_bytes());writer.send(&packet).await?;play.outstanding=Some((play.nonce,Instant::now()));play.last_keepalive=Instant::now();}
+                if play.show_bar{let (title,progress)=tpsbar_metrics(&state);for packet in packets::bossbar_update(play.bar,&title,progress){writer.send(&packet).await?;}}
+                if play.stream.as_ref().is_some_and(|task|task.0.is_finished())&&let Some(mut task)=play.stream.take(){(&mut task.0).await??;}
+                if !joining&&!play.streaming&&play.stream.is_none(){
+                    let next=world_view::center(play.position.0,play.position.2);
+                    if next!=play.center{play.center=next;play.desired=world_view::desired(play.center,play.radius);play.streaming=true;play.stream_epoch=play.stream_epoch.checked_add(1).ok_or("chunk stream epoch exhausted")?;play.stream=Some(stream_chunks(chunk_sender.clone(),play.stream_epoch,play.center,&play.desired,&play.loaded));}
+                }
+                continue;
             },
-            packet=incoming.recv()=>{
-                let packet=packet.ok_or("connection reader stopped")??;
-                if rate_start.elapsed()>=Duration::from_secs(1){rate_start=Instant::now();packet_count=0;inventory_count=0;}
-                packet_count+=1;if packet_count>500{return Err("packet rate limit exceeded".into());}
-                let mut view=packet.as_slice();let id=get_varint(&mut view)?;
-                match id{
-                    18|54|57=>{
-                        inventory_count+=1;if inventory_count>64{if inventory_count==65{inventory_response(Err(crate::player_inventory::InventoryServiceError::RateLimited),inventory,&mut writer).await?;}continue;}
-                        let policy=zerqon_inventory::InventoryPolicy {creative:true,can_interact:teleport_confirmed,allow_drops:false};
-                        let body_offset=packet.as_slice().len()-view.len();
-                        inventory_response(inventory.apply_inbound_packet(id,packet,body_offset,policy).await,inventory,&mut writer).await?;
-                    },
-                    66=>{
-                        let request=zerqon_inventory::decode_use_on(view)?;
-                        let sequence=request.sequence;
-                        inventory_count+=1;
-                        let result=if inventory_count>64 {Err("Block interactions are rate limited".into())}
-                            else if !teleport_confirmed {Err("Wait for teleport confirmation".into())}
-                            else if !loaded.contains(&(request.block.x.div_euclid(16),request.block.z.div_euclid(16))) {Err("Block is outside the loaded terrain".into())}
-                            else {state.edit_block(profile.uuid,registration.id(),inventory,BlockInteraction::Place(request)).await};
-                        block_response(&state,profile.uuid,registration.id(),sequence,result)?;
-                    },
-                    1=>{
-                        let target=get_varint(&mut view)?;
-                        if target<=0||!view.is_empty(){return Err("invalid attack packet".into());}
-                        if teleport_confirmed&&let Some(mobs)=&state.mobs{mobs.attack(profile.uuid,registration.id(),target).await?;}
-                    },
-                    0=>{
-                        let acknowledgement=zerqon_protocol::decode_teleport_ack(view)?;
-                        if acknowledgement.id>teleport_id{return Err("invalid teleport acknowledgement".into());}
-                        if acknowledgement.id==teleport_id{teleport_confirmed=true;}
-                    },
-                    28=>{
-                        let received=zerqon_protocol::decode_keepalive(view)?;
-                        if !outstanding.is_some_and(|(expected,_)|expected==received){return Err("invalid keepalive response".into());}
-                        if let Some((_,sent))=outstanding{registration.latency(sent.elapsed().as_millis().min(i32::MAX as u128) as i32)?;}
-                        outstanding=None;
-                    },
-                    7|8=>{let command=zerqon_protocol::decode_command(view,id==8)?;if command.trim()=="tpsbar"{show_bar = !show_bar;if show_bar{let (title,progress)=tpsbar_metrics(&state);writer.send(&packets::bossbar_add(bar,&title,progress)).await?;}else{writer.send(&packets::bossbar_remove(bar)).await?;}}else{match state.command(CommandSource::Player{uuid:profile.uuid,session_id:registration.id(),name:&profile.name},command).await{Ok(replies)=>for reply in replies{writer.send(&packets::system_chat(&reply)).await?;},Err(error)=>writer.send(&packets::system_chat(&format!("Command failed: {error}"))).await?,}}},
-                    30|31=>{
-                        let x=f64::from_be_bytes(take(&mut view,8)?.try_into()?);
-                        let y=f64::from_be_bytes(take(&mut view,8)?.try_into()?);
-                        let z=f64::from_be_bytes(take(&mut view,8)?.try_into()?);
-                        let next_rotation=if id==31{(f32::from_be_bytes(take(&mut view,4)?.try_into()?),f32::from_be_bytes(take(&mut view,4)?.try_into()?))}else{rotation};
-                        let flags=take(&mut view,1)?[0];
-                        let next=Position{xyz:[x,y,z],yaw:next_rotation.0,pitch:next_rotation.1,on_ground:flags&1!=0};
-                        if !view.is_empty()||!world_view::valid_position(next){return Err("invalid movement packet".into());}
-                        if teleport_confirmed{
-                            if world.existing_only()&&!world_view::can_move([position.0,position.1,position.2],next.xyz,&loaded,&desired){
-                                teleport_id=teleport_id.checked_add(1).ok_or("teleport identifier exhausted")?;
-                                teleport_confirmed=false;
-                                writer.send(&packets::position_rotated(teleport_id,[position.0,position.1,position.2],[rotation.0,rotation.1])).await?;
-                                if !boundary_notice{writer.send(&packets::system_chat("This area is outside the available imported terrain.")).await?;boundary_notice=true;}
-                            }else{let _gameplay=state.gameplay.read().await;registration.move_to(next)?;position=(x,y,z);rotation=next_rotation;}
-                        }
-                    },
-                    32|33=>{
-                        let next_rotation=if id==32{(f32::from_be_bytes(take(&mut view,4)?.try_into()?),f32::from_be_bytes(take(&mut view,4)?.try_into()?))}else{rotation};
-                        let flags=take(&mut view,1)?[0];
-                        let next=Position{xyz:[position.0,position.1,position.2],yaw:next_rotation.0,pitch:next_rotation.1,on_ground:flags&1!=0};
-                        if !view.is_empty()||!world_view::valid_position(next){return Err("invalid movement packet".into());}
-                        if teleport_confirmed{let _gameplay=state.gameplay.read().await;registration.move_to(next)?;rotation=next_rotation;}
-                    },
-                    41=>{
-                        use zerqon_inventory::PlayerAction;
-                        let request=zerqon_inventory::decode_player_action(view)?;
-                        let action=request.action;
-                        if matches!(action,PlayerAction::DropAllItems|PlayerAction::DropItem|PlayerAction::SwapItemWithOffhand){
-                            inventory_count+=1;
-                            if inventory_count<=64{
-                                let result=if action==PlayerAction::SwapItemWithOffhand{inventory.swap_offhand(zerqon_inventory::InventoryPolicy{creative:true,can_interact:teleport_confirmed,allow_drops:false}).await}else{Err(zerqon_inventory::InventoryError::DroppingUnavailable.into())};
-                                inventory_response(result,inventory,&mut writer).await?;
-                            }else if inventory_count==65{inventory_response(Err(crate::player_inventory::InventoryServiceError::RateLimited),inventory,&mut writer).await?;}
-                        }else if matches!(action,PlayerAction::StartDestroyBlock|PlayerAction::ChangeDestroyDirection|PlayerAction::AbortDestroyBlock|PlayerAction::StopDestroyBlock){
-                            let sequence=request.sequence;
-                            inventory_count+=1;
-                            let result=if inventory_count>64 {Err("Block interactions are rate limited".into())}
-                                else if !teleport_confirmed {Err("Wait for teleport confirmation".into())}
-                                else if !loaded.contains(&(request.block.x.div_euclid(16),request.block.z.div_euclid(16))) {Err("Block is outside the loaded terrain".into())}
-                                else if action==PlayerAction::StartDestroyBlock {state.edit_block(profile.uuid,registration.id(),inventory,BlockInteraction::Break(request)).await}
-                                else {Ok(())};
-                            block_response(&state,profile.uuid,registration.id(),sequence,result)?;
-                        }
-                    },
-                    _=>{},
+            packet=incoming.recv()=>(packet.ok_or("connection reader stopped")?, false),
+            _=std::future::ready(()), if !ordered_work_pending && !deferred.is_empty() => (deferred.pop_front().expect("deferred branch is enabled"), true),
+        };
+        let ReceivedPacket {
+            sequence,
+            packet,
+            counted,
+        } = received;
+        let packet = packet?;
+        if !counted {
+            if play.rate_start.elapsed() >= Duration::from_secs(1) {
+                play.rate_start = Instant::now();
+                play.packet_count = 0;
+                play.inventory_count = 0;
+            }
+            play.packet_count += 1;
+            if play.packet_count > 500 {
+                return Err("packet rate limit exceeded".into());
+            }
+        }
+        let mut view = packet.as_slice();
+        let id = get_varint(&mut view)?;
+        let is_command = matches!(id, 7 | 8);
+        if from_deferred && is_command {
+            deferred_commands -= 1;
+        }
+        if !from_deferred
+            && (ordered_work_pending || !deferred.is_empty())
+            && matches!(id, 1 | 7 | 8 | 18 | 30 | 31 | 32 | 33 | 41 | 54 | 57 | 66)
+        {
+            if is_command {
+                zerqon_protocol::decode_command(view, id == 8)?;
+            }
+            if deferred.len() >= 64 || is_command && deferred_commands >= 4 {
+                return Err("deferred gameplay queue exceeded".into());
+            }
+            deferred_commands += usize::from(is_command);
+            deferred.push_back(ReceivedPacket {
+                sequence,
+                packet: Ok(packet),
+                counted: true,
+            });
+            continue;
+        }
+        let can_interact = play.teleport_confirmed && sequence > play.last_ack_sequence;
+        match id {
+            18 | 54 | 57 => {
+                play.inventory_count += 1;
+                if play.inventory_count > 64 {
+                    if play.inventory_count == 65 {
+                        inventory_response(
+                            Err(crate::player_inventory::InventoryServiceError::RateLimited),
+                            inventory,
+                            &mut writer,
+                        )
+                        .await?;
+                    }
+                    continue;
+                }
+                let policy = zerqon_inventory::InventoryPolicy {
+                    creative: true,
+                    can_interact,
+                    allow_drops: false,
+                };
+                let body_offset = packet.as_slice().len() - view.len();
+                inventory_response(
+                    inventory
+                        .apply_inbound_packet(id, packet, body_offset, policy)
+                        .await,
+                    inventory,
+                    &mut writer,
+                )
+                .await?;
+            }
+            66 => {
+                let request = zerqon_inventory::decode_use_on(view)?;
+                let sequence = request.sequence;
+                play.inventory_count += 1;
+                let result = if play.inventory_count > 64 {
+                    Err("Block interactions are rate limited".into())
+                } else if !can_interact {
+                    Err("Wait for teleport confirmation".into())
+                } else if !play.loaded.contains(&(
+                    request.block.x.div_euclid(16),
+                    request.block.z.div_euclid(16),
+                )) {
+                    Err("Block is outside the loaded terrain".into())
+                } else {
+                    state
+                        .edit_block(
+                            profile.uuid,
+                            registration.id(),
+                            inventory,
+                            BlockInteraction::Place(request),
+                        )
+                        .await
+                };
+                block_response(&state, profile.uuid, registration.id(), sequence, result)?;
+            }
+            1 => {
+                let target = get_varint(&mut view)?;
+                if target <= 0 || !view.is_empty() {
+                    return Err("invalid attack packet".into());
+                }
+                if can_interact && let Some(mobs) = &state.mobs {
+                    mobs.attack(profile.uuid, registration.id(), target).await?;
                 }
             }
+            0 => {
+                let acknowledgement = zerqon_protocol::decode_teleport_ack(view)?;
+                if acknowledgement.id > play.teleport_id {
+                    return Err("invalid teleport acknowledgement".into());
+                }
+                if acknowledgement.id == play.teleport_id && !play.teleport_confirmed {
+                    play.teleport_confirmed = true;
+                    play.last_ack_sequence = sequence;
+                }
+            }
+            28 => {
+                let received = zerqon_protocol::decode_keepalive(view)?;
+                if !play
+                    .outstanding
+                    .is_some_and(|(expected, _)| expected == received)
+                {
+                    return Err("invalid keepalive response".into());
+                }
+                if let Some((_, sent)) = play.outstanding {
+                    registration.latency(sent.elapsed().as_millis().min(i32::MAX as u128) as i32)?;
+                }
+                play.outstanding = None;
+            }
+            7 | 8 => {
+                let input = zerqon_protocol::decode_command(view, id == 8)?;
+                if input.trim() == "tpsbar" {
+                    play.show_bar = !play.show_bar;
+                    if play.show_bar {
+                        let (title, progress) = tpsbar_metrics(&state);
+                        writer
+                            .send(&packets::bossbar_add(play.bar, &title, progress))
+                            .await?;
+                    } else {
+                        writer.send(&packets::bossbar_remove(play.bar)).await?;
+                    }
+                } else {
+                    command = Some(session.start_command(packet)?);
+                }
+            }
+            30 | 31 => {
+                let x = f64::from_be_bytes(take(&mut view, 8)?.try_into()?);
+                let y = f64::from_be_bytes(take(&mut view, 8)?.try_into()?);
+                let z = f64::from_be_bytes(take(&mut view, 8)?.try_into()?);
+                let next_rotation = if id == 31 {
+                    (
+                        f32::from_be_bytes(take(&mut view, 4)?.try_into()?),
+                        f32::from_be_bytes(take(&mut view, 4)?.try_into()?),
+                    )
+                } else {
+                    play.rotation
+                };
+                let flags = take(&mut view, 1)?[0];
+                let next = Position {
+                    xyz: [x, y, z],
+                    yaw: next_rotation.0,
+                    pitch: next_rotation.1,
+                    on_ground: flags & 1 != 0,
+                };
+                if !view.is_empty() || !world_view::valid_position(next) {
+                    return Err("invalid movement packet".into());
+                }
+                if can_interact {
+                    if world.existing_only()
+                        && !world_view::can_move(
+                            [play.position.0, play.position.1, play.position.2],
+                            next.xyz,
+                            &play.loaded,
+                            &play.desired,
+                        )
+                    {
+                        play.teleport_id = play
+                            .teleport_id
+                            .checked_add(1)
+                            .ok_or("teleport identifier exhausted")?;
+                        play.teleport_confirmed = false;
+                        writer
+                            .send(&packets::position_rotated(
+                                play.teleport_id,
+                                [play.position.0, play.position.1, play.position.2],
+                                [play.rotation.0, play.rotation.1],
+                            ))
+                            .await?;
+                        if !play.boundary_notice {
+                            writer
+                                .send(&packets::system_chat(
+                                    "This area is outside the available imported terrain.",
+                                ))
+                                .await?;
+                            play.boundary_notice = true;
+                        }
+                    } else {
+                        let _gameplay = state.gameplay.read().await;
+                        registration.move_to(next)?;
+                        play.position = (x, y, z);
+                        play.rotation = next_rotation;
+                    }
+                }
+            }
+            32 | 33 => {
+                let next_rotation = if id == 32 {
+                    (
+                        f32::from_be_bytes(take(&mut view, 4)?.try_into()?),
+                        f32::from_be_bytes(take(&mut view, 4)?.try_into()?),
+                    )
+                } else {
+                    play.rotation
+                };
+                let flags = take(&mut view, 1)?[0];
+                let next = Position {
+                    xyz: [play.position.0, play.position.1, play.position.2],
+                    yaw: next_rotation.0,
+                    pitch: next_rotation.1,
+                    on_ground: flags & 1 != 0,
+                };
+                if !view.is_empty() || !world_view::valid_position(next) {
+                    return Err("invalid movement packet".into());
+                }
+                if can_interact {
+                    let _gameplay = state.gameplay.read().await;
+                    registration.move_to(next)?;
+                    play.rotation = next_rotation;
+                }
+            }
+            41 => {
+                use zerqon_inventory::PlayerAction;
+                let request = zerqon_inventory::decode_player_action(view)?;
+                let action = request.action;
+                if matches!(
+                    action,
+                    PlayerAction::DropAllItems
+                        | PlayerAction::DropItem
+                        | PlayerAction::SwapItemWithOffhand
+                ) {
+                    play.inventory_count += 1;
+                    if play.inventory_count <= 64 {
+                        let result = if action == PlayerAction::SwapItemWithOffhand {
+                            inventory
+                                .swap_offhand(zerqon_inventory::InventoryPolicy {
+                                    creative: true,
+                                    can_interact,
+                                    allow_drops: false,
+                                })
+                                .await
+                        } else {
+                            Err(zerqon_inventory::InventoryError::DroppingUnavailable.into())
+                        };
+                        inventory_response(result, inventory, &mut writer).await?;
+                    } else if play.inventory_count == 65 {
+                        inventory_response(
+                            Err(crate::player_inventory::InventoryServiceError::RateLimited),
+                            inventory,
+                            &mut writer,
+                        )
+                        .await?;
+                    }
+                } else if matches!(
+                    action,
+                    PlayerAction::StartDestroyBlock
+                        | PlayerAction::ChangeDestroyDirection
+                        | PlayerAction::AbortDestroyBlock
+                        | PlayerAction::StopDestroyBlock
+                ) {
+                    let sequence = request.sequence;
+                    play.inventory_count += 1;
+                    let result = if play.inventory_count > 64 {
+                        Err("Block interactions are rate limited".into())
+                    } else if !can_interact {
+                        Err("Wait for teleport confirmation".into())
+                    } else if !play.loaded.contains(&(
+                        request.block.x.div_euclid(16),
+                        request.block.z.div_euclid(16),
+                    )) {
+                        Err("Block is outside the loaded terrain".into())
+                    } else if action == PlayerAction::StartDestroyBlock {
+                        state
+                            .edit_block(
+                                profile.uuid,
+                                registration.id(),
+                                inventory,
+                                BlockInteraction::Break(request),
+                            )
+                            .await
+                    } else {
+                        Ok(())
+                    };
+                    block_response(&state, profile.uuid, registration.id(), sequence, result)?;
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -798,10 +1281,15 @@ enum ChunkEvent {
     Finished,
 }
 
+struct StreamEvent {
+    epoch: u64,
+    event: ChunkEvent,
+}
+
 async fn write_chunk_event(
     event: ChunkEvent,
     writer: &mut Writer,
-    world: &World,
+    world: &Arc<World>,
     loaded: &mut HashSet<(i32, i32)>,
     count: &mut i32,
 ) -> Result<bool> {
@@ -837,7 +1325,8 @@ async fn write_chunk_event(
 }
 
 fn stream_chunks(
-    sender: mpsc::Sender<ChunkEvent>,
+    sender: mpsc::Sender<StreamEvent>,
+    epoch: u64,
     center: (i32, i32),
     desired: &HashSet<(i32, i32)>,
     loaded: &HashSet<(i32, i32)>,
@@ -847,13 +1336,33 @@ fn stream_chunks(
     added.sort_by_key(|&(x, z)| (x - center.0).abs() + (z - center.1).abs());
     AbortTask(tokio::spawn(async move {
         for (x, z) in removed {
-            sender.send(ChunkEvent::Unload(x, z)).await?;
+            sender
+                .send(StreamEvent {
+                    epoch,
+                    event: ChunkEvent::Unload(x, z),
+                })
+                .await?;
         }
-        sender.send(ChunkEvent::Begin(center.0, center.1)).await?;
+        sender
+            .send(StreamEvent {
+                epoch,
+                event: ChunkEvent::Begin(center.0, center.1),
+            })
+            .await?;
         for (x, z) in added {
-            sender.send(ChunkEvent::Chunk { x, z }).await?;
+            sender
+                .send(StreamEvent {
+                    epoch,
+                    event: ChunkEvent::Chunk { x, z },
+                })
+                .await?;
         }
-        sender.send(ChunkEvent::Finished).await?;
+        sender
+            .send(StreamEvent {
+                epoch,
+                event: ChunkEvent::Finished,
+            })
+            .await?;
         Ok(())
     }))
 }
@@ -966,6 +1475,7 @@ mod configuration_deadline_tests {
             compression: None,
             deadline: Duration::from_secs(30),
             shutdown: shutdown.subscribe(),
+            _control_transport: None,
         };
         let start = std::time::Instant::now() - Duration::from_secs(2);
         let profile =
@@ -991,6 +1501,7 @@ mod configuration_deadline_tests {
             compression: None,
             deadline: Duration::from_secs(30),
             shutdown: shutdown.subscribe(),
+            _control_transport: None,
         };
         let profile = profile(Duration::from_millis(50));
         let pending =
@@ -1025,6 +1536,7 @@ mod configuration_deadline_tests {
             compression: None,
             deadline: Duration::from_secs(30),
             shutdown: shutdown.subscribe(),
+            _control_transport: None,
         };
         let profile = profile(Duration::from_millis(90));
         let pending = tokio::spawn(async move {
@@ -1170,6 +1682,7 @@ mod shutdown_tests {
             compression: None,
             deadline: Duration::from_secs(30),
             shutdown: receiver,
+            _control_transport: None,
         };
         let task = tokio::spawn(async move { writer.send(&[1; 1024]).await });
         tokio::task::yield_now().await;
@@ -1207,13 +1720,22 @@ mod shutdown_tests {
         let (sender, mut events) = mpsc::channel(4);
         let desired = HashSet::from([(0, 0)]);
         let mut loaded = HashSet::new();
-        let _stream = stream_chunks(sender, (0, 0), &desired, &loaded);
+        let _stream = stream_chunks(sender, 1, (0, 0), &desired, &loaded);
         assert!(matches!(
             events.recv().await.unwrap(),
-            ChunkEvent::Begin(0, 0)
+            StreamEvent {
+                epoch: 1,
+                event: ChunkEvent::Begin(0, 0)
+            }
         ));
         let queued = events.recv().await.unwrap();
-        assert!(matches!(&queued, ChunkEvent::Chunk { x: 0, z: 0, .. }));
+        assert!(matches!(
+            &queued,
+            StreamEvent {
+                epoch: 1,
+                event: ChunkEvent::Chunk { x: 0, z: 0 }
+            }
+        ));
         let old = world.packet(0, 0).await.unwrap();
         let block = state.data.as_ref().unwrap().flat.bedrock;
         world.set_block(0, 70, 0, block).await.unwrap();
@@ -1225,11 +1747,12 @@ mod shutdown_tests {
             compression: None,
             deadline: Duration::from_secs(5),
             shutdown: shutdown.subscribe(),
+            _control_transport: None,
         };
         let update = block_update(0, 70, 0, block);
         writer.send(&update).await.unwrap();
         let mut count = 0;
-        write_chunk_event(queued, &mut writer, world, &mut loaded, &mut count)
+        write_chunk_event(queued.event, &mut writer, world, &mut loaded, &mut count)
             .await
             .unwrap();
         assert_eq!(

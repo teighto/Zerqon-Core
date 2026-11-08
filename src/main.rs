@@ -17,6 +17,7 @@ mod native_query_runtime;
 mod operator_store;
 mod packets;
 mod paper_libraries;
+mod player_control;
 mod player_inventory;
 mod player_session;
 mod player_store;

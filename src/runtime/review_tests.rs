@@ -139,7 +139,10 @@ async fn rust_actions(state: &State, plugin: &str, event: &Event) -> Vec<Action>
 }
 
 async fn state() -> (tempfile::TempDir, Arc<State>) {
-    let directory = tempfile::tempdir().unwrap();
+    state_in(tempfile::tempdir().unwrap()).await
+}
+
+async fn state_in(directory: tempfile::TempDir) -> (tempfile::TempDir, Arc<State>) {
     crate::config::initialize(directory.path()).unwrap();
     let settings = Settings {
         data_directory: Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -166,6 +169,370 @@ async fn state() -> (tempfile::TempDir, Arc<State>) {
     .await
     .unwrap();
     (directory, state)
+}
+
+#[tokio::test]
+#[ignore = "requires prepared official Minecraft 26.3 data"]
+async fn abandoned_chunk_packet_keeps_cleanup_pending_until_physical_completion() {
+    use std::{future::Future, task::Poll};
+    let (_directory, state) = state().await;
+    let world = Arc::clone(state.world.as_ref().unwrap());
+    assert!(state.lifecycle.pending().is_empty());
+    let (release, holder) = hold_chunk_snapshot(&world).await;
+    let parent = state.lifecycle.token();
+    let snapshot = ChunkSnapshotFence::default();
+    let mut packet = Box::pin(world.prepare_packet_with_fence(
+        0,
+        0,
+        &parent,
+        tokio::time::Instant::now() + Duration::from_secs(5),
+        snapshot.clone(),
+    ));
+    std::future::poll_fn(|context| {
+        assert!(packet.as_mut().poll(context).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    wait_for_chunk_snapshot(&snapshot).await;
+    let admitted_permits = world.inflight.available_permits();
+    drop(packet);
+    state.lifecycle.stop();
+    let pending = state
+        .lifecycle
+        .drain(tokio::time::Instant::now() + Duration::from_millis(20))
+        .await;
+    let retained_permits = world.inflight.available_permits();
+    release.send(()).unwrap();
+    holder.join().unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while world.inflight.available_permits() != 8 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let completed = state
+        .lifecycle
+        .drain(tokio::time::Instant::now() + Duration::from_secs(2))
+        .await;
+    assert_eq!(admitted_permits, 7);
+    assert_eq!(
+        retained_permits, 7,
+        "abandoned packet released its physical work quota"
+    );
+    assert!(
+        matches!(pending, Err(crate::lifecycle::DrainError::Deadline { .. })),
+        "cleanup completed while a chunk worker was still blocked: {pending:?}"
+    );
+    completed.unwrap();
+}
+
+async fn hold_chunk_snapshot(
+    world: &World,
+) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+    let stripes = Arc::clone(&world.stripes);
+    let (entered, locked) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let _guard = stripes[stripe(0, 0)].lock().unwrap();
+        entered.send(()).unwrap();
+        released.recv_timeout(Duration::from_secs(5)).unwrap();
+    });
+    locked.await.unwrap();
+    (release, holder)
+}
+
+async fn wait_for_chunk_snapshot(snapshot: &ChunkSnapshotFence) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !snapshot.started() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires prepared official Minecraft 26.3 data"]
+async fn chunk_preparation_deadline_keeps_physical_work_and_output_owned() {
+    use std::{future::Future, task::Poll};
+    let (_directory, state) = state().await;
+    let world = Arc::clone(state.world.as_ref().unwrap());
+    let (release, holder) = hold_chunk_snapshot(&world).await;
+    let parent = state.lifecycle.token();
+    let snapshot = ChunkSnapshotFence::default();
+    let mut packet = Box::pin(world.prepare_packet_with_fence(
+        0,
+        0,
+        &parent,
+        tokio::time::Instant::now() + Duration::from_secs(2),
+        snapshot.clone(),
+    ));
+    std::future::poll_fn(|context| {
+        assert!(packet.as_mut().poll(context).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    wait_for_chunk_snapshot(&snapshot).await;
+    let result = packet.await;
+    let work_permits = world.inflight.available_permits();
+    let output_bytes = world.packet_output.available_permits();
+    state.lifecycle.stop();
+    let pending = state
+        .lifecycle
+        .drain(tokio::time::Instant::now() + Duration::from_millis(20))
+        .await;
+    release.send(()).unwrap();
+    holder.join().unwrap();
+    let completed = state
+        .lifecycle
+        .drain(tokio::time::Instant::now() + Duration::from_secs(2))
+        .await;
+    assert!(
+        matches!(
+            result
+                .as_ref()
+                .err()
+                .and_then(|error| error.downcast_ref::<zerqon_world::WorldError>()),
+            Some(zerqon_world::WorldError::Timeout)
+        ),
+        "unexpected packet result: {result:?}"
+    );
+    assert_eq!(work_permits, 7);
+    assert_eq!(output_bytes, 28 * 1024 * 1024);
+    assert!(
+        matches!(pending, Err(crate::lifecycle::DrainError::Deadline { .. })),
+        "{pending:?}"
+    );
+    completed.unwrap();
+    assert_eq!(world.inflight.available_permits(), 8);
+    assert_eq!(world.packet_output.available_permits(), 32 * 1024 * 1024);
+}
+
+#[tokio::test]
+#[ignore = "requires prepared official Minecraft 26.3 data"]
+async fn prepared_chunk_outputs_bound_memory_without_holding_world_work_permits() {
+    let (_directory, state) = state().await;
+    let world = Arc::clone(state.world.as_ref().unwrap());
+    let parent = state.lifecycle.token();
+    let mut packets = Vec::new();
+    for x in 0..8 {
+        let packet = world
+            .prepare_packet(
+                x,
+                0,
+                &parent,
+                tokio::time::Instant::now() + Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+        assert_eq!(packet.bytes()[0], 46);
+        assert_eq!(&packet.bytes()[1..5], &x.to_be_bytes());
+        packets.push(packet);
+    }
+    assert_eq!(world.packet_output.available_permits(), 0);
+    assert_eq!(world.inflight.available_permits(), 8);
+    let ninth = world
+        .prepare_packet(
+            100,
+            0,
+            &parent,
+            tokio::time::Instant::now() + Duration::from_millis(20),
+        )
+        .await;
+    assert!(
+        matches!(
+            ninth
+                .as_ref()
+                .err()
+                .and_then(|error| error.downcast_ref::<zerqon_world::WorldError>()),
+            Some(zerqon_world::WorldError::Timeout)
+        ),
+        "{ninth:?}"
+    );
+    assert!(world.cache.lock().unwrap().get(100, 0).is_none());
+    assert_eq!(world.execute(|| Ok(42)).await.unwrap(), 42);
+    state.lifecycle.stop();
+    let pending = state
+        .lifecycle
+        .drain(tokio::time::Instant::now() + Duration::from_millis(20))
+        .await;
+    drop(packets);
+    state
+        .lifecycle
+        .drain(tokio::time::Instant::now() + Duration::from_secs(2))
+        .await
+        .unwrap();
+    assert!(
+        matches!(pending, Err(crate::lifecycle::DrainError::Deadline { .. })),
+        "{pending:?}"
+    );
+    assert_eq!(world.packet_output.available_permits(), 32 * 1024 * 1024);
+}
+
+#[tokio::test]
+#[ignore = "requires prepared official Minecraft 26.3 data"]
+async fn chunk_snapshot_fence_starts_after_admission_and_before_snapshot_lock() {
+    use std::{future::Future, task::Poll};
+    let (_directory, state) = state().await;
+    let world = Arc::clone(state.world.as_ref().unwrap());
+    let output = Arc::clone(&world.packet_output)
+        .acquire_many_owned(32 * 1024 * 1024)
+        .await
+        .unwrap();
+    let stripes = Arc::clone(&world.stripes);
+    let (entered, locked) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let _guard = stripes[stripe(0, 0)].lock().unwrap();
+        entered.send(()).unwrap();
+        released.recv_timeout(Duration::from_secs(5)).unwrap();
+    });
+    locked.await.unwrap();
+    let parent = state.lifecycle.token();
+    let fence = ChunkSnapshotFence::default();
+    let mut packet = Box::pin(world.prepare_packet_with_fence(
+        0,
+        0,
+        &parent,
+        tokio::time::Instant::now() + Duration::from_secs(2),
+        fence.clone(),
+    ));
+    std::future::poll_fn(|context| {
+        assert!(packet.as_mut().poll(context).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    tokio::task::yield_now().await;
+    let before_admission = fence.started();
+    let work_before_admission = world.inflight.available_permits();
+    drop(output);
+    let started = tokio::time::timeout(Duration::from_secs(2), async {
+        while !fence.started() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    let work_during_snapshot = world.inflight.available_permits();
+    release.send(()).unwrap();
+    holder.join().unwrap();
+    let packet = packet.await.unwrap();
+    assert_eq!(packet.bytes()[0], 46);
+    drop(packet);
+    state.lifecycle.stop();
+    state
+        .lifecycle
+        .drain(tokio::time::Instant::now() + Duration::from_secs(2))
+        .await
+        .unwrap();
+    assert!(!before_admission);
+    assert_eq!(work_before_admission, 8);
+    started.unwrap();
+    assert_eq!(work_during_snapshot, 7);
+    assert!(fence.started());
+}
+
+async fn abandon_running_chunk(
+    state: &Arc<State>,
+) -> std::result::Result<(), crate::lifecycle::DrainError> {
+    use std::{future::Future, task::Poll};
+    let world = Arc::clone(state.world.as_ref().unwrap());
+    let (release, holder) = hold_chunk_snapshot(&world).await;
+    let parent = state.lifecycle.token();
+    let snapshot = ChunkSnapshotFence::default();
+    let mut packet = Box::pin(world.prepare_packet_with_fence(
+        0,
+        0,
+        &parent,
+        tokio::time::Instant::now() + Duration::from_secs(5),
+        snapshot.clone(),
+    ));
+    std::future::poll_fn(|context| {
+        assert!(packet.as_mut().poll(context).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    wait_for_chunk_snapshot(&snapshot).await;
+    drop(packet);
+    state.lifecycle.stop();
+    let pending = state
+        .lifecycle
+        .drain(tokio::time::Instant::now() + Duration::from_millis(20))
+        .await;
+    release.send(()).unwrap();
+    holder.join().unwrap();
+    let completed = state
+        .lifecycle
+        .drain(tokio::time::Instant::now() + Duration::from_secs(2))
+        .await;
+    assert!(
+        matches!(pending, Err(crate::lifecycle::DrainError::Deadline { .. })),
+        "{pending:?}"
+    );
+    assert_eq!(world.inflight.available_permits(), 8);
+    assert_eq!(world.packet_output.available_permits(), 32 * 1024 * 1024);
+    completed
+}
+
+#[tokio::test]
+#[ignore = "requires prepared official Minecraft 26.3 data"]
+async fn abandoned_missing_imported_chunk_is_not_a_cleanup_failure() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("source");
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("crates/zerqon-world/tests/fixtures");
+    std::fs::create_dir_all(source.join("data/minecraft")).unwrap();
+    std::fs::create_dir_all(source.join("region")).unwrap();
+    for (fixture, destination) in [
+        ("metadata-level.dat", "level.dat"),
+        (
+            "metadata-world-gen-settings.dat",
+            "data/minecraft/world_gen_settings.dat",
+        ),
+        ("metadata-game-rules.dat", "data/minecraft/game_rules.dat"),
+        ("negative-3.mca", "region/r.-1.-2.mca"),
+    ] {
+        std::fs::copy(fixtures.join(fixture), source.join(destination)).unwrap();
+    }
+    let resolver = crate::game_data::BlockResolver::load(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join(".cache/vanilla/26.3"),
+    )
+    .unwrap();
+    zerqon_world::anvil::import_world_blocks(
+        &source,
+        &directory.path().join("world"),
+        &|name, properties| resolver.resolve(name, properties),
+    )
+    .unwrap();
+    let (_directory, state) = state_in(directory).await;
+    let world = state.world.as_ref().unwrap();
+    let error = world
+        .prepare_packet(
+            0,
+            0,
+            &state.lifecycle.token(),
+            tokio::time::Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        .expect_err("imported world unexpectedly generated a missing chunk");
+    assert!(World::missing_imported_chunk(error.as_ref()));
+    abandon_running_chunk(&state).await.unwrap();
+    world.check_health().unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires prepared official Minecraft 26.3 data"]
+async fn abandoned_corrupt_chunk_still_records_the_storage_failure() {
+    let (_directory, state) = state().await;
+    let world = state.world.as_ref().unwrap();
+    let mut chunk = Chunk::flat(0, 0, state.data.as_ref().unwrap().flat);
+    chunk.set_block(0, 64, 0, u32::MAX).unwrap();
+    world.store.save(&chunk).unwrap();
+    let result = abandon_running_chunk(&state).await;
+    assert!(
+        matches!(result, Err(crate::lifecycle::DrainError::Cleanup { ref failures, .. })
+        if failures.iter().any(|failure| failure.contains("unknown block state"))),
+        "{result:?}"
+    );
 }
 
 async fn actor(state: &Arc<State>) -> (PlayerHandle, InventoryHandle, mpsc::Receiver<PacketBatch>) {
