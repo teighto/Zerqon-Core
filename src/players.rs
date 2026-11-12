@@ -130,6 +130,11 @@ struct Player {
     equipment: Option<Bytes>,
     profile: Bytes,
     latency: i32,
+    game_mode: GameMode,
+    health: f32,
+    invulnerable_until: std::time::Instant,
+    spawn_revision: u64,
+    sneaking: bool,
 }
 #[derive(Clone)]
 struct ReplicatedPlayer {
@@ -138,6 +143,8 @@ struct ReplicatedPlayer {
     equipment: Option<Bytes>,
     profile: Bytes,
     latency: i32,
+    health: f32,
+    spawn_revision: u64,
 }
 struct TrackingPackets {
     spawn: PacketBatch,
@@ -169,6 +176,173 @@ fn player_snapshot(player: &Player) -> PlayerSnapshot {
 }
 
 impl Players {
+    pub(crate) fn is_sneaking(&self, uuid: Uuid, id: i32) -> Result<bool, PlayerError> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| PlayerError::Unavailable)?
+            .get(&uuid)
+            .filter(|p| p.id == id)
+            .is_some_and(|p| p.sneaking))
+    }
+    pub(crate) fn combat_targets(&self) -> Result<Vec<zerqon_entities::PlayerTarget>, PlayerError> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| PlayerError::Unavailable)?
+            .values()
+            .filter(|p| p.active && p.health > 0.0)
+            .map(|p| zerqon_entities::PlayerTarget {
+                id: p.id,
+                position: p.position.xyz,
+                attackable: p.game_mode == GameMode::Survival,
+            })
+            .collect())
+    }
+
+    pub(crate) fn mob_attack(
+        &self,
+        id: i32,
+        origin: [f64; 3],
+        damage: f32,
+    ) -> Result<(), PlayerError> {
+        if !damage.is_finite() || damage <= 0.0 || origin.iter().any(|v| !v.is_finite()) {
+            return Err(PlayerError::Invalid);
+        }
+        let mut inner = self.inner.lock().map_err(|_| PlayerError::Unavailable)?;
+        let Some(player) = inner.values_mut().find(|p| {
+            p.id == id
+                && p.active
+                && p.health > 0.0
+                && p.game_mode == GameMode::Survival
+                && std::time::Instant::now() >= p.invulnerable_until
+        }) else {
+            return Ok(());
+        };
+        let dx = player.position.xyz[0] - origin[0];
+        let dz = player.position.xyz[2] - origin[2];
+        let length = dx.hypot(dz).max(0.01);
+        let impulse = [dx / length * 0.4, 0.35, dz / length * 0.4];
+        player.health = (player.health - damage).max(0.0);
+        player.invulnerable_until =
+            std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let mut packets: Vec<Bytes> = vec![
+            entity_packets::health(player.health, 20, 5.0).into(),
+            entity_packets::hurt_animation(id, 0.0)
+                .map_err(|_| PlayerError::Invalid)?
+                .into(),
+            entity_packets::entity_motion(id, impulse)
+                .map_err(|_| PlayerError::Invalid)?
+                .into(),
+        ];
+        if player.health == 0.0 {
+            packets.push(crate::blast_packets::combat_kill(id, "Slain by a zombie").into());
+        }
+        enqueue(player, packets);
+        let (position, health) = (player.position, player.health);
+        for observer in inner
+            .values()
+            .filter(|p| p.active && p.id != id && self.visible(p.position, position))
+        {
+            enqueue(
+                observer,
+                vec![
+                    Bytes::from(entity_packets::mob_health(id, health)),
+                    entity_packets::hurt_animation(id, 0.0)
+                        .map_err(|_| PlayerError::Invalid)?
+                        .into(),
+                    entity_packets::entity_motion(id, impulse)
+                        .map_err(|_| PlayerError::Invalid)?
+                        .into(),
+                ],
+            );
+        }
+        Ok(())
+    }
+    pub(crate) fn is_alive(&self, uuid: Uuid, id: i32) -> Result<bool, PlayerError> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| PlayerError::Unavailable)?
+            .get(&uuid)
+            .is_some_and(|player| player.id == id && player.active && player.health > 0.0))
+    }
+
+    pub(crate) fn blast_targets(&self, center: [f64; 3]) -> Result<Vec<(Uuid, i32)>, PlayerError> {
+        let inner = self.inner.lock().map_err(|_| PlayerError::Unavailable)?;
+        Ok(inner
+            .values()
+            .filter(|player| {
+                player.active
+                    && player.health > 0.0
+                    && player.game_mode == GameMode::Survival
+                    && crate::blast_damage::within_blast(center, player.position.xyz)
+            })
+            .map(|player| (player.identity.uuid, player.id))
+            .collect())
+    }
+
+    pub(crate) fn apply_blast(
+        &self,
+        center: [f64; 3],
+        view: &crate::blast_damage::BlastView,
+        targets: &[(Uuid, i32)],
+    ) -> Result<(), PlayerError> {
+        let mut inner = self.inner.lock().map_err(|_| PlayerError::Unavailable)?;
+        let mut notifications = Vec::new();
+        for &(uuid, id) in targets {
+            let Some(player) = inner.get_mut(&uuid).filter(|player| {
+                player.id == id
+                    && player.active
+                    && player.health > 0.0
+                    && player.game_mode == GameMode::Survival
+                    && std::time::Instant::now() >= player.invulnerable_until
+            }) else {
+                continue;
+            };
+            let Some(effect) = view.effect(
+                center,
+                player.position.xyz,
+                [f64::from(0.6_f32), f64::from(1.8_f32)],
+                f64::from(1.62_f32),
+            ) else {
+                continue;
+            };
+            player.health = (player.health - effect.damage).max(0.0);
+            let mut packets: Vec<Bytes> = vec![
+                entity_packets::health(player.health, 20, 5.0).into(),
+                entity_packets::hurt_animation(player.id, 0.0)
+                    .map_err(|_| PlayerError::Invalid)?
+                    .into(),
+                entity_packets::entity_motion(player.id, effect.impulse)
+                    .map_err(|_| PlayerError::Invalid)?
+                    .into(),
+            ];
+            if player.health == 0.0 {
+                packets.push(crate::blast_packets::death(player.id).into());
+            }
+            enqueue(player, packets);
+            notifications.push((player.id, player.position, player.health, effect.impulse));
+        }
+        for (id, position, health, impulse) in notifications {
+            let packets: Vec<Bytes> = vec![
+                entity_packets::mob_health(id, health).into(),
+                entity_packets::hurt_animation(id, 0.0)
+                    .map_err(|_| PlayerError::Invalid)?
+                    .into(),
+                entity_packets::entity_motion(id, impulse)
+                    .map_err(|_| PlayerError::Invalid)?
+                    .into(),
+            ];
+            for observer in inner.values().filter(|observer| {
+                observer.active && observer.id != id && self.visible(observer.position, position)
+            }) {
+                enqueue(observer, packets.clone());
+            }
+        }
+        Ok(())
+    }
+
     pub fn set_equipment(&self, uuid: Uuid, id: i32, packet: Bytes) -> Result<(), PlayerError> {
         let mut inner = self.inner.lock().map_err(|_| PlayerError::Unavailable)?;
         let Some(player) = inner.get_mut(&uuid).filter(|player| player.id == id) else {
@@ -210,6 +384,8 @@ impl Players {
                         equipment: player.equipment.clone(),
                         profile: player.profile.clone(),
                         latency: player.latency,
+                        health: player.health,
+                        spawn_revision: player.spawn_revision,
                     },
                 )
             })
@@ -257,7 +433,10 @@ impl Players {
                     let was_visible =
                         uuid != observer_uuid && self.visible(old.position, old_observer.position);
                     if was_visible
-                        && next.is_none_or(|next| !self.visible(next.position, observer.position))
+                        && next.is_none_or(|next| {
+                            !self.visible(next.position, observer.position)
+                                || next.spawn_revision != old.spawn_revision
+                        })
                     {
                         removed_entities.push(old.id);
                     }
@@ -286,9 +465,10 @@ impl Players {
                 if uuid == observer_uuid || !self.visible(player.position, observer.position) {
                     continue;
                 }
-                let was_visible = old
-                    .zip(old_observer)
-                    .is_some_and(|(old, observer)| self.visible(old.position, observer.position));
+                let was_visible = old.zip(old_observer).is_some_and(|(old, observer)| {
+                    old.spawn_revision == player.spawn_revision
+                        && self.visible(old.position, observer.position)
+                });
                 if !was_visible {
                     batch.extend(encoded.spawn.iter().cloned());
                 } else if let Some(old) = old {
@@ -425,6 +605,11 @@ impl Players {
                 equipment: None,
                 profile,
                 latency: 0,
+                game_mode: GameMode::Creative,
+                health: 20.0,
+                invulnerable_until: std::time::Instant::now(),
+                spawn_revision: 0,
+                sneaking: false,
             },
         );
         Ok(PlayerHandle {
@@ -469,6 +654,55 @@ impl Players {
     }
 }
 impl PlayerHandle {
+    pub fn set_sneaking(&self, sneaking: bool) -> Result<(), PlayerError> {
+        let mut inner = self
+            .players
+            .inner
+            .lock()
+            .map_err(|_| PlayerError::Unavailable)?;
+        let player = inner
+            .get_mut(&self.uuid)
+            .filter(|p| p.id == self.id)
+            .ok_or(PlayerError::Unavailable)?;
+        player.sneaking = sneaking;
+        Ok(())
+    }
+    pub fn health(&self) -> Result<f32, PlayerError> {
+        self.players
+            .inner
+            .lock()
+            .map_err(|_| PlayerError::Unavailable)?
+            .get(&self.uuid)
+            .filter(|player| player.id == self.id)
+            .map(|player| player.health)
+            .ok_or(PlayerError::Unavailable)
+    }
+    pub fn respawn(&self, position: Position) -> Result<bool, PlayerError> {
+        if !crate::world_view::valid_position(position) {
+            return Err(PlayerError::Invalid);
+        }
+        let mut inner = self
+            .players
+            .inner
+            .lock()
+            .map_err(|_| PlayerError::Unavailable)?;
+        let player = inner
+            .get_mut(&self.uuid)
+            .filter(|player| player.id == self.id)
+            .ok_or(PlayerError::Unavailable)?;
+        if player.health > 0.0 {
+            return Ok(false);
+        }
+        player.spawn_revision = player
+            .spawn_revision
+            .checked_add(1)
+            .ok_or(PlayerError::Capacity)?;
+        player.health = 20.0;
+        player.position = position;
+        player.invulnerable_until = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        self.players.tracking_dirty.store(true, Ordering::Relaxed);
+        Ok(true)
+    }
     pub fn id(&self) -> i32 {
         self.id
     }
@@ -486,6 +720,7 @@ impl PlayerHandle {
             return Err(PlayerError::Invalid);
         }
         player.profile = profile_packet(&player.identity, game_mode);
+        player.game_mode = game_mode;
         Ok(())
     }
     pub fn activate(&self) -> Result<(), PlayerError> {
@@ -602,6 +837,9 @@ fn spawn_packets(uuid: Uuid, player: &ReplicatedPlayer, kind: i32) -> PacketBatc
         .into(),
         entity_packets::player_metadata(player.id, 127).into(),
     ];
+    if player.health != 20.0 || player.spawn_revision > 0 {
+        packets.push(entity_packets::mob_health(player.id, player.health).into());
+    }
     if let Some(equipment) = &player.equipment {
         packets.push(equipment.clone());
     }

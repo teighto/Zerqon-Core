@@ -519,6 +519,7 @@ fn offline_uuid(name: &str) -> Uuid {
 }
 
 struct PlayState {
+    mining: Option<MiningAttempt>,
     radius: i32,
     loaded: HashSet<(i32, i32)>,
     center: (i32, i32),
@@ -542,6 +543,14 @@ struct PlayState {
     packet_count: u32,
     inventory_count: u32,
     flying: bool,
+}
+
+struct MiningAttempt {
+    block: zerqon_inventory::BlockPosition,
+    expected: u32,
+    held: zerqon_inventory::Slot,
+    started: Instant,
+    duration: Duration,
 }
 
 struct ReceivedPacket {
@@ -707,9 +716,16 @@ async fn play(
             state.properties.online_mode,
         ))
         .await?;
+    let mut flight_speed = state
+        .flight_speed
+        .register(profile.uuid, registration.id())?;
     writer.send(&packets::abilities(game_mode, false)).await?;
     writer
-        .send(&crate::entity_packets::health(20.0, 20, 5.0))
+        .send(&crate::entity_packets::health(
+            registration.health()?,
+            20,
+            5.0,
+        ))
         .await?;
     for packet in inventory.full_sync().await? {
         writer.send(&packet).await?;
@@ -731,6 +747,16 @@ async fn play(
         "list".into(),
         "setblock".into(),
         "give".into(),
+        "speed".into(),
+        "/pos1".into(),
+        "/pos2".into(),
+        "/size".into(),
+        "/set".into(),
+        "/replace".into(),
+        "/desel".into(),
+        "/ignite".into(),
+        "/tntstatus".into(),
+        "/tntcancel".into(),
         "summon".into(),
         "spark".into(),
         "stop".into(),
@@ -759,8 +785,16 @@ async fn play(
             ))
             .await?;
     } else {
-        writer.send(&packets::default_spawn(0, 64, 0)).await?;
-        writer.send(&packets::position(1, 0.5, 64.0, 0.5)).await?;
+        let [x, y, z] = spawn.position;
+        writer.send(&packets::default_spawn(x, y, z)).await?;
+        writer
+            .send(&packets::position(
+                1,
+                initial.xyz[0],
+                initial.xyz[1],
+                initial.xyz[2],
+            ))
+            .await?;
     }
     writer.send(&packets::game_event(13, 0.0)).await?;
     let radius = i32::from(state.properties.view_distance);
@@ -798,6 +832,7 @@ async fn play(
     let mut pending_chunk: Option<PendingChunk> = None;
     let mut held_outbound: Option<PacketBatch> = None;
     let mut play = PlayState {
+        mining: None,
         radius,
         loaded,
         center,
@@ -846,6 +881,12 @@ async fn play(
         let (received, from_deferred) = tokio::select! {
             _=shutdown.changed()=>{writer.send(&disconnect(32,"Server stopping")).await?;return Ok(());},
             _=disconnected.changed()=>return Err("outbound queue exceeded".into()),
+            speed=flight_speed.changed()=>{
+                let speed = speed?;
+                let (mode, _) = inventory.modes()?;
+                writer.send(&packets::abilities_with_flight_speed(mode, play.flying, speed)).await?;
+                continue;
+            },
             outcome=async { pending_notice.as_mut().expect("notice branch is enabled").completion.as_mut().await }, if notice_pending => {
                 let notice = pending_notice.take().expect("notice branch is enabled");
                 match outcome {
@@ -953,7 +994,7 @@ async fn play(
             && (ordered_work_pending || !deferred.is_empty())
             && matches!(
                 id,
-                1 | 7 | 8 | 18 | 19 | 30 | 31 | 32 | 33 | 40 | 41 | 54 | 57 | 66
+                1 | 7 | 8 | 12 | 18 | 19 | 26 | 30 | 31 | 32 | 33 | 40 | 41 | 43 | 54 | 57 | 66
             )
         {
             if is_command {
@@ -970,15 +1011,156 @@ async fn play(
             });
             continue;
         }
-        let can_interact = play.teleport_confirmed && sequence > play.last_ack_sequence;
+        let can_interact = play.teleport_confirmed
+            && sequence > play.last_ack_sequence
+            && registration.health()? > 0.0;
         match id {
+            43 => {
+                let flags = take(&mut view, 1)?[0];
+                if flags & 128 != 0 || !view.is_empty() {
+                    return Err("invalid player input".into());
+                }
+                registration.set_sneaking(flags & 32 != 0)?;
+            }
+            26 => {
+                let target = get_varint(&mut view)?;
+                let hand = match get_varint(&mut view)? {
+                    0 => zerqon_inventory::Hand::Main,
+                    1 => zerqon_inventory::Hand::Off,
+                    _ => return Err("invalid interaction hand".into()),
+                };
+                let location = zerqon_protocol::get_lp_vec3(&mut view)?;
+                if target <= 0
+                    || location.iter().any(|v| !v.is_finite() || v.abs() > 32.0)
+                    || !matches!(take(&mut view, 1)?[0], 0 | 1)
+                    || !view.is_empty()
+                {
+                    return Err("invalid entity interaction".into());
+                }
+                if can_interact
+                    && let Some(mobs) = &state.mobs
+                    && let Err(error) = mobs
+                        .interact(profile.uuid, registration.id(), target, hand, inventory)
+                        .await
+                {
+                    writer
+                        .send(&packets::system_chat(&format!(
+                            "Interaction failed: {error}"
+                        )))
+                        .await?;
+                }
+            }
+            12 => {
+                let action = get_varint(&mut view)?;
+                if !(0..=2).contains(&action) || !view.is_empty() {
+                    return Err("invalid client command".into());
+                }
+                if action != 0 || registration.health()? > 0.0 {
+                    continue;
+                }
+                if let Some(batch) = held_outbound.take() {
+                    send_outbound_batch(&mut writer, inventory, batch).await?;
+                }
+                while let Ok(batch) = outbound.try_recv() {
+                    send_outbound_batch(&mut writer, inventory, batch).await?;
+                }
+                let spawn = world.spawn();
+                let position = Position {
+                    xyz: [
+                        f64::from(spawn.position[0]) + 0.5,
+                        f64::from(spawn.position[1]),
+                        f64::from(spawn.position[2]) + 0.5,
+                    ],
+                    yaw: spawn.yaw,
+                    pitch: spawn.pitch,
+                    on_ground: true,
+                };
+                {
+                    let _gameplay = state.gameplay.write().await;
+                    if !registration.respawn(position)? {
+                        continue;
+                    }
+                }
+                let (mode, previous) = inventory.modes()?;
+                writer
+                    .send(&crate::blast_packets::respawn(
+                        data.overworld_dimension,
+                        mode,
+                        previous,
+                        state.properties.level_type == crate::config::LevelType::Flat,
+                    ))
+                    .await?;
+                writer
+                    .send(&crate::entity_packets::health(20.0, 20, 5.0))
+                    .await?;
+                writer
+                    .send(&packets::abilities_with_flight_speed(
+                        mode,
+                        false,
+                        flight_speed.current(),
+                    ))
+                    .await?;
+                for packet in inventory.full_sync().await? {
+                    writer.send(&packet).await?;
+                }
+                play.stream.take();
+                pending_chunk.take();
+                play.loaded.clear();
+                play.position = (position.xyz[0], position.xyz[1], position.xyz[2]);
+                play.rotation = (position.yaw, position.pitch);
+                play.center = world_view::center(position.xyz[0], position.xyz[2]);
+                play.desired = world_view::desired(play.center, play.radius);
+                play.stream_epoch = play
+                    .stream_epoch
+                    .checked_add(1)
+                    .ok_or("chunk stream epoch exhausted")?;
+                play.chunk_count = 0;
+                play.streaming = true;
+                play.flying = false;
+                play.mining = None;
+                play.boundary_notice = false;
+                play.teleport_id = play
+                    .teleport_id
+                    .checked_add(1)
+                    .ok_or("teleport identifier exhausted")?;
+                play.teleport_confirmed = false;
+                play.last_ack_sequence = sequence;
+                writer
+                    .send(&packets::world_spawn(
+                        &spawn.dimension,
+                        spawn.position,
+                        [spawn.yaw, spawn.pitch],
+                    ))
+                    .await?;
+                writer
+                    .send(&packets::position_rotated(
+                        play.teleport_id,
+                        position.xyz,
+                        [position.yaw, position.pitch],
+                    ))
+                    .await?;
+                writer.send(&packets::game_event(13, 0.0)).await?;
+                play.stream = Some(stream_chunks(
+                    chunk_sender.clone(),
+                    play.stream_epoch,
+                    play.center,
+                    &play.desired,
+                    &play.loaded,
+                ));
+            }
             40 => {
                 let requested = zerqon_protocol::decode_player_abilities(view)?;
                 let (mode, _) = inventory.modes()?;
                 if can_interact {
                     play.flying = requested && mode == crate::game_mode::GameMode::Creative;
                 }
-                writer.send(&packets::abilities(mode, play.flying)).await?;
+                writer
+                    .send(&packets::abilities_with_flight_speed(
+                        mode,
+                        play.flying,
+                        flight_speed.current(),
+                    ))
+                    .await?;
             }
             18 | 19 | 54 | 57 => {
                 play.inventory_count += 1;
@@ -999,6 +1181,23 @@ async fn play(
                     allow_drops: false,
                 };
                 let body_offset = packet.as_slice().len() - view.len();
+                if id != 54 {
+                    if view.len() > 65536 {
+                        return Err("Inventory packet exceeds limit".into());
+                    }
+                    let result = state
+                        .inventory_packet(
+                            profile.uuid,
+                            registration.id(),
+                            inventory,
+                            id,
+                            view.to_vec(),
+                            can_interact,
+                        )
+                        .await;
+                    item_response(result, &state, inventory, &mut writer).await?;
+                    continue;
+                }
                 inventory_response(
                     inventory
                         .apply_inbound_packet(id, packet, body_offset, policy)
@@ -1177,6 +1376,22 @@ async fn play(
                 ) {
                     play.inventory_count += 1;
                     if play.inventory_count <= 64 {
+                        if action != PlayerAction::SwapItemWithOffhand {
+                            let result = if can_interact {
+                                state
+                                    .drop_selected(
+                                        profile.uuid,
+                                        registration.id(),
+                                        inventory,
+                                        action == PlayerAction::DropAllItems,
+                                    )
+                                    .await
+                            } else {
+                                Err("Wait for teleport confirmation before dropping items".into())
+                            };
+                            item_response(result, &state, inventory, &mut writer).await?;
+                            continue;
+                        }
                         let result = if action == PlayerAction::SwapItemWithOffhand {
                             inventory
                                 .swap_offhand(zerqon_inventory::InventoryPolicy {
@@ -1205,6 +1420,7 @@ async fn play(
                         | PlayerAction::StopDestroyBlock
                 ) {
                     let sequence = request.sequence;
+                    let target = request.block;
                     play.inventory_count += 1;
                     let result = if play.inventory_count > 64 {
                         Err("Block interactions are rate limited".into())
@@ -1215,10 +1431,17 @@ async fn play(
                         request.block.z.div_euclid(16),
                     )) {
                         Err("Block is outside the loaded terrain".into())
-                    } else if action == PlayerAction::StartDestroyBlock
-                        || (action == PlayerAction::StopDestroyBlock
-                            && inventory.modes()?.0 != crate::game_mode::GameMode::Creative)
+                    } else if (play.position.0 - f64::from(target.x) - 0.5).powi(2)
+                        + (play.position.1 + 1.62 - f64::from(target.y) - 0.5).powi(2)
+                        + (play.position.2 - f64::from(target.z) - 0.5).powi(2)
+                        > 36.0
                     {
+                        play.mining = None;
+                        Err("Block is outside interaction range".into())
+                    } else if action == PlayerAction::StartDestroyBlock
+                        && inventory.modes()?.0 == crate::game_mode::GameMode::Creative
+                    {
+                        play.mining = None;
                         state
                             .edit_block(
                                 profile.uuid,
@@ -1227,9 +1450,108 @@ async fn play(
                                 BlockInteraction::Break(request),
                             )
                             .await
+                    } else if action == PlayerAction::StartDestroyBlock {
+                        play.mining = None;
+                        let position = request.block;
+                        let chunk = world
+                            .chunk(position.x.div_euclid(16), position.z.div_euclid(16))
+                            .await?;
+                        let expected = chunk
+                            .get_block(
+                                position.x.rem_euclid(16) as u8,
+                                position.y,
+                                position.z.rem_euclid(16) as u8,
+                            )
+                            .ok_or("Invalid mining coordinates")?;
+                        let held = inventory.held_stack(zerqon_inventory::Hand::Main)?;
+                        let rules = state.blocks.as_ref().ok_or("Block catalog unavailable")?;
+                        match inventory.mining_profile(
+                            rules.state(zerqon_blocks::StateId(expected))?.key(),
+                            &held,
+                        ) {
+                            Ok(mining) => {
+                                if mining.ticks == 0 {
+                                    state
+                                        .edit_block(
+                                            profile.uuid,
+                                            registration.id(),
+                                            inventory,
+                                            BlockInteraction::Mined {
+                                                request,
+                                                expected,
+                                                held,
+                                            },
+                                        )
+                                        .await
+                                } else {
+                                    let airborne =
+                                        if state.players.query_snapshot(profile.uuid)?.is_some_and(
+                                            |p| p.id == registration.id() && p.position.on_ground,
+                                        ) {
+                                            1
+                                        } else {
+                                            5
+                                        };
+                                    play.mining = Some(MiningAttempt {
+                                        block: position,
+                                        expected,
+                                        held,
+                                        started: Instant::now(),
+                                        duration: Duration::from_millis(
+                                            u64::from(mining.ticks) * 50 * airborne,
+                                        ),
+                                    });
+                                    Ok(())
+                                }
+                            }
+                            Err(error) => Err(error),
+                        }
+                    } else if action == PlayerAction::StopDestroyBlock
+                        && inventory.modes()?.0 != crate::game_mode::GameMode::Creative
+                    {
+                        match play.mining.take() {
+                            Some(attempt)
+                                if attempt.block == request.block
+                                    && attempt.started.elapsed() + Duration::from_millis(100)
+                                        >= attempt.duration =>
+                            {
+                                state
+                                    .edit_block(
+                                        profile.uuid,
+                                        registration.id(),
+                                        inventory,
+                                        BlockInteraction::Mined {
+                                            request,
+                                            expected: attempt.expected,
+                                            held: attempt.held,
+                                        },
+                                    )
+                                    .await
+                            }
+                            _ => Err("Block mining has not finished".into()),
+                        }
                     } else {
+                        if action == PlayerAction::AbortDestroyBlock {
+                            play.mining = None;
+                        }
                         Ok(())
                     };
+                    if result.is_err() && world.check_available().is_ok() {
+                        let chunk = world
+                            .chunk(target.x.div_euclid(16), target.z.div_euclid(16))
+                            .await?;
+                        if let Some(block) = chunk.get_block(
+                            target.x.rem_euclid(16) as u8,
+                            target.y,
+                            target.z.rem_euclid(16) as u8,
+                        ) {
+                            writer
+                                .send(&crate::runtime::block_update(
+                                    target.x, target.y, target.z, block,
+                                ))
+                                .await?;
+                        }
+                    }
                     block_response(&state, profile.uuid, registration.id(), sequence, result)?;
                 }
             }
@@ -1259,6 +1581,31 @@ fn block_response(
     put_varint(sequence as i32, &mut acknowledgement);
     batch.push(acknowledgement.into());
     state.players.dispatch_batches(vec![(uuid, id, batch)])?;
+    Ok(())
+}
+
+async fn item_response(
+    result: Result<()>,
+    state: &State,
+    inventory: &InventoryHandle,
+    writer: &mut Writer,
+) -> Result<()> {
+    if let Err(error) = result {
+        if crate::managed_tasks::is_cleanup_failure(error.as_ref()) {
+            return Err(error);
+        }
+        if let Some(world) = &state.world {
+            world.check_available()?;
+        }
+        writer
+            .send(&packets::system_chat(&format!(
+                "Inventory action rejected: {error}"
+            )))
+            .await?;
+        for packet in inventory.full_sync().await? {
+            writer.send(&packet).await?;
+        }
+    }
     Ok(())
 }
 

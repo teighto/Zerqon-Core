@@ -20,45 +20,64 @@ impl Drop for Process {
 #[tokio::test]
 #[ignore = "requires official 26.3 reports: python scripts/prepare-data.py"]
 async fn offline_login_configuration_chunks_commands_and_shutdown() {
-    play_session(None, "zerqon").await;
+    play_session(None, "zerqon", false, None).await;
 }
 
 #[tokio::test]
 #[ignore = "requires official 26.3 reports: python scripts/prepare-data.py"]
 async fn configured_server_brand_is_sent_during_login() {
-    play_session(Some("teighto • тест 🚀"), "teighto • тест 🚀").await;
+    play_session(Some("teighto • тест 🚀"), "teighto • тест 🚀", false, None).await;
 }
 
-async fn play_session(server_brand: Option<&str>, expected_brand: &str) {
+#[tokio::test]
+#[ignore = "requires official 26.3 reports: python scripts/prepare-data.py"]
+async fn normal_world_chunks_survive_server_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    play_session(None, "zerqon", true, Some(directory.path())).await;
+    play_session(None, "zerqon", true, Some(directory.path())).await;
+}
+
+async fn play_session(
+    server_brand: Option<&str>,
+    expected_brand: &str,
+    normal: bool,
+    existing: Option<&Path>,
+) {
     let data = Path::new(env!("CARGO_MANIFEST_DIR")).join(".cache/vanilla/26.3");
     assert!(data.join("prepared.json").exists(), "run prepare-data.py");
-    let directory = tempfile::tempdir().unwrap();
+    let temporary = tempfile::tempdir().unwrap();
+    let directory = existing.unwrap_or(temporary.path());
     let exe = env!("CARGO_BIN_EXE_zerqon");
     assert!(
         Command::new(exe)
-            .args(["--init", "--directory", directory.path().to_str().unwrap()])
+            .args(["--init", "--directory", directory.to_str().unwrap()])
             .status()
             .unwrap()
             .success()
     );
-    std::fs::write(directory.path().join("eula.txt"), "eula=true\n").unwrap();
+    std::fs::write(directory.join("eula.txt"), "eula=true\n").unwrap();
     let mut settings =
         toml::Table::from_iter([("update_check".into(), toml::Value::Boolean(false))]);
     if let Some(brand) = server_brand {
         settings.insert("server_brand".into(), toml::Value::String(brand.into()));
     }
     std::fs::write(
-        directory.path().join("server.settings"),
+        directory.join("server.settings"),
         toml::to_string(&settings).unwrap(),
     )
     .unwrap();
-    std::fs::write(directory.path().join("server.properties"),"server-ip=127.0.0.1\nserver-port=0\nonline-mode=false\nview-distance=1\nnetwork-compression-threshold=256\n").unwrap();
+    let generation = if normal {
+        "level-type=normal\nlevel-seed=42\n"
+    } else {
+        ""
+    };
+    std::fs::write(directory.join("server.properties"),format!("server-ip=127.0.0.1\nserver-port=0\nonline-mode=false\nview-distance=1\nnetwork-compression-threshold=256\n{generation}")).unwrap();
     let mut child = Process(
         Command::new(exe)
             .env("RUST_LOG", "info")
             .args([
                 "--directory",
-                directory.path().to_str().unwrap(),
+                directory.to_str().unwrap(),
                 "--data",
                 data.to_str().unwrap(),
                 "--no-color",
@@ -145,8 +164,11 @@ async fn play_session(server_brand: Option<&str>, expected_brand: &str) {
         .await
         .unwrap();
     let mut chunks = 0;
+    let mut chunk_positions = Vec::new();
+    let mut first_chunk = None;
     let mut joined = false;
     let mut positioned = false;
+    let mut spawn_position = [0.0f64; 3];
     loop {
         let packet = read_frame(&mut socket, 2_097_151, Some(threshold))
             .await
@@ -157,6 +179,9 @@ async fn play_session(server_brand: Option<&str>, expected_brand: &str) {
                 positioned = true;
                 let mut data = &packet[1..];
                 let teleport = get_varint(&mut data).unwrap();
+                for (axis, value) in spawn_position.iter_mut().enumerate() {
+                    *value = f64::from_be_bytes(data[axis * 8..axis * 8 + 8].try_into().unwrap());
+                }
                 let mut ack = vec![0];
                 put_varint(teleport, &mut ack);
                 ack.extend_from_slice(&data[..24]);
@@ -165,13 +190,26 @@ async fn play_session(server_brand: Option<&str>, expected_brand: &str) {
                     .await
                     .unwrap();
             }
-            46 => chunks += 1,
+            46 => {
+                first_chunk.get_or_insert_with(std::time::Instant::now);
+                chunks += 1;
+                chunk_positions.push((
+                    i32::from_be_bytes(packet[1..5].try_into().unwrap()),
+                    i32::from_be_bytes(packet[5..9].try_into().unwrap()),
+                ));
+            }
             11 => break,
             _ => {}
         }
     }
     assert!(joined && positioned);
     assert_eq!(chunks, 9);
+    if normal {
+        eprintln!(
+            "Normal world: received {chunks} chunks in {:?} after the first packet",
+            first_chunk.unwrap().elapsed()
+        );
+    }
     let mut command = vec![7];
     put_string("tps", &mut command);
     write_frame(&mut socket, &command, Some(threshold))
@@ -202,4 +240,47 @@ async fn play_session(server_brand: Option<&str>, expected_brand: &str) {
     .await
     .unwrap();
     assert!(status.success());
+    if normal {
+        assert!(directory.join("world/normal-generator.json").is_file());
+        let store = zerqon_world::WorldStore::open(directory.join("world")).unwrap();
+        let [x, y, z] = spawn_position.map(|value| value.floor() as i32);
+        let spawn_chunk = store
+            .load(x.div_euclid(16), z.div_euclid(16))
+            .unwrap()
+            .unwrap();
+        let rules = zerqon_blocks::Catalog::embedded().unwrap();
+        let block = |y| {
+            spawn_chunk
+                .get_block(x.rem_euclid(16) as u8, y, z.rem_euclid(16) as u8)
+                .unwrap()
+        };
+        assert!(
+            !rules
+                .state(zerqon_blocks::StateId(block(y - 1)))
+                .unwrap()
+                .is_air()
+                && !rules
+                    .state(zerqon_blocks::StateId(block(y - 1)))
+                    .unwrap()
+                    .has_fluid(),
+            "spawn has no dry ground"
+        );
+        assert!(
+            rules
+                .state(zerqon_blocks::StateId(block(y)))
+                .unwrap()
+                .is_air()
+                && rules
+                    .state(zerqon_blocks::StateId(block(y + 1)))
+                    .unwrap()
+                    .is_air(),
+            "spawn is inside terrain"
+        );
+        for (x, z) in chunk_positions {
+            assert!(
+                store.load(x, z).unwrap().is_some(),
+                "generated chunk was not saved"
+            );
+        }
+    }
 }

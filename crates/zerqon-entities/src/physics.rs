@@ -49,7 +49,11 @@ impl ShapeBuffer {
 }
 
 pub fn body_bounds(position: [f64; 3], kind: MobKind) -> Aabb {
-    let [width, height] = kind.dimensions();
+    scaled_bounds(position, kind, 1.0)
+}
+
+pub fn scaled_bounds(position: [f64; 3], kind: MobKind, scale: f64) -> Aabb {
+    let [width, height] = kind.dimensions().map(|value| value * scale);
     let half = width / 2.0;
     Aabb {
         min: [position[0] - half, position[1], position[2] - half],
@@ -314,6 +318,26 @@ pub(crate) fn move_with_scratch(
     world: &impl WorldQuery,
     scratch: &mut Scratch,
 ) -> Result<Movement, PhysicsError> {
+    move_scaled_with_scratch(
+        position,
+        kind,
+        1.0,
+        requested,
+        was_on_ground,
+        world,
+        scratch,
+    )
+}
+
+pub(crate) fn move_scaled_with_scratch(
+    position: [f64; 3],
+    kind: MobKind,
+    scale: f64,
+    requested: [f64; 3],
+    was_on_ground: bool,
+    world: &impl WorldQuery,
+    scratch: &mut Scratch,
+) -> Result<Movement, PhysicsError> {
     if !crate::valid_position(position)
         || requested
             .iter()
@@ -321,7 +345,7 @@ pub(crate) fn move_with_scratch(
     {
         return Err(PhysicsError::Invalid);
     }
-    let bounds = body_bounds(position, kind);
+    let bounds = scaled_bounds(position, kind, scale);
     collect(swept(bounds, requested), world, &mut scratch.ordinary)?;
     if scratch
         .ordinary

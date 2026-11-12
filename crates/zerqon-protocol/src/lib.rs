@@ -4,6 +4,8 @@ mod client;
 pub mod codec;
 pub mod inbound;
 mod teleport;
+mod velocity;
 pub use client::{decode_command, decode_keepalive, decode_player_abilities};
 pub use codec::Error as ProtocolError;
 pub use teleport::{TeleportAck, decode_teleport_ack, encode_teleport_ack};
+pub use velocity::{get_lp_vec3, put_lp_vec3};

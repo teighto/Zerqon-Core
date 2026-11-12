@@ -69,18 +69,30 @@ pub fn position_rotated(teleport: i32, xyz: [f64; 3], rotation: [f32; 2]) -> Vec
 }
 
 pub fn abilities(game_mode: GameMode, flying: bool) -> Vec<u8> {
+    abilities_with_flight_speed(
+        game_mode,
+        flying,
+        crate::flight_speed::FlightSpeed::default(),
+    )
+}
+
+pub fn abilities_with_flight_speed(
+    game_mode: GameMode,
+    flying: bool,
+    speed: crate::flight_speed::FlightSpeed,
+) -> Vec<u8> {
     let flags = if game_mode == GameMode::Creative {
         0x0d | (u8::from(flying) << 1)
     } else {
         0
     };
     let mut out = vec![65, flags];
-    out.extend_from_slice(&0.05_f32.to_be_bytes());
+    out.extend_from_slice(&speed.wire().to_be_bytes());
     out.extend_from_slice(&0.1_f32.to_be_bytes());
     out
 }
 
-fn text_component(text: &str, out: &mut Vec<u8>) {
+pub(crate) fn text_component(text: &str, out: &mut Vec<u8>) {
     let mut encoded = Vec::with_capacity(text.len().min(65535));
     for character in text.chars() {
         let mut utf16 = [0_u16; 2];
@@ -154,6 +166,51 @@ pub fn bossbar_remove(id: Uuid) -> Vec<u8> {
 }
 
 pub fn chunk(chunk: &Chunk, data: &GameData) -> Result<Vec<u8>, PacketError> {
+    chunk_with_generator(chunk, data, None)
+}
+
+pub fn chunk_with_generator(
+    chunk: &Chunk,
+    data: &GameData,
+    generator: Option<zerqon_world::NormalGenerator>,
+) -> Result<Vec<u8>, PacketError> {
+    let mut biome_data = Vec::new();
+    if let Some(generator) = generator {
+        let mut palette = Vec::new();
+        let indices: [u32; 16] = std::array::from_fn(|index| {
+            let biome = generator.biome_at(
+                i64::from(chunk.x) * 16 + (index % 4) as i64 * 4,
+                i64::from(chunk.z) * 16 + (index / 4) as i64 * 4,
+            );
+            if let Some(index) = palette.iter().position(|id| *id == biome) {
+                index as u32
+            } else {
+                palette.push(biome);
+                (palette.len() - 1) as u32
+            }
+        });
+        if palette.len() == 1 {
+            biome_data.push(0);
+            put_varint(palette[0], &mut biome_data);
+        } else {
+            // The seven native biome kinds fit the protocol's 1..=3 bit palette.
+            let bits = (usize::BITS - (palette.len() - 1).leading_zeros()) as u8;
+            biome_data.push(bits);
+            put_varint(palette.len() as i32, &mut biome_data);
+            for biome in palette {
+                put_varint(biome, &mut biome_data);
+            }
+            // PalettedContainer order is X, then Z, then Y (4*4*4 quart cells).
+            pack_values(
+                (0..64).map(|index| indices[index % 16]),
+                bits,
+                &mut biome_data,
+            );
+        }
+    } else {
+        biome_data.push(0);
+        put_varint(data.plains_biome, &mut biome_data);
+    }
     let mut section_data = Vec::with_capacity(8192);
     let mut heights = [0_u32; 256];
     for (section_index, section) in chunk.sections().iter().enumerate() {
@@ -185,8 +242,7 @@ pub fn chunk(chunk: &Chunk, data: &GameData) -> Result<Vec<u8>, PacketError> {
         section_data.extend_from_slice(&non_air.to_be_bytes());
         section_data.extend_from_slice(&fluids.to_be_bytes());
         encode_section(section, data.block_bits, &mut section_data);
-        section_data.push(0);
-        put_varint(data.plains_biome, &mut section_data);
+        section_data.extend_from_slice(&biome_data);
     }
     let mut out = vec![46];
     out.extend_from_slice(&chunk.x.to_be_bytes());

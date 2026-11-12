@@ -1270,6 +1270,27 @@ async fn summoned_mob_has_real_motion_damage_and_persisted_lifecycle() {
     first
         .until(|packet| mob_health(packet) == Some((pig.id, 6.0)))
         .await;
+    let hurt = first
+        .until(|packet| packet_entity(packet, 43) == Some(pig.id))
+        .await;
+    let mut hurt_body = &hurt[1..];
+    assert_eq!(get_varint(&mut hurt_body).unwrap(), pig.id);
+    assert_eq!(hurt_body, &0.0_f32.to_be_bytes());
+    let motion = first
+        .until(|packet| packet_entity(packet, 103) == Some(pig.id))
+        .await;
+    let mut motion_body = &motion[1..];
+    assert_eq!(get_varint(&mut motion_body).unwrap(), pig.id);
+    assert_eq!(motion_body.len(), 6);
+    let packed = u64::from(motion_body[0])
+        | (u64::from(motion_body[1]) << 8)
+        | (u64::from(u32::from_be_bytes(motion_body[2..6].try_into().unwrap())) << 16);
+    assert_eq!(packed & 7, 1, "basic knockback must use LP scale 1");
+    let velocity = [3, 18, 33].map(|shift| ((packed >> shift) & 0x7fff) as f64 / 16383.0 - 1.0);
+    assert!(
+        velocity[0].hypot(velocity[2]) > 0.25,
+        "hit had no horizontal knockback"
+    );
     second
         .until(|packet| mob_health(packet) == Some((pig.id, 6.0)))
         .await;
@@ -1332,6 +1353,27 @@ async fn summoned_mob_has_real_motion_damage_and_persisted_lifecycle() {
         "attack cooldown failed"
     );
     tokio::time::sleep(Duration::from_millis(550)).await;
+    first.reply("version", "Zerqon").await;
+    let latest = first
+        .observed
+        .iter()
+        .rev()
+        .find_map(|packet| {
+            if packet_entity(packet, 35) != Some(pig.id) {
+                return None;
+            }
+            let mut body = &packet[1..];
+            get_varint(&mut body).unwrap();
+            assert_eq!(get_varint(&mut body).unwrap(), 0);
+            Some(std::array::from_fn::<_, 3, _>(|_| {
+                f64::from_be_bytes(take(&mut body, 8).unwrap().try_into().unwrap())
+            }))
+        })
+        .unwrap_or(restored.position);
+    first
+        .move_to([latest[0] - 1.0, latest[1], latest[2]], 0.0, 0.0)
+        .await;
+    first.reply("version", "Zerqon").await;
     first.attack(pig.id).await;
     first
         .until(|packet| mob_health(packet) == Some((pig.id, 0.0)))

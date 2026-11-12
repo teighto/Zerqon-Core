@@ -251,6 +251,31 @@ impl ItemCatalog {
         self.components.len()
     }
 
+    pub fn effective_component(
+        &self,
+        stack: &ItemStack,
+        key: &str,
+    ) -> Result<Option<serde_json::Value>, ItemError> {
+        self.validate_stack(stack)?;
+        let Some(id) = self.component_id(key) else {
+            return Ok(None);
+        };
+        if stack.patch().removed.contains(&id) {
+            return Ok(None);
+        }
+        Ok(stack
+            .patch()
+            .added
+            .get(&id)
+            .map(ComponentValue::to_json)
+            .or_else(|| {
+                self.defaults
+                    .get(&stack.item())
+                    .and_then(|defaults| defaults.get(&id))
+                    .cloned()
+            }))
+    }
+
     pub fn validate_stack(&self, stack: &ItemStack) -> Result<(), ItemError> {
         let item = self.item(stack.item())?;
         if item.key == "minecraft:air" {

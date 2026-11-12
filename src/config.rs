@@ -7,7 +7,7 @@ use std::{
     path::Path,
 };
 
-pub const DEFAULT_PROPERTIES: &str = "server-ip=127.0.0.1\nserver-port=25565\nmotd=Zerqon 26.3\nmax-players=20\nonline-mode=true\ngamemode=creative\nview-distance=4\nnetwork-compression-threshold=256\nlevel-name=world\n";
+pub const DEFAULT_PROPERTIES: &str = "server-ip=127.0.0.1\nserver-port=25565\nmotd=Zerqon 26.3\nmax-players=20\nonline-mode=true\ngamemode=creative\nview-distance=4\nnetwork-compression-threshold=256\nlevel-name=world\nlevel-type=normal\nlevel-seed=0\n";
 const MAX_CONFIG_BYTES: usize = 1024 * 1024;
 const PROPERTY_KEYS: &[&str] = &[
     "server-ip",
@@ -19,6 +19,8 @@ const PROPERTY_KEYS: &[&str] = &[
     "view-distance",
     "network-compression-threshold",
     "level-name",
+    "level-type",
+    "level-seed",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,7 +46,10 @@ pub struct Settings {
     pub update_check: bool,
     pub update_check_interval_hours: u64,
     pub max_entities: usize,
+    pub max_item_entities: usize,
+    pub item_memory_mib: usize,
     pub spawn_mobs: bool,
+    pub tnt_explosions_per_tick: usize,
     pub auto_download_runtime: bool,
 }
 
@@ -74,7 +79,10 @@ impl Default for Settings {
             update_check: true,
             update_check_interval_hours: 6,
             max_entities: 128,
+            max_item_entities: 2048,
+            item_memory_mib: 32,
             spawn_mobs: true,
+            tnt_explosions_per_tick: 32,
             auto_download_runtime: true,
         }
     }
@@ -110,6 +118,14 @@ impl Settings {
             ("work_queue_capacity", self.work_queue_capacity, 1, 65536),
             ("plugin_memory_mib", self.plugin_memory_mib, 1, 256),
             ("max_entities", self.max_entities, 1, 10000),
+            ("max_item_entities", self.max_item_entities, 1, 20000),
+            ("item_memory_mib", self.item_memory_mib, 4, 256),
+            (
+                "tnt_explosions_per_tick",
+                self.tnt_explosions_per_tick,
+                1,
+                4096,
+            ),
         ] {
             if !(min..=max).contains(&value) {
                 return Err(ConfigError::Invalid(format!(
@@ -183,6 +199,23 @@ pub struct Properties {
     pub view_distance: u8,
     pub compression_threshold: Option<usize>,
     pub level_name: String,
+    pub level_type: LevelType,
+    pub level_seed: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LevelType {
+    Flat,
+    Normal,
+}
+
+impl LevelType {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Flat => "flat",
+            Self::Normal => "normal",
+        }
+    }
 }
 
 impl Properties {
@@ -203,6 +236,19 @@ impl Properties {
             Ok(value)
         };
         let level_name = get("level-name", "world").to_owned();
+        // Missing keys preserve the terrain policy of pre-generator installations.
+        let level_type = match get("level-type", "flat") {
+            "flat" => LevelType::Flat,
+            "normal" => LevelType::Normal,
+            _ => {
+                return Err(ConfigError::Invalid(
+                    "level-type must be flat or normal".into(),
+                ));
+            }
+        };
+        let level_seed = get("level-seed", "0").parse::<u64>().map_err(|_| {
+            ConfigError::Invalid("level-seed must be an unsigned 64-bit integer".into())
+        })?;
         if !valid_directory_name(&level_name) {
             return Err(ConfigError::Invalid(
                 "level-name must be a portable directory name, not a Windows device name".into(),
@@ -255,6 +301,8 @@ impl Properties {
             view_distance: number("view-distance", "4", 1, 32)? as u8,
             compression_threshold,
             level_name,
+            level_type,
+            level_seed,
         })
     }
 }
@@ -545,6 +593,19 @@ mod tests {
     }
 
     #[test]
+    fn tnt_work_limit_defaults_and_rejects_unbounded_values() {
+        let defaults: Settings = toml::from_str("").unwrap();
+        assert_eq!(defaults.tnt_explosions_per_tick, 32);
+        for (limit, valid) in [(0, false), (1, true), (4096, true), (4097, false)] {
+            let settings = Settings {
+                tnt_explosions_per_tick: limit,
+                ..Settings::default()
+            };
+            assert_eq!(settings.validate().is_ok(), valid);
+        }
+    }
+
+    #[test]
     fn update_checker_can_be_disabled_and_interval_is_bounded() {
         let settings: Settings =
             toml::from_str("update_check=false\nupdate_check_interval_hours=1\n").unwrap();
@@ -553,6 +614,27 @@ mod tests {
             let settings: Settings =
                 toml::from_str(&format!("update_check_interval_hours={interval}\n")).unwrap();
             assert!(settings.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn normal_generation_defaults_preserve_legacy_properties_and_validate_seed() {
+        let legacy = Properties::parse("").unwrap();
+        assert_eq!((legacy.level_type, legacy.level_seed), (LevelType::Flat, 0));
+        let fresh = Properties::parse(DEFAULT_PROPERTIES).unwrap();
+        assert_eq!((fresh.level_type, fresh.level_seed), (LevelType::Normal, 0));
+        let explicit =
+            Properties::parse("level-type=normal\nlevel-seed=18446744073709551615").unwrap();
+        assert_eq!(explicit.level_seed, u64::MAX);
+        assert_eq!(explicit.level_type.as_str(), "normal");
+        for invalid in [
+            "level-type=amplified",
+            "level-type=",
+            "level-seed=-1",
+            "level-seed=18446744073709551616",
+            "level-seed=seed",
+        ] {
+            assert!(Properties::parse(invalid).is_err(), "{invalid}");
         }
     }
 

@@ -12,6 +12,8 @@ import java.util.Arrays;
 import java.util.List;
 import net.minecraft.SharedConstants;
 import net.minecraft.core.HolderLookup;
+import net.minecraft.core.component.DataComponents;
+import net.minecraft.core.component.DataComponentInitializers;
 import net.minecraft.core.MappedRegistry;
 import net.minecraft.core.RegistrationInfo;
 import net.minecraft.core.Registry;
@@ -30,6 +32,8 @@ import net.minecraft.network.protocol.game.ClientboundAddEntityPacket;
 import net.minecraft.network.protocol.game.ClientboundEntityPositionSyncPacket;
 import net.minecraft.network.protocol.game.ClientboundPlayerInfoUpdatePacket;
 import net.minecraft.network.protocol.game.ClientboundPlayerAbilitiesPacket;
+import net.minecraft.network.protocol.game.ClientboundSetEntityMotionPacket;
+import net.minecraft.network.protocol.game.ClientboundTakeItemEntityPacket;
 import net.minecraft.network.protocol.game.ClientboundSetEntityDataPacket;
 import net.minecraft.network.protocol.game.ClientboundSetHealthPacket;
 import net.minecraft.network.protocol.game.ClientboundRemoveEntitiesPacket;
@@ -38,6 +42,11 @@ import net.minecraft.network.protocol.game.ClientboundRotateHeadPacket;
 import net.minecraft.world.entity.EntityTypes;
 import net.minecraft.world.entity.Avatar;
 import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.entity.PositionPath;
+import net.minecraft.world.entity.item.ItemEntity;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.phys.Vec3;
 import net.minecraft.network.protocol.game.ServerboundAttackPacket;
 import net.minecraft.network.syncher.EntityDataAccessor;
 import net.minecraft.network.syncher.EntityDataSerializers;
@@ -84,6 +93,7 @@ public final class PacketDecoder {
         JsonArray dynamic = JsonParser.parseString(Files.readString(data.resolve("registries-sync.json")))
             .getAsJsonObject().getAsJsonArray("registries");
         for (var entry : dynamic) registries.add(registry(source, entry.getAsJsonObject()));
+        BuiltInRegistries.DATA_COMPONENT_INITIALIZERS.build(source).forEach(DataComponentInitializers.PendingComponents::apply);
         return new RegistryAccess.ImmutableRegistryAccess(registries).freeze();
     }
 
@@ -114,11 +124,13 @@ public final class PacketDecoder {
             case "commands" -> "ClientboundCommandsPacket";
             case "player_info_add", "player_info_properties", "player_info_survival", "player_info_survival_properties" -> "ClientboundPlayerInfoUpdatePacket";
             case "player_info_remove" -> "ClientboundPlayerInfoRemovePacket";
-            case "entity_player", "entity_pig" -> "ClientboundAddEntityPacket";
-            case "entity_position" -> "ClientboundEntityPositionSyncPacket";
+            case "entity_player", "entity_pig", "entity_item_moving" -> "ClientboundAddEntityPacket";
+            case "entity_position", "entity_position_checked" -> "ClientboundEntityPositionSyncPacket";
+            case "entity_motion", "entity_motion_scaled" -> "ClientboundSetEntityMotionPacket";
+            case "take_item_entity" -> "ClientboundTakeItemEntityPacket";
             case "entity_head" -> "ClientboundRotateHeadPacket";
             case "entity_remove" -> "ClientboundRemoveEntitiesPacket";
-            case "entity_metadata", "mob_health" -> "ClientboundSetEntityDataPacket";
+            case "entity_metadata", "mob_health", "item_metadata_stone", "item_metadata_named", "item_metadata_empty" -> "ClientboundSetEntityDataPacket";
             case "attack_request" -> "ServerboundAttackPacket";
             case "player_health" -> "ClientboundSetHealthPacket";
             case "boss_add", "boss_remove", "boss_update_0", "boss_update_1" -> "ClientboundBossEventPacket";
@@ -139,6 +151,18 @@ public final class PacketDecoder {
             require(section.getBlockState(15, 15, 15).is(index == 7 ? Blocks.GRASS_BLOCK : index < 8 ? Blocks.STONE : Blocks.AIR), "Last block in section " + index);
         }
         require(!buffer.isReadable(), "Trailing chunk section bytes");
+    }
+
+    private static Vec3 originalVelocity(Vec3 input) {
+        var buffer = Unpooled.buffer();
+        try {
+            Vec3.LP_STREAM_CODEC.encode(buffer, input);
+            Vec3 result = Vec3.LP_STREAM_CODEC.decode(buffer);
+            require(!buffer.isReadable(), "Original velocity codec consumption");
+            return result;
+        } finally {
+            buffer.release();
+        }
     }
 
     @SuppressWarnings("unchecked")
@@ -221,35 +245,68 @@ public final class PacketDecoder {
                         require(texture.value().equals("texture-value") && texture.signature().equals("signed-value"), "Authenticated property preservation");
                     }
                 }
-                if (packet instanceof ClientboundLoginPacket || packet instanceof ClientboundPlayerAbilitiesPacket || packet instanceof ClientboundPlayerInfoUpdatePacket) {
+                if (packet instanceof ClientboundLoginPacket || packet instanceof ClientboundPlayerAbilitiesPacket || packet instanceof ClientboundPlayerInfoUpdatePacket
+                    || packet instanceof ClientboundAddEntityPacket || packet instanceof ClientboundSetEntityMotionPacket || packet instanceof ClientboundTakeItemEntityPacket
+                    || packet instanceof ClientboundSetEntityDataPacket || packet instanceof ClientboundEntityPositionSyncPacket) {
                     var encoded = new RegistryFriendlyByteBuf(Unpooled.buffer(), registries);
                     try {
                         encoded.writeVarInt(id);
                         codec.encode(encoded, packet);
                         byte[] roundTrip = new byte[encoded.readableBytes()];
                         encoded.readBytes(roundTrip);
-                        require(Arrays.equals(fixtureBytes, roundTrip), "Original mode packet round trip: " + name);
+                        require(Arrays.equals(fixtureBytes, roundTrip), "Original packet round trip: " + name);
                     } finally {
                         encoded.release();
                     }
                 }
                 if (packet instanceof ClientboundPlayerInfoRemovePacket removed) require(removed.profileIds().size() == 1, "TAB removal");
                 if (packet instanceof ClientboundAddEntityPacket entity) {
-                    require(entity.getType() == (name.equals("entity_player") ? EntityTypes.PLAYER : EntityTypes.PIG), "Entity registry type");
+                    require(id == 1, "Entity spawn packet ID");
+                    var expectedType = switch (name) {
+                        case "entity_player" -> EntityTypes.PLAYER;
+                        case "entity_item_moving" -> EntityTypes.ITEM;
+                        default -> EntityTypes.PIG;
+                    };
+                    require(entity.getType() == expectedType, "Entity registry type");
                     require(entity.getX() == 1.0 && entity.getY() == 64.0 && entity.getZ() == -2.0, "Entity coordinates");
-                    require(entity.getMovement().lengthSqr() == 0.0, "Zero low-precision velocity");
+                    if (name.equals("entity_item_moving")) {
+                        require(entity.getId() == 300 && entity.getUUID().equals(new java.util.UUID(0,42)), "Item entity identity");
+                        require(entity.getMovement().equals(originalVelocity(new Vec3(0.1,0.2,-0.05))), "Item spawn LP velocity");
+                    } else require(entity.getMovement().lengthSqr() == 0.0, "Zero low-precision velocity");
                     require(entity.getXRot() == -45.0f && entity.getYRot() == 90.0f, "Entity angles");
                 }
-                if (packet instanceof ClientboundEntityPositionSyncPacket sync) require(sync.id() == 300 && sync.position().endPosition().x == 2.0 && sync.onGround(), "Linear entity position");
+                if (packet instanceof ClientboundEntityPositionSyncPacket sync) require(id == 35 && sync.id() == 300 && sync.position() instanceof PositionPath.Linear && sync.position().endPosition().equals(new Vec3(2.0,64.0,-3.0)) && sync.yRot() == 45.0f && sync.xRot() == -30.0f && sync.onGround(), "Linear entity position");
+                if (packet instanceof ClientboundSetEntityMotionPacket motion) {
+                    Vec3 expected = name.equals("entity_motion_scaled") ? new Vec3(512.25,-1024.5,4.75) : new Vec3(0.1,0.2,-0.05);
+                    require(id == 103 && motion.id() == 300 && motion.movement().equals(originalVelocity(expected)), "Entity velocity packet");
+                }
+                if (packet instanceof ClientboundTakeItemEntityPacket taken) require(id == 127 && taken.getItemId() == 300 && taken.getPlayerId() == 301 && taken.getAmount() == 7, "Item collection packet");
                 if (packet instanceof ClientboundRotateHeadPacket head) require(head.getYHeadRot() == 90.0f, "Head rotation");
                 if (packet instanceof ClientboundRemoveEntitiesPacket remove) require(remove.entityIds().size() == 2 && remove.entityIds().getInt(1) == 301, "Entity removal");
                 if (packet instanceof ClientboundSetEntityDataPacket entity) {
+                    if (name.startsWith("item_metadata_")) {
+                        var field = ItemEntity.class.getDeclaredField("DATA_ITEM");
+                        field.setAccessible(true);
+                        var accessor = (EntityDataAccessor<?>)field.get(null);
+                        require(id == 101 && entity.id() == 300 && entity.packedItems().size() == 1, "Item metadata envelope");
+                        var value = entity.packedItems().getFirst();
+                        require(accessor.id() == 8 && EntityDataSerializers.getSerializedId(accessor.serializer()) == 7 && value.id() == accessor.id() && value.serializer() == EntityDataSerializers.ITEM_STACK, "Original item accessor and serializer");
+                        var stack = (ItemStack)value.value();
+                        if (name.equals("item_metadata_empty")) require(stack.isEmpty(), "Empty item metadata");
+                        else {
+                            boolean named = name.equals("item_metadata_named");
+                            require(stack.is(Items.STONE) && stack.getCount() == (named ? 3 : 7), "Item metadata stack");
+                            if (named) require(stack.get(DataComponents.CUSTOM_NAME).getString().equals("teighto") && stack.getComponentsPatch().size() == 1, "Item metadata component patch");
+                            else require(stack.getComponentsPatch().isEmpty(), "Default item metadata has no patch");
+                        }
+                    } else {
                     var field = name.equals("mob_health")?LivingEntity.class.getDeclaredField("DATA_HEALTH_ID"):Avatar.class.getDeclaredField("DATA_PLAYER_MODE_CUSTOMISATION");
                     field.setAccessible(true);
                     var skin = (EntityDataAccessor<?>) field.get(null);
                     var value = entity.packedItems().getFirst();
                     if(name.equals("mob_health"))require(value.id()==skin.id()&&value.serializer()==EntityDataSerializers.FLOAT&&value.value().equals(6.0f),"Living entity health accessor");
                     else require(value.id() == skin.id() && value.serializer() == EntityDataSerializers.BYTE && value.value().equals((byte)127), "Vanilla skin-layer accessor");
+                    }
                 }
                 if(packet instanceof ServerboundAttackPacket attack)require(attack.entityId()==300,"Serverbound attack ID");
                 if (packet instanceof ClientboundSetHealthPacket health) require(health.getHealth() == 20.0f && health.getFood() == 20 && health.getSaturation() == 5.0f, "Health and hunger");

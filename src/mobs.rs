@@ -46,11 +46,81 @@ struct LiveMobs {
 }
 
 impl Mobs {
+    pub(crate) fn blast_targets(&self, center: [f64; 3]) -> Result<Vec<(i32, Uuid)>> {
+        let live = self.live.lock().map_err(|_| "mob state lock poisoned")?;
+        Ok(live
+            .engine
+            .entities()
+            .filter(|mob| {
+                mob.health > 0.0 && crate::blast_damage::within_blast(center, mob.position)
+            })
+            .map(|mob| (mob.id, mob.uuid))
+            .collect())
+    }
+
+    pub(crate) async fn apply_blast(
+        &self,
+        center: [f64; 3],
+        view: Arc<crate::blast_damage::BlastView>,
+        targets: Vec<(i32, Uuid)>,
+    ) -> Result<()> {
+        if targets.is_empty() {
+            return Ok(());
+        }
+        let _serial = self.serial.lock().await;
+        let gameplay = Arc::clone(&self.gameplay).read_owned().await;
+        let observers = self.players.snapshots()?;
+        let live = Arc::clone(&self.live);
+        let data = Arc::clone(&self.data);
+        let path = self.config.path.clone();
+        let capacity = self.config.capacity;
+        let radius = self.config.visibility_radius;
+        let batches = self
+            .world
+            .execute(move || {
+                let _gameplay = gameplay;
+                let mut live = live.lock().map_err(|_| "mob state lock poisoned")?;
+                let mut effects = Vec::new();
+                for (id, uuid) in targets {
+                    let Some(mob) = live
+                        .engine
+                        .get(id)
+                        .filter(|mob| mob.uuid == uuid && mob.health > 0.0)
+                    else {
+                        continue;
+                    };
+                    let dimensions = mob.dimensions();
+                    if let Some(effect) =
+                        view.effect(center, mob.position, dimensions, dimensions[1] * 0.85)
+                    {
+                        effects.push((id, effect));
+                    }
+                }
+                if effects.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let before = live.engine.snapshot();
+                let mut changes = Vec::new();
+                for (id, effect) in effects {
+                    changes.extend(live.engine.damage_with_impulse(
+                        id,
+                        effect.damage,
+                        effect.impulse,
+                    )?);
+                }
+                persist_mutation(&mut live, &path, before, capacity)?;
+                live.batches(&observers, &changes, &data, radius)
+            })
+            .await?;
+        self.players.dispatch_batches(batches)?;
+        Ok(())
+    }
+
     pub fn blockers_near(&self, position: [f64; 3]) -> Result<Vec<zerqon_blocks::Aabb>> {
         let live = self.live.lock().map_err(|_| "mob state lock poisoned")?;
         let mut blockers = Vec::new();
         for mob in live.engine.entities().filter(|mob| mob.health > 0.0) {
-            let bounds = zerqon_entities::body_bounds(mob.position, mob.kind);
+            let bounds = zerqon_entities::scaled_bounds(mob.position, mob.kind, mob.scale());
             if (0..3).all(|axis| {
                 bounds.max[axis] >= position[axis] - 3.0 && bounds.min[axis] <= position[axis] + 4.0
             }) {
@@ -104,7 +174,16 @@ impl Mobs {
         }))
     }
 
+    #[cfg(test)]
     pub async fn tick(&self, tick: u64) -> Result<()> {
+        self.tick_with_food(tick, Vec::new()).await
+    }
+
+    pub async fn tick_with_food(
+        &self,
+        tick: u64,
+        food: Vec<(MobKind, PlayerTarget)>,
+    ) -> Result<()> {
         let _serial = self.serial.lock().await;
         let gameplay = Arc::clone(&self.gameplay).read_owned().await;
         let observers = self.players.snapshots()?;
@@ -116,7 +195,7 @@ impl Mobs {
             }
             return self.flush_locked().await;
         }
-        let natural = self.config.natural_spawning && tick.is_multiple_of(20);
+        let natural = self.config.natural_spawning && tick.is_multiple_of(200);
         let no_work = {
             let live = self.live.lock().map_err(|_| "mob state lock poisoned")?;
             live.engine.is_empty() && !live.dirty && live.visible.values().all(BTreeSet::is_empty)
@@ -132,33 +211,57 @@ impl Mobs {
         let radius = self.config.visibility_radius;
         let path = self.config.path.clone();
         let capacity = self.config.capacity;
+        let targets = self.players.combat_targets()?;
+        let players = Arc::clone(&self.players);
         let (batches, save_error) = self
             .world
             .execute(move || {
                 let _gameplay = gameplay;
                 let view = ChunkView::new(world.cached_chunks()?, blocks);
-                let targets: Vec<_> = observers
-                    .iter()
-                    .map(|player| PlayerTarget {
-                        id: player.id,
-                        position: player.position.xyz,
-                        attackable: false,
-                    })
-                    .collect();
                 let mut live = live.lock().map_err(|_| "mob state lock poisoned")?;
-                let mut changes = live.engine.tick(&view, &targets);
+                let mut changes = live.engine.tick_with_food(&view, &targets, &food);
+                for change in &changes {
+                    if let EntityChange::AttackPlayer {
+                        attacker,
+                        player,
+                        damage,
+                    } = change
+                        && let Some(mob) = live.engine.get(*attacker)
+                    {
+                        players.mob_attack(*player, mob.position, *damage)?;
+                    }
+                }
                 for change in &changes {
                     if let EntityChange::PhysicsBlocked { id, reason } = change {
                         tracing::debug!(id,%reason,"Mob physics paused");
                     }
                 }
                 let mut spawned = false;
+                let pairs = live.engine.breeding_pairs();
+                if !pairs.is_empty() {
+                    let before = live.engine.snapshot();
+                    let mut births = Vec::new();
+                    for (first, second) in pairs {
+                        if let Some(child) =
+                            live.engine
+                                .breed(first, second, ids.next()?, Uuid::new_v4(), &view)?
+                        {
+                            births.push(child);
+                        }
+                    }
+                    if !births.is_empty() {
+                        persist_mutation(&mut live, &path, before, capacity)?;
+                        changes.extend(births);
+                    }
+                }
                 if natural && live.engine.len() < capacity {
                     let id = ids.next()?;
-                    if let Some(change) =
-                        live.engine
-                            .try_natural_spawn(&view, &targets, false, || (id, Uuid::new_v4()))?
-                    {
+                    if let Some(change) = live.engine.try_natural_spawn(
+                        &view,
+                        &targets,
+                        (tick % 24000) >= 13000,
+                        || (id, Uuid::new_v4()),
+                    )? {
                         changes.push(change);
                         spawned = true;
                     }
@@ -294,7 +397,7 @@ impl Mobs {
                     return Ok(Vec::new());
                 }
                 let before = live.engine.snapshot();
-                let changes = live.engine.damage(target, 4.0)?;
+                let changes = live.engine.damage_with_knockback(target, 4.0, attacker)?;
                 persist_mutation(&mut live, &path, before, capacity)?;
                 live.last_attack.insert(observer, Instant::now());
                 live.batches(&observers, &changes, &data, radius)
@@ -302,6 +405,79 @@ impl Mobs {
             .await?;
         self.players.dispatch_batches(batches)?;
         Ok(())
+    }
+
+    pub async fn interact(
+        &self,
+        uuid: Uuid,
+        player_id: i32,
+        target: i32,
+        hand: zerqon_inventory::Hand,
+        inventory: &crate::player_inventory::InventoryHandle,
+    ) -> Result<bool> {
+        let _serial = self.serial.lock().await;
+        let Some(stack) = inventory.held_stack(hand)? else {
+            return Ok(false);
+        };
+        let item = inventory.item_key(&stack)?;
+        let gameplay = Arc::clone(&self.gameplay).read_owned().await;
+        if !self.players.is_alive(uuid, player_id)? {
+            return Ok(false);
+        }
+        let actor = self
+            .players
+            .query_snapshot(uuid)?
+            .filter(|p| p.id == player_id)
+            .ok_or("Player is no longer connected")?;
+        let view = ChunkView::new(self.world.cached_chunks()?, Arc::clone(&self.blocks));
+        let mob_id = {
+            let live = self.live.lock().map_err(|_| "mob lock poisoned")?;
+            let Some(mob) = live.engine.get(target) else {
+                return Ok(false);
+            };
+            let food = match mob.kind {
+                MobKind::Cow => item == "minecraft:wheat",
+                MobKind::Pig => matches!(
+                    item.as_str(),
+                    "minecraft:carrot" | "minecraft:potato" | "minecraft:beetroot"
+                ),
+                _ => false,
+            };
+            if !food
+                || !mob.can_feed()
+                || !live
+                    .engine
+                    .reachable_from(target, actor.position.xyz, &view)
+            {
+                return Ok(false);
+            }
+            mob.uuid
+        };
+        drop(gameplay);
+        inventory.consume_hand(hand, stack).await?;
+        let gameplay = Arc::clone(&self.gameplay).read_owned().await;
+        let live = Arc::clone(&self.live);
+        let path = self.config.path.clone();
+        let capacity = self.config.capacity;
+        let data = Arc::clone(&self.data);
+        let observers = self.players.snapshots()?;
+        let radius = self.config.visibility_radius;
+        let batches = self
+            .world
+            .execute(move || {
+                let _gameplay = gameplay;
+                let mut live = live.lock().map_err(|_| "mob lock poisoned")?;
+                if !live.engine.get(target).is_some_and(|m| m.uuid == mob_id) {
+                    return Err("Animal is no longer available".into());
+                }
+                let before = live.engine.snapshot();
+                let changes = live.engine.feed(target)?;
+                persist_mutation(&mut live, &path, before, capacity)?;
+                live.batches(&observers, &changes, &data, radius)
+            })
+            .await?;
+        self.players.dispatch_batches(batches)?;
+        Ok(true)
     }
 
     pub async fn flush(&self) -> Result<()> {
@@ -372,10 +548,25 @@ impl LiveMobs {
                 .collect();
             let mut batch = Vec::new();
             for change in changes {
+                if let EntityChange::Love { id } = change
+                    && previous.contains(id)
+                {
+                    batch.push(entity_packets::entity_event(*id, 18).into());
+                }
+                if let EntityChange::AgeChanged { id, baby } = change
+                    && previous.contains(id)
+                {
+                    batch.push(entity_packets::animal_age(*id, *baby).into());
+                }
                 if let EntityChange::Health { id, health } = change
                     && previous.contains(id)
                 {
                     batch.push(Bytes::from(entity_packets::mob_health(*id, *health)));
+                    // Original non-player LivingEntity.getHurtDir() returns zero.
+                    batch.push(entity_packets::hurt_animation(*id, 0.0)?.into());
+                    if let Some(mob) = self.engine.get(*id) {
+                        batch.push(entity_packets::entity_motion(*id, mob.velocity)?.into());
+                    }
                 }
             }
             let removed: Vec<_> = previous.difference(&current).copied().collect();
@@ -439,11 +630,23 @@ fn spawn_packets(mob: &Mob, data: &GameData) -> Result<PacketBatch> {
     let kind = data
         .entity_type(mob.kind.identifier())
         .ok_or("missing mob entity type")?;
-    Ok(vec![
-        entity_packets::add_entity(mob.id, mob.uuid, kind, mob.position, mob.yaw, mob.pitch).into(),
+    let mut packets: Vec<Bytes> = vec![
+        entity_packets::add_entity_with_motion(
+            mob.id,
+            mob.uuid,
+            kind,
+            mob.position,
+            mob.velocity,
+            mob.yaw,
+            mob.pitch,
+        )?
+        .into(),
         entity_packets::mob_health(mob.id, mob.health).into(),
-    ]
-    .into())
+    ];
+    if mob.kind != MobKind::Zombie {
+        packets.push(entity_packets::animal_age(mob.id, mob.is_baby()).into());
+    }
+    Ok(packets.into())
 }
 
 struct ChunkView {
@@ -462,6 +665,13 @@ impl ChunkView {
     }
 }
 impl WorldQuery for ChunkView {
+    fn water_at(&self, x: i32, y: i32, z: i32) -> bool {
+        self.chunks
+            .get(&(x.div_euclid(16), z.div_euclid(16)))
+            .and_then(|c| c.get_block(x.rem_euclid(16) as u8, y, z.rem_euclid(16) as u8))
+            .and_then(|id| self.blocks.state(zerqon_blocks::StateId(id)).ok())
+            .is_some_and(|state| state.key() == "minecraft:water")
+    }
     fn loaded_at(&self, x: i32, z: i32) -> bool {
         self.chunks
             .contains_key(&(x.div_euclid(16), z.div_euclid(16)))
@@ -486,7 +696,7 @@ impl WorldQuery for ChunkView {
         let Ok(state) = self.blocks.state(zerqon_blocks::StateId(state)) else {
             return BlockCollision::Unsupported;
         };
-        if state.has_fluid() {
+        if state.has_fluid() && state.key() != "minecraft:water" {
             return BlockCollision::Unsupported;
         }
         match state.collision() {

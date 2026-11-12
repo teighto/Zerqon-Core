@@ -59,6 +59,12 @@ pub struct EditPlan {
 }
 
 impl EditPlan {
+    pub fn unchanged() -> Self {
+        Self {
+            reads: Vec::new(),
+            changes: Vec::new(),
+        }
+    }
     /// Every value must still match when the caller commits under world locks.
     pub fn reads(&self) -> &[(Position, StateId)] {
         &self.reads
@@ -101,6 +107,61 @@ pub enum BuildError {
 }
 
 impl Catalog {
+    pub fn plan_use(
+        &self,
+        view: &impl BlockView,
+        interaction: &Interaction<'_>,
+        position: Position,
+    ) -> Result<Option<EditPlan>, BuildError> {
+        interaction.validate_target(position)?;
+        let mut reads = Reads::new(self, view, interaction.bounds);
+        let state = reads.get(position)?;
+        if !hand_openable(state.key()) {
+            return Ok(None);
+        }
+        let open = if state.property("open") == Some("true") {
+            "false"
+        } else {
+            "true"
+        };
+        reads.set(
+            position,
+            self.with_properties(state.id(), [("open", open)])?,
+        )?;
+        if door(state.key()) {
+            let other = position
+                .relative(if state.property("half") == Some("upper") {
+                    Direction::Down
+                } else {
+                    Direction::Up
+                })
+                .ok_or(BuildError::OutOfBounds)?;
+            let adjacent = reads.get(other)?;
+            if adjacent.key() == state.key() {
+                reads.set(
+                    other,
+                    self.with_properties(adjacent.id(), [("open", open)])?,
+                )?;
+            }
+        }
+        Ok(Some(reads.finish()))
+    }
+    pub fn plan_ignite_tnt(
+        &self,
+        view: &impl BlockView,
+        interaction: &Interaction<'_>,
+        position: Position,
+    ) -> Result<EditPlan, BuildError> {
+        interaction.validate_target(position)?;
+        let mut reads = Reads::new(self, view, interaction.bounds);
+        if reads.get(position)?.key() != "minecraft:tnt" {
+            return Err(BuildError::UnsupportedBlock(position));
+        }
+        reads.set(position, self.air())?;
+        update_neighbors_inner(&mut reads, position, true)?;
+        Ok(reads.finish())
+    }
+
     /// Compute creative edits from server-owned inventory and interaction state.
     /// The caller must validate authorization, actor and inventory changes again before commit.
     pub fn plan_placement(
@@ -109,7 +170,7 @@ impl Catalog {
         interaction: &Interaction<'_>,
         request: &Placement<'_>,
     ) -> Result<EditPlan, BuildError> {
-        interaction.validate(request.clicked)?;
+        interaction.validate_target(request.clicked)?;
         if !request.facing.horizontal()
             || request
                 .local_hit
@@ -122,16 +183,30 @@ impl Catalog {
         let item = self.item(request.item)?;
         let default = self
             .item_block(request.item)?
-            .filter(|_| item.ordinary_block_item)
+            .filter(|state| {
+                item.ordinary_block_item
+                    || self
+                        .state(*state)
+                        .is_ok_and(|state| door(state.key()) || torch(state.key()))
+            })
             .ok_or(BuildError::UnsupportedItem)?;
         let kind = self.state(default)?.kind();
         if kind == BlockKind::Unsupported {
-            return Err(BuildError::UnsupportedItem);
+            placing_supported(self.state(default)?, request.clicked)?;
         }
         let mut reads = Reads::new(self, view, interaction.bounds);
         let clicked = reads.get(request.clicked)?;
-        dry(clicked, request.clicked)?;
-        if clicked.interactive() && !request.secondary_use {
+        if !matches!(clicked.key(), "minecraft:water" | "minecraft:lava") {
+            dry(clicked, request.clicked)?;
+        }
+        if clicked.interactive()
+            && !request.secondary_use
+            && !hand_openable(clicked.key())
+            && !matches!(
+                clicked.key(),
+                "minecraft:iron_door" | "minecraft:iron_trapdoor"
+            )
+        {
             return Err(BuildError::Interactive(request.clicked));
         }
         let target = if can_replace(clicked, request, true)? {
@@ -146,18 +221,111 @@ impl Catalog {
             return Err(BuildError::OutOfBounds);
         }
         let previous = reads.get(target)?;
-        dry(previous, target)?;
+        if !matches!(previous.key(), "minecraft:water" | "minecraft:lava") {
+            dry(previous, target)?;
+        }
         if !can_replace(previous, request, target == request.clicked)? {
             return Err(BuildError::Occupied(target));
         }
-        mutation_supported(previous, target)?;
+        if !previous.has_fluid() {
+            mutation_supported(previous, target)?;
+        }
+        if door(self.state(default)?.key()) {
+            let upper = target
+                .relative(Direction::Up)
+                .ok_or(BuildError::OutOfBounds)?;
+            if !interaction.bounds.contains(upper) {
+                return Err(BuildError::OutOfBounds);
+            }
+            let above = reads.get(upper)?;
+            if !above.replaceable() {
+                return Err(BuildError::Occupied(upper));
+            }
+            let support = reads.get(
+                target
+                    .relative(Direction::Down)
+                    .ok_or(BuildError::OutOfBounds)?,
+            )?;
+            if !full_cube(support) {
+                return Err(BuildError::UnsupportedBlock(target));
+            }
+            let left = request
+                .facing
+                .counter_clockwise()
+                .ok_or(BuildError::Invalid)?;
+            let right = left.opposite();
+            let lp = target.relative(left).ok_or(BuildError::OutOfBounds)?;
+            let rp = target.relative(right).ok_or(BuildError::OutOfBounds)?;
+            let l = reads.get(lp)?;
+            let r = reads.get(rp)?;
+            let lu = reads.get(lp.relative(Direction::Up).ok_or(BuildError::OutOfBounds)?)?;
+            let ru = reads.get(rp.relative(Direction::Up).ok_or(BuildError::OutOfBounds)?)?;
+            let balance = i32::from(full_cube(r)) + i32::from(full_cube(ru))
+                - i32::from(full_cube(l))
+                - i32::from(full_cube(lu));
+            let ld = door(l.key()) && l.property("half") == Some("lower");
+            let rd = door(r.key()) && r.property("half") == Some("lower");
+            let x = f64::from(request.clicked.x - target.x) + f64::from(request.local_hit[0]);
+            let z = f64::from(request.clicked.z - target.z) + f64::from(request.local_hit[2]);
+            let right_hinge = if (ld && !rd) || balance > 0 {
+                true
+            } else if (rd && !ld) || balance < 0 {
+                false
+            } else {
+                match request.facing {
+                    Direction::West => z < 0.5,
+                    Direction::East => z > 0.5,
+                    Direction::North => x > 0.5,
+                    Direction::South => x < 0.5,
+                    _ => false,
+                }
+            };
+            let lower = self.with_properties(
+                default,
+                [
+                    ("facing", request.facing.name()),
+                    ("hinge", if right_hinge { "right" } else { "left" }),
+                    ("half", "lower"),
+                    ("open", "false"),
+                    ("powered", "false"),
+                ],
+            )?;
+            reads.set(target, lower)?;
+            reads.set(upper, self.with_properties(lower, [("half", "upper")])?)?;
+            let plan = reads.finish();
+            self.validate_collision(&plan, interaction.blockers)?;
+            return Ok(plan);
+        }
+        if torch(self.state(default)?.key()) {
+            let support = if request.face.horizontal() {
+                request.face.opposite()
+            } else if request.face == Direction::Up {
+                Direction::Down
+            } else {
+                return Err(BuildError::Invalid);
+            };
+            let support_at = target.relative(support).ok_or(BuildError::OutOfBounds)?;
+            if !full_cube(reads.get(support_at)?) {
+                return Err(BuildError::UnsupportedBlock(support_at));
+            }
+            let replacement = if request.face.horizontal() {
+                self.resolve(
+                    &self.state(default)?.key().replace("torch", "wall_torch"),
+                    &BTreeMap::from([("facing".into(), request.face.name().into())]),
+                )?
+            } else {
+                default
+            };
+            reads.set(target, replacement)?;
+            return Ok(reads.finish());
+        }
         let top = request.face == Direction::Down
             || (request.face.horizontal()
                 && f64::from(request.clicked.y) + f64::from(request.local_hit[1])
                     - f64::from(target.y)
                     > 0.5);
         let mut replacement = match kind {
-            BlockKind::Simple => default,
+            BlockKind::Simple | BlockKind::Unsupported => default,
             BlockKind::Pillar => self.with_properties(default, [("axis", request.face.axis())])?,
             BlockKind::Slab => {
                 let slab_type = if previous.key() == self.state(default)?.key() {
@@ -185,8 +353,33 @@ impl Catalog {
                 )?;
                 self.snowy_neighbor_state(default, Direction::Up, above.id())?
             }
-            BlockKind::Unsupported => return Err(BuildError::UnsupportedItem),
         };
+        let key = self.state(default)?.key();
+        if key.ends_with("_trapdoor") {
+            let facing = if request.face.horizontal() && target != request.clicked {
+                request.face
+            } else {
+                request.facing.opposite()
+            };
+            replacement = self.with_properties(
+                default,
+                [
+                    ("facing", facing.name()),
+                    ("half", if top { "top" } else { "bottom" }),
+                    ("open", "false"),
+                    ("powered", "false"),
+                ],
+            )?;
+        } else if key.ends_with("_fence_gate") {
+            replacement = self.with_properties(
+                default,
+                [
+                    ("facing", request.facing.name()),
+                    ("open", "false"),
+                    ("powered", "false"),
+                ],
+            )?;
+        }
         if request
             .properties
             .iter()
@@ -201,13 +394,22 @@ impl Catalog {
                 .iter()
                 .map(|(key, value)| (key.as_str(), value.as_str())),
         )?;
-        mutation_supported(self.state(replacement)?, target)?;
+        if self.state(replacement)?.kind() == BlockKind::Unsupported {
+            placing_supported(self.state(replacement)?, target)?;
+        } else {
+            mutation_supported(self.state(replacement)?, target)?;
+        }
+        if self.state(replacement)?.property("waterlogged").is_some()
+            && previous.key() == "minecraft:water"
+        {
+            replacement = self.with_properties(replacement, [("waterlogged", "true")])?;
+        }
         reads.set(target, replacement)?;
         if kind == BlockKind::Stairs {
             replacement = stairs(&mut reads, target, replacement)?;
             reads.set(target, replacement)?;
         }
-        update_neighbors(&mut reads, target)?;
+        update_neighbors_inner(&mut reads, target, true)?;
         let plan = reads.finish();
         self.validate_collision(&plan, interaction.blockers)?;
         Ok(plan)
@@ -220,8 +422,10 @@ impl Catalog {
         position: Position,
         held_item: Option<u32>,
     ) -> Result<EditPlan, BuildError> {
-        interaction.validate(position)?;
-        if let Some(item) = held_item {
+        interaction.validate_target(position)?;
+        if interaction.creative
+            && let Some(item) = held_item
+        {
             match self.item(item)?.can_destroy_in_creative {
                 Some(true) => {}
                 Some(false) => return Err(BuildError::ToolDenied),
@@ -230,12 +434,29 @@ impl Catalog {
         }
         let mut reads = Reads::new(self, view, interaction.bounds);
         let previous = reads.get(position)?;
-        mutation_supported(previous, position)?;
+        breaking_supported(previous, position)?;
         if previous.is_air() {
             return Ok(reads.finish());
         }
-        reads.set(position, self.air())?;
-        update_neighbors(&mut reads, position)?;
+        let replacement = if previous.property("waterlogged") == Some("true") {
+            self.resolve("minecraft:water", &BTreeMap::new())?
+        } else {
+            self.air()
+        };
+        reads.set(position, replacement)?;
+        if door(previous.key()) {
+            let other = position
+                .relative(if previous.property("half") == Some("upper") {
+                    Direction::Down
+                } else {
+                    Direction::Up
+                })
+                .ok_or(BuildError::OutOfBounds)?;
+            if reads.get(other)?.key() == previous.key() {
+                reads.set(other, self.air())?;
+            }
+        }
+        update_neighbors_inner(&mut reads, position, true)?;
         let plan = reads.finish();
         self.validate_collision(&plan, interaction.blockers)?;
         Ok(plan)
@@ -322,10 +543,7 @@ impl Bounds {
 }
 
 impl Interaction<'_> {
-    fn validate(&self, target: Position) -> Result<(), BuildError> {
-        if !self.creative {
-            return Err(BuildError::Survival);
-        }
+    fn validate_target(&self, target: Position) -> Result<(), BuildError> {
         if !self.bounds.valid()
             || !self.block_range.is_finite()
             || !(0.0..=64.0).contains(&self.block_range)
@@ -435,7 +653,7 @@ impl<'a, V: BlockView> Reads<'a, V> {
 }
 
 fn dry(state: State<'_>, position: Position) -> Result<(), BuildError> {
-    if state.has_fluid() {
+    if state.has_fluid() && state.property("waterlogged") != Some("true") {
         return Err(BuildError::Fluid(position));
     }
     if state.dynamic_collision() {
@@ -456,11 +674,64 @@ fn mutation_supported(state: State<'_>, position: Position) -> Result<(), BuildE
     Ok(())
 }
 
+fn breaking_supported(state: State<'_>, position: Position) -> Result<(), BuildError> {
+    if state.property("waterlogged") != Some("true") {
+        dry(state, position)?;
+    }
+    if !state.is_air()
+        && (state.has_block_entity()
+            || state.game_master()
+            || (state.kind() == BlockKind::Unsupported
+                && state.interactive()
+                && state.key() != "minecraft:tnt"
+                && !hand_openable(state.key())
+                && !door(state.key())
+                && !state.key().ends_with("_trapdoor")
+                && !full_cube(state)))
+    {
+        return Err(BuildError::UnsupportedBlock(position));
+    }
+    Ok(())
+}
+
+fn door(key: &str) -> bool {
+    key.ends_with("_door")
+}
+fn torch(key: &str) -> bool {
+    matches!(key, "minecraft:torch" | "minecraft:soul_torch")
+}
+fn hand_openable(key: &str) -> bool {
+    (door(key) || key.ends_with("_trapdoor") || key.ends_with("_fence_gate"))
+        && !matches!(key, "minecraft:iron_door" | "minecraft:iron_trapdoor")
+}
+fn full_cube(state: State<'_>) -> bool {
+    state.collision().is_ok_and(|shapes| {
+        shapes
+            == [Aabb {
+                min: [0.0; 3],
+                max: [1.0; 3],
+            }]
+    })
+}
+fn placing_supported(state: State<'_>, position: Position) -> Result<(), BuildError> {
+    if door(state.key())
+        || torch(state.key())
+        || state.key().ends_with("_trapdoor")
+        || state.key().ends_with("_fence_gate")
+    {
+        return Ok(());
+    }
+    breaking_supported(state, position)
+}
+
 fn can_replace(
     state: State<'_>,
     request: &Placement<'_>,
     replacing_clicked: bool,
 ) -> Result<bool, BuildError> {
+    if matches!(state.key(), "minecraft:water" | "minecraft:lava") {
+        return Ok(true);
+    }
     if state.kind() == BlockKind::Slab {
         if state.item() != request.item || state.property("type") == Some("double") {
             return Ok(false);
@@ -481,9 +752,10 @@ fn can_replace(
     Ok(state.replaceable() && state.item() != request.item)
 }
 
-fn update_neighbors<V: BlockView>(
+fn update_neighbors_inner<V: BlockView>(
     reads: &mut Reads<'_, V>,
     position: Position,
+    _removal: bool,
 ) -> Result<(), BuildError> {
     let mut pending = VecDeque::from([position]);
     let mut visited = BTreeSet::new();
@@ -496,13 +768,6 @@ fn update_neighbors<V: BlockView>(
                 .relative(direction)
                 .ok_or(BuildError::OutOfBounds)?;
             let state = reads.get(neighbor)?;
-            dry(state, neighbor)?;
-            if state.kind() == BlockKind::Unsupported
-                && !state.is_air()
-                && (state.neighbor_effects() || state.has_block_entity())
-            {
-                return Err(BuildError::UnsupportedBlock(neighbor));
-            }
             if direction.horizontal() && state.kind() == BlockKind::Stairs {
                 let updated = stairs(reads, neighbor, state.id())?;
                 if updated != state.id() {
@@ -576,4 +841,132 @@ fn stairs<V: BlockView>(
         return Ok(reads.catalog.with_properties(id, [("shape", shape)])?);
     }
     Ok(reads.catalog.with_properties(id, [("shape", "straight")])?)
+}
+
+#[cfg(test)]
+mod ignition_tests {
+    use super::*;
+
+    #[test]
+    fn survival_ignition_preserves_adjacent_tnt_and_checks_reach_and_target() {
+        let catalog = Catalog::embedded().unwrap();
+        let target = Position::new(0, 64, 0);
+        let tnt = catalog.resolve("minecraft:tnt", &BTreeMap::new()).unwrap();
+        let neighbor = Position::new(1, 64, 0);
+        let view = |position| {
+            Some(if position == target || position == neighbor {
+                tnt
+            } else {
+                catalog.air()
+            })
+        };
+        let mut interaction = Interaction {
+            eye: [0.5, 65.62, 2.5],
+            block_range: 5.0,
+            creative: false,
+            bounds: Bounds::default(),
+            blockers: &[],
+        };
+        let plan = catalog
+            .plan_ignite_tnt(&view, &interaction, target)
+            .unwrap();
+        assert_eq!(
+            plan.changes(),
+            &[BlockChange {
+                position: target,
+                expected: tnt,
+                replacement: catalog.air()
+            }]
+        );
+        assert!(plan.reads().contains(&(neighbor, tnt)));
+        assert!(
+            catalog
+                .plan_break(&view, &interaction, target, None)
+                .is_ok()
+        );
+        assert!(matches!(
+            catalog.plan_ignite_tnt(&view, &interaction, Position::new(0, 65, 0)),
+            Err(BuildError::UnsupportedBlock(_))
+        ));
+        interaction.eye[0] = 64.0;
+        assert!(matches!(
+            catalog.plan_ignite_tnt(&view, &interaction, target),
+            Err(BuildError::OutOfReach)
+        ));
+        assert!(matches!(
+            catalog.plan_ignite_tnt(&view, &interaction, Position::new(0, 320, 0)),
+            Err(BuildError::OutOfBounds)
+        ));
+        interaction.eye[0] = 0.5;
+        interaction.creative = true;
+        for key in [
+            "minecraft:sand",
+            "minecraft:red_sand",
+            "minecraft:gravel",
+            "minecraft:oak_leaves",
+            "minecraft:spruce_leaves",
+        ] {
+            let natural = catalog.resolve(key, &BTreeMap::new()).unwrap();
+            let natural_view = |position| {
+                Some(if position == target {
+                    natural
+                } else if position == neighbor {
+                    tnt
+                } else {
+                    catalog.air()
+                })
+            };
+            let plan = catalog
+                .plan_break(&natural_view, &interaction, target, None)
+                .unwrap();
+            assert_eq!(
+                plan.changes(),
+                &[BlockChange {
+                    position: target,
+                    expected: natural,
+                    replacement: catalog.air()
+                }],
+                "{key}"
+            );
+            let stone = catalog
+                .resolve("minecraft:stone", &BTreeMap::new())
+                .unwrap();
+            let adjacent_view = |position| {
+                Some(if position == target {
+                    stone
+                } else if position == neighbor {
+                    natural
+                } else {
+                    catalog.air()
+                })
+            };
+            assert!(
+                catalog
+                    .plan_break(&adjacent_view, &interaction, target, None)
+                    .is_ok(),
+                "stone adjacent to {key}"
+            );
+        }
+        for key in [
+            "minecraft:water",
+            "minecraft:chest",
+            "minecraft:redstone_wire",
+            "minecraft:command_block",
+        ] {
+            let protected = catalog.resolve(key, &BTreeMap::new()).unwrap();
+            let protected_view = |position| {
+                Some(if position == target {
+                    protected
+                } else {
+                    catalog.air()
+                })
+            };
+            assert!(
+                catalog
+                    .plan_break(&protected_view, &interaction, target, None)
+                    .is_err(),
+                "{key}"
+            );
+        }
+    }
 }

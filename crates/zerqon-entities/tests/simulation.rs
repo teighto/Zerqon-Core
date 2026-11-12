@@ -92,6 +92,37 @@ fn damage_updates_health_then_removes_dead_entity_and_index() {
 }
 
 #[test]
+fn attacks_apply_persistent_knockback_that_survives_the_next_ai_tick() {
+    for kind in [MobKind::Pig, MobKind::Cow, MobKind::Zombie] {
+        let mut world = EntityWorld::new(7, 8).unwrap();
+        spawn(&mut world, 1, kind, [1.5, 64.0, 0.5]);
+        world.tick(&Floor, &[]);
+        let before = world.get(1).unwrap().position;
+        let untouched = world.snapshot();
+        assert!(
+            world
+                .damage_with_knockback(1, 4.0, [f64::NAN, 64.0, 0.5])
+                .is_err()
+        );
+        assert_eq!(world.snapshot(), untouched);
+        world
+            .damage_with_knockback(1, 4.0, [before[0] - 1.0, before[1], before[2]])
+            .unwrap();
+        let damaged = world.get(1).unwrap();
+        assert_eq!(damaged.health, kind.maximum_health() - 4.0);
+        assert!(damaged.velocity[0] > 0.3);
+        assert_eq!(damaged.velocity[1], 0.4);
+        let mut restored = EntityWorld::restore(world.snapshot(), 8).unwrap();
+        restored.tick(&Floor, &[]);
+        assert!(
+            restored.get(1).unwrap().position[0] > before[0] + 0.3,
+            "AI erased the knockback"
+        );
+        assert!(restored.get(1).unwrap().position[1] > before[1]);
+    }
+}
+
+#[test]
 fn zombie_pursues_only_attackable_players_and_respects_attack_cooldown() {
     let mut world = EntityWorld::new(4, 8).unwrap();
     spawn(&mut world, 1, MobKind::Zombie, [0.0, 64.0, 0.0]);

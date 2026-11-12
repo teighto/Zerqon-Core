@@ -46,8 +46,12 @@ Before running managed Java, Zerqon checks the JRE files against the sizes and S
 | `view-distance` | `4` | Chunk view radius, 1–32 |
 | `network-compression-threshold` | `256` | Compression threshold in bytes; `-1` disables it |
 | `level-name` | `world` | World subdirectory name; path separators are rejected |
+| `level-type` | `normal` in newly created files | `normal` or `flat`; older files without this key retain `flat` |
+| `level-seed` | `0` | Unsigned 64-bit seed, 0–18,446,744,073,709,551,615 |
 
 The parser accepts `key=value` lines and `#`/`!` comments. Unknown and duplicate keys are rejected. It does not support Java `.properties` escapes or continued lines. Configuration files are limited to 1 MiB.
+
+`level-type=normal` selects the native Rust terrain generator: hills, mountains, oceans, rivers, climate biomes, caves, ores and trees. It is a custom initial generator; the same seed does not reproduce a vanilla Minecraft world. A normal world keeps its original generator type and seed; changing them is rejected. To create normal terrain alongside an existing flat or imported world, choose a new unused `level-name`. Existing worlds are preserved and are not converted. Keep `normal-generator.json` and `IMPORT_INCOMPLETE` with the world backup; the latter also prevents older builds from extending it with flat chunks.
 
 ## server.settings
 
@@ -120,15 +124,25 @@ Use `help`, `version`, `tps`, `plugins` and `stop` in the console. `op NAME` gra
 
 `/give PLAYER minecraft:ITEM [COUNT]` gives items to a connected player and requires operator level 2. The default count is 1; the limit is 4,096. If the full amount does not fit, nothing is added. Inventories and player modes are saved by UUID in the world's `chunks.redb` database.
 
-The personal 2×2 crafting grid supports 478 ordinary shaped and shapeless recipes. Left/right pickup, shift crafting, hotbar swaps and recipe remainders use server-owned inventory state. The result slot is a preview and is recalculated after reconnect; it is not saved as an extra item. Closing the window or disconnecting returns the grid and cursor to the inventory before Quit. If that would require dropping items into the world, the items stay saved in the grid/cursor for the next session. Crafting actions that require drops are rejected without consuming ingredients. World item drops, special recipes, recipe-book actions and other containers still need work.
+`/speed LEVEL [PLAYER]` changes flight speed through the temporary built-in Rust plugin `ZerqonSpeed`. It requires operator level 2 and accepts levels 1–10; level 1 restores the vanilla speed of 0.05. Without a player name it targets the sender; the console must supply a connected player. Flight permission follows the game mode. The speed resets on reconnect.
+
+The personal 2×2 grid supports 478 ordinary recipes, shift crafting, hotbar swaps and ingredient remainders. Closing the menu or disconnecting drops any overflow as persistent world items in the same transaction as the inventory change. Special recipes, containers and 3×3 crafting remain unfinished.
 
 An older `playerdata/UUID.zinv` is imported on that player's first login. Its grid, cursor and item components are preserved, and its mode remains Creative. The original file stays unchanged; later logins use the database. A legacy file with a nonempty saved result slot is rejected and preserved for explicit recovery. Do not delete that file to bypass the check.
 
-Creative is the default for new players. In Creative, ordinary blocks, logs, dry slabs and stairs can be placed and broken, including stair connections across chunk boundaries. Placement checks the held item, range and entity collisions. `gamemode=survival` enables ordinary inventory actions and personal crafting from items supplied with `/give`; it refuses creative item creation and flight requests. Mining, Survival placement, loot, health, hunger and respawn are still being developed. Runtime `/gamemode` changes, fluids, random block ticks and interactive containers are not implemented yet. See [world storage](WORLD_STORAGE.md) before restoring a backup or moving to an older build.
+Creative is the default for new players. In Creative, ordinary blocks, logs, dry slabs and stairs can be placed and broken, including stair connections across chunk boundaries. Placement checks the held item, range and entity collisions. `gamemode=survival` enables ordinary inventory actions and personal crafting from items supplied with `/give`; it refuses creative item creation and flight requests. Basic Survival mining and placement are available. Hunger and full loot rules are still being developed. TNT damage, death and respawn work during the player session; health is not saved across reconnects yet. Runtime `/gamemode` changes, fluids, random block ticks and interactive containers are not implemented yet. See [world storage](WORLD_STORAGE.md) before restoring a backup or moving to an older build.
 
 `/tps` reports the recent coordinator tick rate and average measured tick work. The built-in Rust CPU profiler uses `/spark profiler start` and `/spark profiler stop` on Linux. It saves reports in `profiles/`; see [Profiling](PROFILING.md). The append-only `logs/latest.log` is not automatically rotated. `RUST_LOG` selects log verbosity, for example `info` or `zerqon=debug`.
 
 ## Русский
+
+| Генерация в `server.properties` | Значение | Назначение |
+|---|---|---|
+| `level-name` | `world` | Подкаталог мира; для нового мира укажите ещё не занятое имя |
+| `level-type` | `normal` в новых файлах | `normal` или `flat`; отсутствие ключа в старом конфиге сохраняет `flat` |
+| `level-seed` | `0` | Целое число без знака от 0 до 18 446 744 073 709 551 615 |
+
+`normal` включает нативный Rust-генератор холмов, гор, океанов, рек, климатических биомов, пещер, руд и деревьев. Это первоначальный собственный генератор: совпадение seed не воспроизводит мир vanilla Minecraft. Тип генератора и seed уже созданного обычного мира менять нельзя. Для перехода с существующего плоского или импортированного мира выберите новый свободный `level-name`; прежний мир сохраняется без преобразования. Вместе с резервной копией мира сохраняйте `normal-generator.json` и `IMPORT_INCOMPLETE`: последний также защищает мир от генерации плоских чанков старой сборкой.
 
 При быстром повторном входе сервер ждёт завершения `Quit` и очистки прежней закрывающейся сессии. На это отведено `connection_timeout_seconds`; дополнительный слот игрока во время ожидания не занят. Если прежнее соединение ещё активно, повторный вход отклоняется.
 
@@ -152,11 +166,11 @@ Linux-дистрибутив собирается для `x86_64-unknown-linux-m
 
 Команда `/give ИГРОК minecraft:ПРЕДМЕТ [КОЛИЧЕСТВО]` выдаёт предметы подключённому игроку; нужен второй уровень оператора. По умолчанию выдаётся один предмет, максимум 4 096. Если места не хватает на всё количество, команда ничего не добавляет. Инвентарь и режим игрока сохраняются по UUID в `world/chunks.redb`.
 
-В личной сетке 2×2 работают 478 обычных рецептов. Сервер проверяет взятие результата, Shift-крафт, обмен с хотбаром и остатки ингредиентов. Результат в выходном слоте вычисляется заново после входа и не сохраняется как дополнительный предмет. При закрытии окна или отключении сетка и курсор возвращаются в инвентарь до события Quit. Если для этого пришлось бы выбросить предметы в мир, они остаются сохранёнными в сетке и на курсоре. Крафт, требующий выбрасывания, отклоняется без расхода ингредиентов. Предметы в мире, специальные рецепты, книга рецептов и другие контейнеры ещё дорабатываются.
+В личной сетке 2×2 работают 478 обычных рецептов. Поддержаны Shift-крафт, обмен с хотбаром и остатки ингредиентов. Результат пересчитывается после входа. При переполнении закрытие меню и выход создают предметы в мире; они сохраняются вместе с изменением инвентаря. Специальные рецепты, контейнеры и крафт 3×3 ещё не реализованы.
 
 Старый файл `playerdata/UUID.zinv` переносится в базу при первом входе игрока. Сетка, курсор и компоненты предметов сохраняются; режим остаётся творческим. Исходный файл не меняется, следующие входы используют запись в базе. Если старый файл содержит предмет в выходном слоте крафта, загрузка останавливается для отдельного восстановления. Удалять его для обхода проверки не нужно.
 
-Новые игроки по умолчанию входят в творческом режиме. В нём можно ставить и ломать обычные блоки, брёвна, сухие плиты и лестницы. Сервер проверяет предмет в руке, расстояние и пересечение с игроками и мобами; соединения лестниц обновляются и на границах чанков. Настройка `gamemode=survival` в `server.properties` выбирает режим выживания для новых игроков, уже сохранённые игроки сохраняют свой режим. В Survival работают инвентарь и личный крафт из предметов, выданных через `/give`; создание предметов творческими пакетами и запросы полёта запрещены. Добыча, установка блоков в Survival, лут, здоровье, голод и возрождение ещё дорабатываются. Команда `/gamemode`, жидкости, случайные тики блоков и контейнеры пока не реализованы. Правила переноса и восстановления описаны в [документации хранилища](WORLD_STORAGE.md).
+Новые игроки по умолчанию входят в Creative. `gamemode=survival` в `server.properties` задаёт Survival для новых игроков; ранее сохранённый режим не меняется. Работают добыча и установка обычных блоков, расход предметов, износ инструмента, крафт 2×2, выбрасывание и подбор. Сервер проверяет режим, дистанцию и владение предметами. Голод, контейнеры, крафт 3×3, полная симуляция жидкостей и случайные тики ещё в работе.
 
 `cargo run --release -- --init` создаёт конфиги и завершает работу, `cargo run --release -- --check-config` проверяет значения без запуска сети. Настройки применяются после перезапуска. `server.properties` содержит адрес, порт, MOTD, онлайн-проверку аккаунтов и параметры Minecraft. `server.settings` — TOML с настройками потоков, кеша, очередей и плагинов. Неизвестные и повторяющиеся ключи отвергаются.
 
@@ -171,3 +185,64 @@ Java обычно скачивается в `.cache/java/`. Уже устано�
 Проверка обновлений задаётся `update_check = true` и интервалом `update_check_interval_hours = 6` (1–168 часов). Она обращается к публичному GitHub без токена и не скачивает программы. О новой стабильной версии консоль и операторы получают одно английское уведомление со ссылкой; для игрока повторное уведомление возможно в новом сеансе или при появлении более новой версии. `update_check = false` полностью отключает запросы, а диагностический режим статуса их не запускает.
 
 Команды консоли: `help`, `version`, `tps`, `plugins`, `op NAME`, `deop NAME`, `setblock X Y Z STATE-ID`, `stop`. Операторы определяются по UUID. Для `op NAME` игрок должен быть на сервере; `deop` принимает имя или UUID. Для команд ядра учитывается уровень оператора. Полный API прав ещё дорабатывается. `/tpsbar` отображается в игре. Rust-профилировщик работает на Linux и сохраняет отчёты spark в `profiles/`. Журнал `logs/latest.log` дописывается и автоматически не ротируется.
+
+`/speed УРОВЕНЬ [ИГРОК]` — команда временного встроенного Rust-плагина `ZerqonSpeed`. Нужен уровень оператора 2; допустимы значения 1–10. Значение 1 возвращает стандартную скорость полёта 0,05. Без имени команда действует на отправителя, а из консоли нужно указать подключённого игрока. Право полёта зависит от режима игры. При переподключении скорость сбрасывается.
+
+## ZerqonEdit
+
+TNT can also be lit by right-clicking it with flint and steel or a fire charge in either hand. Survival uses one durability point or one fire charge; Creative does not consume either. The TNT block and held-item change are saved together. Creative breaking supports natural terrain such as sand, gravel and leaves, including beside other natural blocks or TNT. Falling sand, leaf decay and general fire placement remain unfinished.
+
+TNT можно поджечь правой кнопкой зажигалкой или огненным зарядом в любой руке. В Survival тратится одна единица прочности либо один огненный заряд; в Creative расхода нет. Изменение блока и предмета сохраняется одной операцией. В Creative исправлено ломание природных блоков — в том числе песка, гравия и листвы рядом с другими природными блоками или TNT. Падение песка, гниение листвы и обычная установка огня ещё не реализованы.
+
+The built-in Rust plugin provides `//pos1 [x y z]`, `//pos2 [x y z]`, `//size`, `//set block`, `//replace from-block to-block` and `//desel`. It requires operator level 2. Without coordinates, a corner uses the player's current position. Names such as `stone`, `tnt` and `minecraft:oak_log` use their default block states. Edits are atomic and limited to 65,536 blocks across 16 chunks. Selections reset when the player disconnects. This is Zerqon's editor, not the EngineHub WorldEdit plugin; brushes, schematics and undo are not implemented.
+
+`//ignite` primes TNT in the selection, with a four-second fuse at 20 TPS and a limit of 4,096 active charges. `//tntstatus` reports active, ready and detonated counts. `tnt_explosions_per_tick = 32` in `server.settings` controls the work per tick (1–4096); compare the backlog and total completion time alongside TPS. `//tntcancel` removes pending charges. Primed charges are not restored as blocks and do not survive shutdown.
+
+TNT now falls under gravity, collides with static block shapes and explodes at its current position. Blasts persist terrain changes and trigger nearby TNT. Mobs and Survival players receive damage and knockback based on distance and exposure through the pre-blast terrain; Creative players are immune. Survival players can respawn after death, with three seconds of protection. Mob damage persists; player health is currently session-only and resets on reconnect. Fluid currents, special slime restitution, armor/enchantment reductions, drops, redstone ignition and vanilla block-resistance rules remain unfinished. Unsupported or unavailable collision geometry pauses TNT and its fuse; `//tntstatus` includes the paused count. This is not a full vanilla TNT performance comparison.
+
+Встроенный Rust-плагин поддерживает `//pos1 [x y z]`, `//pos2 [x y z]`, `//size`, `//set блок`, `//replace исходный-блок новый-блок` и `//desel`. Нужен уровень оператора 2. Без координат угол берётся из текущего положения игрока. Имена блоков принимаются с `minecraft:` или без него. За одну операцию можно изменить до 65 536 блоков в 16 чанках; запись атомарная. Выделение сбрасывается при выходе. Это собственный редактор Zerqon, а не EngineHub WorldEdit: кистей, схем и отмены пока нет.
+
+Пример области из 4096 TNT / example with 4096 TNT:
+
+```text
+//pos1 0 100 0
+//pos2 15 115 15
+//set tnt
+//ignite
+//tntstatus
+```
+
+`//ignite` поджигает TNT в выделении, запал — 4 секунды при 20 TPS. Одновременно допускается 4096 зарядов. В `server.settings` настройка `tnt_explosions_per_tick = 32` задаёт число взрывов за тик (1–4096). При замере смотрите и TPS, и очередь `ready`, и время завершения всей нагрузки. `//tntcancel` убирает ожидающие заряды, не возвращая их блоки. При остановке сервера запущенные заряды не сохраняются.
+
+TNT падает под действием гравитации, сталкивается со статическими формами блоков и взрывается в текущей точке. Взрыв сохраняет разрушения и запускает соседние TNT. Мобы и игроки Survival получают урон и отбрасывание с учётом расстояния и укрытий до разрушения блоков; Creative защищён. После смерти в Survival работает возрождение с защитой на три секунды. Урон мобам сохраняется; здоровье игрока пока действует в пределах сеанса и сбрасывается при переподключении. Течения жидкости, особый отскок от слизи, броня и чары, дроп, редстоун-поджиг и точные правила прочности блоков vanilla ещё не реализованы. При недоступной или неподдерживаемой форме столкновения TNT и запал приостанавливаются; число таких зарядов видно в `//tntstatus`. Это ещё не полное воспроизведение TNT vanilla.
+
+
+## Gameplay framework / Игровой каркас
+
+Survival players can mine ordinary terrain and place blocks. Mining uses the official 26.3 hardness and tool tags; the server checks elapsed digging time, range, held item and current block before committing. Mining creates item entities with a pickup delay. A full inventory leaves the items in the world. Tools lose durability, and placement consumes one held block. Fortune, Silk Touch and complete loot tables are not implemented.
+
+Pigs and cows follow players holding their food within ten blocks: wheat for cows, carrots/potatoes/beetroots for pigs. Right-click an eligible adult with its food to enter love mode for 30 seconds. Two animals of the same species approach each other and breed after three seconds of courtship when within three blocks. Survival consumes one food item; Creative does not. Parents then have a five-minute cooldown. Babies take 20 minutes of simulated time to grow; feeding accelerates growth using the 26.3 formula. Feeding does not heal animals. Zombies pursue and attack living Survival players; Creative players are ignored. Navigation routes around static obstacles, jumps one-block steps and avoids large drops. Animals flee after being hit and separate when crowded. Unloaded or unsupported terrain stops movement. Path searches are bounded; this is not a full vanilla AI port.
+
+В Survival можно добывать обычные блоки и строить. Время добычи и требования к инструменту взяты из данных 26.3. Сервер проверяет время, дистанцию, предмет в руке и состояние блока. После добычи предмет появляется в мире с задержкой подбора. Если инвентарь полон, предмет остаётся лежать. Инструмент изнашивается, при установке расходуется один блок. Fortune, Silk Touch и полные таблицы добычи пока не реализованы.
+
+Коровы идут за пшеницей, свиньи — за морковью, картошкой или свёклой в радиусе десяти блоков. ПКМ с кормом включает готовность взрослого животного к размножению на 30 секунд. Два животных одного вида подходят друг к другу; после трёх секунд ухаживания в пределах трёх блоков появляется детёныш. В Survival расходуется один предмет, в Creative расхода нет. У родителей начинается пауза на пять минут. Детёныш растёт 20 минут активной симуляции; корм ускоряет рост по формуле 26.3. Здоровье корм больше не восстанавливает. Зомби преследуют и атакуют живых игроков Survival, но игнорируют Creative. Мобы обходят статические препятствия, перепрыгивают ступень высотой в блок и избегают больших обрывов. Животные убегают после удара и расходятся при скоплении. На недоступной или неподдерживаемой геометрии движение останавливается. Полный перенос ванильного AI, голод, контейнеры и крафт 3×3 остаются в работе.
+
+
+Animal snapshots now use schema 2, storing age, forced age and love time. Existing schema 1 adults load automatically. Back up `world/entities.zqe` before updating; older Zerqon builds cannot read newly saved animal snapshots. Timers stop when the entities are not simulated. Baby collision boxes and navigation use half size. Breeding experience orbs and inherited variants remain unfinished.
+
+Состояние животных теперь сохраняется в схеме 2: возраст, ускоренный кормлением рост и время готовности к размножению. Старые взрослые животные из схемы 1 загружаются автоматически. Перед обновлением сохраните копию `world/entities.zqe`: старые сборки Zerqon не прочитают обновлённый файл. Когда сущности не симулируются, таймеры стоят. Размер коллизии и навигация детёнышей уменьшены вдвое. Сферы опыта за размножение и наследование вариантов животных ещё не реализованы.
+
+
+## Building and items / Строительство и предметы
+
+Ordinary building no longer rejects an edit just because water, a chest or another unrelated block is next to it. Wooden/copper doors, trapdoors and fence gates open by right-click; Shift uses the held block instead. Doors place and break both halves together. Ground/wall torches and waterlogged slabs/stairs have dedicated placement rules. Inventory-bearing blocks and full redstone/neighbor simulation remain unfinished.
+
+Q drops one held item; Ctrl+Q drops the stack. Inventory throws, crafting overflow and disconnect overflow create real item entities. Items fall, collide, merge compatible stacks and can be picked up by another player. Thrower attribution does not make an item private. Pickup, partial pickup, merges and deletion are durable. Item stacks, motion, remaining pickup delay and age survive restart. Despawn is after 6,000 simulated ticks; unloaded terrain pauses simulation. Ownership/count changes are saved immediately; motion is checkpointed every 100 ticks and at graceful shutdown.
+
+`max_item_entities = 2048` and `item_memory_mib = 32` in `server.settings` bound active items and their accounted payload memory. These are not a total process-memory limit. Hitting the cap rejects the creating action without spending its items. `/tps` also reports item count. Basic water/lava behavior is present; fluid currents, all special block effects and explosion loot remain incomplete.
+
+Установка больше не отклоняется только из-за воды, сундука или другого соседнего блока. Деревянные/медные двери, люки и калитки открываются правой кнопкой. Shift позволяет вместо открытия поставить блок рядом. Обе половины двери ставятся и ломаются вместе. Добавлены правила установки обычных/настенных факелов и плит/лестниц в воде. Интерфейсы контейнеров, полная редстоун-схема и все обновления соседей ещё не готовы.
+
+Q выбрасывает один предмет, Ctrl+Q — стак. Выбрасывание из инвентаря, переполнение при крафте и выходе создают настоящие предметы в мире. Они падают, сталкиваются с блоками, объединяются и подбираются, в том числе другими игроками. Подбор, остаток после частичного подбора и удаление сохраняются одной операцией с инвентарём. Стак, движение, задержка подбора и возраст переживают перезапуск. Исчезновение — через 6 000 тиков симуляции. Количество и владелец сохраняются сразу; положение — раз в 100 тиков и при штатной остановке.
+
+В `server.settings` параметры `max_item_entities = 2048` и `item_memory_mib = 32` ограничивают число предметов и учитываемую память их записей. Это не ограничение всей памяти процесса. При достижении лимита создающее предметы действие отклоняется без расхода вещей. `/tps` показывает количество предметов. Течения, все особые эффекты блоков и добыча после взрывов ещё требуют работы.

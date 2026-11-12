@@ -2,6 +2,10 @@
 
 Bounded pig, cow and zombie simulation with persisted identities and movement. Terrain collision uses the static boxes from `zerqon-blocks`, including slabs, stairs and shapes that extend outside their block cell.
 
+Animal feeding uses `feed`: an adult enters love mode for 600 ticks, while feeding a baby advances its age by the original 26.3 feeding formula. It does not heal health. After 60 courtship ticks and within three blocks, `breeding_pairs` returns eligible pairs. The caller allocates a unique child identity, calls `breed` and persists the child and both parents before publishing changes. A new child starts at age -24,000; parents enter a 6,000-tick cooldown. Babies use half-size collision/navigation and emit age metadata when they grow up.
+
+Snapshot schema 2 saves signed age, forced age and love time. Schema 1 adult snapshots still load; older server versions reject newly saved schema 2. Timers advance during entity simulation, not while the server is stopped. Breeding experience orbs and inherited animal variants are not implemented.
+
 Call `EntityWorld::tick` once per server tick at 20 Hz. Positions describe the center of the feet; velocities are blocks per tick. The caller allocates globally unique positive entity IDs and UUIDs and supplies a synchronous `WorldQuery` view. `spawn` validates identity, capacity and space. `tick` returns changes for the caller to transmit. `AttackPlayer` requests damage; the caller owns player health. Mob damage goes through `damage`, which returns health and removal changes.
 
 Natural spawning is opt-in through `try_natural_spawn`. Each call tries at most eight locations, respects the cap and distance from players, and allocates an identity after finding supported space. `hostile_allowed` is a caller policy, not a daylight or light-level calculation. `nearby` uses 16-block buckets and accepts radii up to 128 blocks.

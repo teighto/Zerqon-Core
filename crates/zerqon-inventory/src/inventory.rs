@@ -63,6 +63,14 @@ pub struct InventoryEffects {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PickupResult {
+    pub inserted: u8,
+    pub discarded: u8,
+    pub remainder: Slot,
+    pub effects: Option<InventoryEffects>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct DragState {
     kind: u8,
     slots: BTreeSet<usize>,
@@ -102,6 +110,59 @@ impl Default for PlayerInventory {
 }
 
 impl PlayerInventory {
+    /// Insert an existing world stack. The caller commits this inventory and
+    /// the returned remainder together; Creative overflow is counted explicitly.
+    pub fn insert_pickup(
+        &mut self,
+        catalog: &ItemCatalog,
+        incoming: &ItemStack,
+        policy: InventoryPolicy,
+    ) -> Result<PickupResult, InventoryError> {
+        if !policy.can_interact {
+            return Err(InventoryError::InteractionDenied);
+        }
+        self.validate_real_contents(catalog)?;
+        catalog.validate_stack(incoming)?;
+        let mut next = self.clone();
+        let remaining = next.insert_player_stack(catalog, incoming)?;
+        let inserted = incoming.count() - remaining;
+        let discarded = if policy.creative { remaining } else { 0 };
+        let remainder = quantity(incoming, remaining - discarded)?;
+        let effects = (inserted != 0).then(|| self.commit(next, Vec::new()));
+        Ok(PickupResult {
+            inserted,
+            discarded,
+            remainder,
+            effects,
+        })
+    }
+
+    /// Remove one or all items from the selected hand for a server-owned drop.
+    /// The cursor and any active menu drag are independent of this action.
+    pub fn drop_selected(
+        &mut self,
+        catalog: &ItemCatalog,
+        all: bool,
+        policy: InventoryPolicy,
+    ) -> Result<Option<InventoryEffects>, InventoryError> {
+        if !policy.can_interact {
+            return Err(InventoryError::InteractionDenied);
+        }
+        self.validate_real_contents(catalog)?;
+        let Some(selected) = self.selected_stack() else {
+            return Ok(None);
+        };
+        if !policy.allow_drops {
+            return Err(InventoryError::DroppingUnavailable);
+        }
+        let amount = if all { selected.count() } else { 1 };
+        let dropped = selected.with_count(amount)?;
+        let mut next = self.clone();
+        next.slots[36 + usize::from(self.selected)] =
+            quantity(selected, selected.count() - amount)?;
+        Ok(Some(self.commit(next, vec![dropped])))
+    }
+
     /// Apply a personal-menu action atomically, deriving slot zero from real
     /// inputs before and after the action. Predictions never supply item value.
     /// A denied drop rolls back the entire action, including earlier batches.
@@ -427,13 +488,7 @@ impl PlayerInventory {
         drops: &mut Vec<ItemStack>,
         source: ReturnSource,
     ) -> Result<(), InventoryError> {
-        let selected = 36 + usize::from(self.selected);
-        let main: Vec<_> = (36..45).chain(9..36).collect();
-        let merge: Vec<_> = std::iter::once(selected)
-            .chain(std::iter::once(45))
-            .chain(main.iter().copied().filter(|index| *index != selected))
-            .collect();
-        let remaining = self.insert_stack(catalog, &stack, &merge, &main)?;
+        let remaining = self.insert_player_stack(catalog, &stack)?;
         if remaining != 0 {
             // Original Inventory.add discards unplaceable crafting remainders
             // in Creative. Menu removal uses placeItemBackInInventory instead,
@@ -444,6 +499,26 @@ impl PlayerInventory {
             drop_stack(stack.with_count(remaining)?, policy, drops)?;
         }
         Ok(())
+    }
+
+    fn insert_player_stack(
+        &mut self,
+        catalog: &ItemCatalog,
+        stack: &ItemStack,
+    ) -> Result<u8, InventoryError> {
+        let selected = 36 + usize::from(self.selected);
+        let main: [usize; 36] =
+            std::array::from_fn(|index| if index < 9 { 36 + index } else { index });
+        let mut merge = [0; 37];
+        merge[0] = selected;
+        merge[1] = 45;
+        for (destination, index) in merge[2..]
+            .iter_mut()
+            .zip(main.into_iter().filter(|index| *index != selected))
+        {
+            *destination = index;
+        }
+        self.insert_stack(catalog, stack, &merge, &main)
     }
 
     pub fn new() -> Self {

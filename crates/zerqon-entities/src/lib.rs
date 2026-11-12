@@ -4,8 +4,11 @@ use std::{
     f64::consts::FRAC_1_SQRT_2,
 };
 use uuid::Uuid;
+mod navigation;
 mod physics;
-pub use physics::{Movement, PhysicsError, body_bounds, clip_motion, clip_shapes, move_mob};
+pub use physics::{
+    Movement, PhysicsError, body_bounds, clip_motion, clip_shapes, move_mob, scaled_bounds,
+};
 
 pub const TICKS_PER_SECOND: u32 = 20;
 const MAX_ENTITIES: usize = 10_000;
@@ -62,6 +65,27 @@ pub struct Mob {
     pub wander_target: [f64; 2],
     pub wander_ticks: u16,
     pub attack_cooldown: u16,
+    #[serde(default)]
+    pub age: i32,
+    #[serde(default)]
+    pub forced_age: i32,
+    #[serde(default)]
+    pub love_ticks: u16,
+}
+
+impl Mob {
+    pub fn is_baby(&self) -> bool {
+        self.age < 0
+    }
+    pub fn scale(&self) -> f64 {
+        if self.is_baby() { 0.5 } else { 1.0 }
+    }
+    pub fn dimensions(&self) -> [f64; 2] {
+        self.kind.dimensions().map(|value| value * self.scale())
+    }
+    pub fn can_feed(&self) -> bool {
+        self.kind != MobKind::Zombie && (self.age < 0 || (self.age == 0 && self.love_ticks == 0))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -80,6 +104,9 @@ pub struct PlayerTarget {
 }
 
 pub trait WorldQuery {
+    fn water_at(&self, _x: i32, _y: i32, _z: i32) -> bool {
+        false
+    }
     fn block_solid(&self, x: i32, y: i32, z: i32) -> bool;
     fn block_collision(&self, x: i32, y: i32, z: i32) -> BlockCollision<'_> {
         if self.block_solid(x, y, z) {
@@ -131,6 +158,16 @@ pub enum EntityChange {
         id: i32,
         health: f32,
     },
+    Love {
+        id: i32,
+    },
+    AgeChanged {
+        id: i32,
+        baby: bool,
+    },
+    GrowthFed {
+        id: i32,
+    },
     Removed {
         id: i32,
         uuid: Uuid,
@@ -168,6 +205,7 @@ pub struct EntityWorld {
     buckets: BTreeMap<(i32, i32), BTreeSet<i32>>,
     physics: physics::Scratch,
     blocked: BTreeMap<i32, PhysicsError>,
+    brains: BTreeMap<i32, navigation::Brain>,
 }
 impl EntityWorld {
     pub fn new(seed: u64, capacity: usize) -> Result<Self, EntityError> {
@@ -183,6 +221,7 @@ impl EntityWorld {
             buckets: BTreeMap::new(),
             physics: physics::Scratch::default(),
             blocked: BTreeMap::new(),
+            brains: BTreeMap::new(),
         })
     }
     pub fn spawn(
@@ -218,16 +257,75 @@ impl EntityWorld {
             wander_target: [position[0], position[2]],
             wander_ticks: 0,
             attack_cooldown: 0,
+            age: 0,
+            forced_age: 0,
+            love_ticks: 0,
         };
         self.insert(mob.clone());
         Ok(EntityChange::Spawned(mob))
     }
     pub fn tick(&mut self, world: &impl WorldQuery, players: &[PlayerTarget]) -> Vec<EntityChange> {
+        self.tick_with_food(world, players, &[])
+    }
+
+    pub fn tick_with_food(
+        &mut self,
+        world: &impl WorldQuery,
+        players: &[PlayerTarget],
+        food: &[(MobKind, PlayerTarget)],
+    ) -> Vec<EntityChange> {
         self.tick = self.tick.wrapping_add(1);
         let targets = player_index(players);
         let mut changes = Vec::new();
         let mut void = Vec::new();
         let mut moved_buckets = Vec::new();
+        let mut path_budget = 8usize;
+        let mut neighbors = BTreeMap::<(i32, i32), Vec<(i32, [f64; 3])>>::new();
+        let mut mates = BTreeMap::<i32, (i32, [f64; 3])>::new();
+        let mut parents = BTreeMap::<i32, [f64; 3]>::new();
+        for mob in self
+            .entities
+            .values()
+            .filter(|mob| mob.is_baby() || (mob.age == 0 && mob.love_ticks > 0))
+        {
+            let at = bucket(mob.position);
+            let mut best: Option<(i32, [f64; 3], f64)> = None;
+            for x in at.0 - 1..=at.0 + 1 {
+                for z in at.1 - 1..=at.1 + 1 {
+                    if let Some(ids) = self.buckets.get(&(x, z)) {
+                        for id in ids {
+                            let other = &self.entities[id];
+                            if other.id == mob.id
+                                || other.kind != mob.kind
+                                || other.is_baby()
+                                || (!mob.is_baby() && (other.age != 0 || other.love_ticks == 0))
+                            {
+                                continue;
+                            }
+                            let distance = distance_squared(mob.position, other.position);
+                            if distance < 64.0
+                                && best.is_none_or(|(_, _, previous)| distance < previous)
+                            {
+                                best = Some((other.id, other.position, distance));
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some((id, position, _)) = best {
+                if mob.is_baby() {
+                    parents.insert(mob.id, position);
+                } else {
+                    mates.insert(mob.id, (id, position));
+                }
+            }
+        }
+        for mob in self.entities.values() {
+            neighbors
+                .entry(bucket(mob.position))
+                .or_default()
+                .push((mob.id, mob.position));
+        }
         for mob in self.entities.values_mut() {
             if !world.loaded_at(
                 mob.position[0].floor() as i32,
@@ -240,16 +338,78 @@ impl EntityWorld {
                 continue;
             }
             let old = (mob.position, mob.yaw, mob.on_ground);
+            let was_baby = mob.is_baby();
+            if mob.age < 0 {
+                mob.age += 1;
+            } else if mob.age > 0 {
+                mob.age -= 1;
+            }
+            if was_baby && !mob.is_baby() {
+                changes.push(EntityChange::AgeChanged {
+                    id: mob.id,
+                    baby: false,
+                });
+            }
+            if mob.age != 0 {
+                mob.love_ticks = 0;
+            } else if mob.love_ticks > 0 {
+                mob.love_ticks -= 1;
+                if mob.love_ticks > 0 && mob.love_ticks.is_multiple_of(10) {
+                    changes.push(EntityChange::Love { id: mob.id });
+                }
+            }
             let before = mob.clone();
             let random_before = self.random_state;
+            let brain = self.brains.entry(mob.id).or_default();
             mob.attack_cooldown = mob.attack_cooldown.saturating_sub(1);
             let target = if mob.kind == MobKind::Zombie {
                 nearest_player(mob.position, &targets)
             } else {
-                None
+                food.iter()
+                    .filter(|(kind, player)| {
+                        *kind == mob.kind && distance_squared(mob.position, player.position) < 100.0
+                    })
+                    .min_by(|(_, a), (_, b)| {
+                        distance_squared(mob.position, a.position)
+                            .total_cmp(&distance_squared(mob.position, b.position))
+                    })
+                    .map(|(_, player)| player)
             };
-            let goal = if let Some(player) = target {
-                [player.position[0], player.position[2]]
+            let panic = self.tick < brain.panic_until;
+            let mate = mates
+                .get(&mob.id)
+                .filter(|_| mob.age == 0 && mob.love_ticks > 0 && !panic);
+            if let Some(&(partner, _)) = mate {
+                if brain.partner == Some(partner) {
+                    brain.courtship = brain.courtship.saturating_add(1).min(60);
+                } else {
+                    brain.partner = Some(partner);
+                    brain.courtship = 1;
+                }
+            } else {
+                brain.partner = None;
+                brain.courtship = 0;
+            }
+            let animal_goal = mate.map(|(_, position)| *position).or_else(|| {
+                if target.is_none() {
+                    parents.get(&mob.id).copied()
+                } else {
+                    None
+                }
+            });
+            let goal = if panic {
+                let dx = mob.position[0] - brain.flee_from[0];
+                let dz = mob.position[2] - brain.flee_from[2];
+                let length = dx.hypot(dz).max(0.1);
+                [
+                    mob.position[0] + dx / length * 6.0,
+                    mob.position[1],
+                    mob.position[2] + dz / length * 6.0,
+                ]
+            } else if let Some(position) = animal_goal {
+                position
+            } else if let Some(player) = target {
+                player.position
             } else {
                 if mob.wander_ticks == 0 || distance_xz(mob.position, mob.wander_target) < 0.2 {
                     let direction = (random(&mut self.random_state) % 8) as usize;
@@ -260,36 +420,123 @@ impl EntityWorld {
                         (mob.position[2] + z * distance).clamp(-BORDER, BORDER),
                     ];
                     mob.wander_ticks = 60 + (random(&mut self.random_state) % 60) as u16;
+                    if random(&mut self.random_state).is_multiple_of(3) {
+                        brain.rest_until = self.tick + 20 + (random(&mut self.random_state) % 40);
+                    }
                 }
                 mob.wander_ticks = mob.wander_ticks.saturating_sub(1);
-                mob.wander_target
+                [mob.wander_target[0], mob.position[1], mob.wander_target[1]]
             };
-            let dx = goal[0] - mob.position[0];
-            let dz = goal[1] - mob.position[2];
+            let goal_cell = [
+                goal[0].floor() as i32,
+                goal[1].floor() as i32,
+                goal[2].floor() as i32,
+            ];
+            if path_budget > 0
+                && self.tick >= brain.next_path
+                && (brain.goal != Some(goal_cell) || brain.path.is_empty())
+            {
+                brain.path = navigation::route(world, mob.kind, mob.scale(), mob.position, goal);
+                brain.goal = Some(goal_cell);
+                brain.next_path = self.tick + 20 + mob.id as u64 % 10;
+                path_budget -= 1;
+            }
+            while brain.path.front().is_some_and(|point| {
+                (point[0] - mob.position[0]).hypot(point[2] - mob.position[2]) < 0.2
+                    && (point[1] - mob.position[1]).abs() < 0.6
+            }) {
+                brain.path.pop_front();
+            }
+            let waypoint = brain.path.front().copied().unwrap_or(mob.position);
+            let dx = waypoint[0] - mob.position[0];
+            let dz = waypoint[2] - mob.position[2];
             let length = dx.hypot(dz);
-            let speed = if mob.kind == MobKind::Zombie {
+            let speed = if panic {
+                0.15
+            } else if mob.kind == MobKind::Zombie {
                 0.115
             } else {
                 0.075
             };
-            let move_horizontal = length > if target.is_some() { 1.3 } else { 0.1 };
-            mob.velocity[0] = if move_horizontal {
-                dx / length * speed
-            } else {
-                0.0
-            };
-            mob.velocity[2] = if move_horizontal {
-                dz / length * speed
-            } else {
-                0.0
-            };
+            let close = !panic
+                && animal_goal.map_or_else(
+                    || {
+                        target.is_some_and(|player| {
+                            distance_squared(mob.position, player.position) < 2.25
+                        })
+                    },
+                    |position| {
+                        distance_squared(mob.position, position)
+                            < if mob.is_baby() { 9.0 } else { 2.25 }
+                    },
+                );
+            let move_horizontal = length > 0.05
+                && !close
+                && (panic
+                    || target.is_some()
+                    || animal_goal.is_some()
+                    || self.tick >= brain.rest_until);
+            // Preserve a stronger external impulse instead of erasing it with
+            // this simple velocity-driven wander/target controller.
+            let knockback = mob.velocity[0].hypot(mob.velocity[2]) > speed * 1.01;
+            if !knockback {
+                mob.velocity[0] = if move_horizontal {
+                    dx / length * speed
+                } else {
+                    0.0
+                };
+                mob.velocity[2] = if move_horizontal {
+                    dz / length * speed
+                } else {
+                    0.0
+                };
+            }
             if move_horizontal {
                 mob.yaw = (-dx).atan2(dz).to_degrees() as f32;
             }
+            if !knockback {
+                let at = bucket(mob.position);
+                for x in at.0 - 1..=at.0 + 1 {
+                    for z in at.1 - 1..=at.1 + 1 {
+                        if let Some(near) = neighbors.get(&(x, z)) {
+                            for &(id, position) in near {
+                                if id == mob.id || (position[1] - mob.position[1]).abs() > 1.5 {
+                                    continue;
+                                }
+                                let dx = mob.position[0] - position[0];
+                                let dz = mob.position[2] - position[2];
+                                let distance = dx.hypot(dz);
+                                if distance < 0.9 {
+                                    let [x, z] = if distance > 0.01 {
+                                        [dx / distance, dz / distance]
+                                    } else {
+                                        DIRECTIONS[mob.id as usize % 8]
+                                    };
+                                    mob.velocity[0] += x * 0.025;
+                                    mob.velocity[2] += z * 0.025;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if mob.on_ground && move_horizontal && waypoint[1] > mob.position[1] + 0.6 {
+                mob.velocity[1] = 0.42;
+            }
+            if world.water_at(
+                mob.position[0].floor() as i32,
+                (mob.position[1] + 0.4).floor() as i32,
+                mob.position[2].floor() as i32,
+            ) {
+                mob.velocity[1] = (mob.velocity[1] + 0.12).min(0.22);
+                mob.velocity[0] *= 0.6;
+                mob.velocity[2] *= 0.6;
+            }
             mob.velocity[1] = (mob.velocity[1] - 0.08).max(-3.92);
-            match physics::move_with_scratch(
+            match physics::move_scaled_with_scratch(
                 mob.position,
                 mob.kind,
+                mob.scale(),
                 mob.velocity,
                 mob.on_ground,
                 world,
@@ -306,13 +553,48 @@ impl EntityWorld {
                         }
                     }
                     mob.velocity[1] *= 0.98;
+                    if knockback {
+                        mob.velocity[0] *= 0.91;
+                        mob.velocity[2] *= 0.91;
+                    }
                     if hit[0] || hit[2] {
-                        mob.wander_ticks = 0;
+                        brain.path.clear();
+                        brain.next_path = self.tick + 5;
                     }
                 }
                 Err(reason) => {
                     *mob = before;
                     self.random_state = random_before;
+                    if reason == PhysicsError::Intersecting
+                        && let Some(position) = (1..=4).find_map(|step| {
+                            let p = [
+                                mob.position[0],
+                                mob.position[1] + f64::from(step) * 0.5,
+                                mob.position[2],
+                            ];
+                            physics::move_scaled_with_scratch(
+                                p,
+                                mob.kind,
+                                mob.scale(),
+                                [0.0, 0.0, 0.0],
+                                false,
+                                world,
+                                &mut self.physics,
+                            )
+                            .ok()
+                            .map(|_| p)
+                        })
+                    {
+                        mob.position = position;
+                        mob.velocity = [0.0; 3];
+                        changes.push(EntityChange::Moved {
+                            id: mob.id,
+                            position,
+                            yaw: mob.yaw,
+                            pitch: mob.pitch,
+                            on_ground: false,
+                        });
+                    }
                     if self.blocked.insert(mob.id, reason) != Some(reason) {
                         changes.push(EntityChange::PhysicsBlocked { id: mob.id, reason });
                     }
@@ -326,9 +608,11 @@ impl EntityWorld {
                 void.push(mob.id);
                 continue;
             }
-            if let Some(player) = target {
+            if let Some(player) =
+                target.filter(|player| mob.kind == MobKind::Zombie && player.attackable)
+            {
                 let mut eye = mob.position;
-                eye[1] += mob.kind.dimensions()[1] * 0.85;
+                eye[1] += mob.dimensions()[1] * 0.85;
                 let mut target_eye = player.position;
                 target_eye[1] += 1.62;
                 if mob.attack_cooldown == 0
@@ -370,12 +654,203 @@ impl EntityWorld {
         }
         let mob = self.entities.get_mut(&id).ok_or(EntityError::Missing)?;
         mob.health = (mob.health - amount).max(0.0);
+        mob.love_ticks = 0;
         let mut changes = vec![EntityChange::Health {
             id,
             health: mob.health,
         }];
         if mob.health == 0.0 {
             changes.push(self.remove_with_reason(id, RemovalReason::Killed)?);
+        }
+        Ok(changes)
+    }
+    pub fn feed(&mut self, id: i32) -> Result<Vec<EntityChange>, EntityError> {
+        let mob = self.entities.get_mut(&id).ok_or(EntityError::Missing)?;
+        if !mob.can_feed() {
+            return Err(EntityError::Invalid("animal cannot eat now"));
+        }
+        if mob.is_baby() {
+            let growth = (((-mob.age / 20) as f32 * 0.1) as i32) * 20;
+            let previous = mob.age;
+            mob.age = (mob.age + growth).min(0);
+            mob.forced_age = (mob.forced_age + mob.age - previous).min(24000);
+            let mut changes = vec![EntityChange::GrowthFed { id }];
+            if mob.age == 0 {
+                mob.age = mob.forced_age;
+                changes.push(EntityChange::AgeChanged { id, baby: false });
+            }
+            Ok(changes)
+        } else {
+            mob.love_ticks = 600;
+            if let Some(brain) = self.brains.get_mut(&id) {
+                brain.next_path = 0;
+                brain.path.clear();
+            }
+            Ok(vec![EntityChange::Love { id }])
+        }
+    }
+
+    pub fn breeding_pairs(&self) -> Vec<(i32, i32)> {
+        let mut used = HashSet::new();
+        let mut result = Vec::new();
+        for (&id, brain) in &self.brains {
+            let Some(partner) = brain.partner.filter(|_| brain.courtship >= 60) else {
+                continue;
+            };
+            if used.contains(&id) || used.contains(&partner) {
+                continue;
+            }
+            let (Some(a), Some(b)) = (self.entities.get(&id), self.entities.get(&partner)) else {
+                continue;
+            };
+            if a.age == 0
+                && b.age == 0
+                && a.love_ticks > 0
+                && b.love_ticks > 0
+                && a.kind == b.kind
+                && distance_squared(a.position, b.position) < 9.0
+            {
+                used.insert(id);
+                used.insert(partner);
+                result.push((id, partner));
+            }
+        }
+        result
+    }
+
+    pub fn breed(
+        &mut self,
+        first: i32,
+        second: i32,
+        id: i32,
+        uuid: Uuid,
+        world: &impl WorldQuery,
+    ) -> Result<Option<EntityChange>, EntityError> {
+        if self.entities.len() >= self.capacity {
+            return Ok(None);
+        }
+        if id <= 0
+            || self.entities.contains_key(&id)
+            || self.identities.contains(&uuid)
+            || first == second
+        {
+            return Err(EntityError::Invalid("offspring identity"));
+        }
+        let a = self.entities.get(&first).ok_or(EntityError::Missing)?;
+        let b = self.entities.get(&second).ok_or(EntityError::Missing)?;
+        if !self
+            .brains
+            .get(&first)
+            .is_some_and(|brain| brain.partner == Some(second) && brain.courtship >= 60)
+        {
+            return Ok(None);
+        }
+        if a.kind == MobKind::Zombie
+            || a.kind != b.kind
+            || a.age != 0
+            || b.age != 0
+            || a.love_ticks == 0
+            || b.love_ticks == 0
+            || distance_squared(a.position, b.position) >= 9.0
+        {
+            return Ok(None);
+        }
+        let position = a.position;
+        if physics::move_scaled_with_scratch(
+            position,
+            a.kind,
+            0.5,
+            [0.0; 3],
+            false,
+            world,
+            &mut self.physics,
+        )
+        .is_err()
+        {
+            return Ok(None);
+        }
+        let child = Mob {
+            id,
+            uuid,
+            kind: a.kind,
+            position,
+            velocity: [0.0; 3],
+            yaw: 0.0,
+            pitch: 0.0,
+            health: a.kind.maximum_health(),
+            on_ground: a.on_ground,
+            wander_target: [position[0], position[2]],
+            wander_ticks: 0,
+            attack_cooldown: 0,
+            age: -24000,
+            forced_age: 0,
+            love_ticks: 0,
+        };
+        for parent in [first, second] {
+            let mob = self.entities.get_mut(&parent).ok_or(EntityError::Missing)?;
+            mob.age = 6000;
+            mob.love_ticks = 0;
+            if let Some(brain) = self.brains.get_mut(&parent) {
+                brain.partner = None;
+                brain.courtship = 0;
+            }
+        }
+        self.insert(child.clone());
+        Ok(Some(EntityChange::Spawned(child)))
+    }
+
+    /// Apply the core's player hit and default living-entity knockback together.
+    pub fn damage_with_knockback(
+        &mut self,
+        id: i32,
+        amount: f32,
+        attacker: [f64; 3],
+    ) -> Result<Vec<EntityChange>, EntityError> {
+        if !valid_position(attacker) {
+            return Err(EntityError::Invalid("invalid attacker position"));
+        }
+        let changes = self.damage(id, amount)?;
+        if let Some(mob) = self.entities.get_mut(&id) {
+            if mob.kind != MobKind::Zombie {
+                let brain = self.brains.entry(id).or_default();
+                brain.panic_until = self.tick + 80;
+                brain.flee_from = attacker;
+                brain.path.clear();
+                brain.next_path = 0;
+            }
+            let dx = mob.position[0] - attacker[0];
+            let dz = mob.position[2] - attacker[2];
+            let length = dx.hypot(dz);
+            let [away_x, away_z] = if length > 0.0032 {
+                [dx / length, dz / length]
+            } else {
+                DIRECTIONS[(random(&mut self.random_state) % 8) as usize]
+            };
+            mob.velocity[0] = mob.velocity[0] * 0.5 + away_x * 0.4;
+            mob.velocity[2] = mob.velocity[2] * 0.5 + away_z * 0.4;
+            if mob.on_ground {
+                mob.velocity[1] = (mob.velocity[1] * 0.5 + 0.4).min(0.4);
+            }
+        }
+        Ok(changes)
+    }
+    pub fn damage_with_impulse(
+        &mut self,
+        id: i32,
+        amount: f32,
+        impulse: [f64; 3],
+    ) -> Result<Vec<EntityChange>, EntityError> {
+        if impulse
+            .iter()
+            .any(|value| !value.is_finite() || value.abs() > 4.0)
+        {
+            return Err(EntityError::Invalid("invalid explosion impulse"));
+        }
+        let changes = self.damage(id, amount)?;
+        if let Some(mob) = self.entities.get_mut(&id) {
+            for (velocity, impulse) in mob.velocity.iter_mut().zip(impulse) {
+                *velocity = (*velocity + impulse).clamp(-4.0, 4.0);
+            }
         }
         Ok(changes)
     }
@@ -389,7 +864,7 @@ impl EntityWorld {
         let mut eye = position;
         eye[1] += 1.62;
         let mut target = mob.position;
-        target[1] += mob.kind.dimensions()[1] * 0.5;
+        target[1] += mob.dimensions()[1] * 0.5;
         physics::line_clear(eye, target, world)
     }
     pub fn remove(&mut self, id: i32) -> Result<EntityChange, EntityError> {
@@ -432,14 +907,14 @@ impl EntityWorld {
     }
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
-            schema: 1,
+            schema: 2,
             tick: self.tick,
             random_state: self.random_state,
             entities: self.entities.values().cloned().collect(),
         }
     }
     pub fn restore(snapshot: Snapshot, capacity: usize) -> Result<Self, EntityError> {
-        if snapshot.schema != 1 {
+        if !matches!(snapshot.schema, 1 | 2) {
             return Err(EntityError::Invalid("unsupported entity snapshot schema"));
         }
         let mut world = Self::new(snapshot.random_state, capacity)?;
@@ -447,6 +922,12 @@ impl EntityWorld {
             return Err(EntityError::Capacity);
         }
         for mob in snapshot.entities {
+            if snapshot.schema == 1 && (mob.age != 0 || mob.forced_age != 0 || mob.love_ticks != 0)
+            {
+                return Err(EntityError::Invalid(
+                    "legacy snapshot contains breeding state",
+                ));
+            }
             if mob.id <= 0
                 || !valid_position(mob.position)
                 || !mob.velocity.iter().all(|v| v.is_finite() && v.abs() <= 4.0)
@@ -461,6 +942,12 @@ impl EntityWorld {
                     .all(|v| v.is_finite() && v.abs() <= BORDER)
                 || mob.wander_ticks > 120
                 || mob.attack_cooldown > 20
+                || !(-24000..=24000).contains(&mob.age)
+                || !(0..=24000).contains(&mob.forced_age)
+                || mob.love_ticks > 600
+                || (mob.age != 0 && mob.love_ticks != 0)
+                || (mob.kind == MobKind::Zombie
+                    && (mob.age != 0 || mob.forced_age != 0 || mob.love_ticks != 0))
             {
                 return Err(EntityError::Invalid("invalid entity snapshot state"));
             }
@@ -501,7 +988,13 @@ impl EntityWorld {
             let Some(y) = world.surface_height(x, z) else {
                 continue;
             };
+            if world.water_at(x, y.floor() as i32, z) {
+                continue;
+            }
             let position = [f64::from(x) + 0.5, y, f64::from(z) + 0.5];
+            if self.nearby(position, 32.0)?.len() >= 8 {
+                continue;
+            }
             if !valid_position(position)
                 || players
                     .iter()
@@ -573,6 +1066,7 @@ impl EntityWorld {
     ) -> Result<EntityChange, EntityError> {
         let mob = self.entities.remove(&id).ok_or(EntityError::Missing)?;
         self.blocked.remove(&id);
+        self.brains.remove(&id);
         self.identities.remove(&mob.uuid);
         self.unindex(id, bucket(mob.position));
         Ok(EntityChange::Removed {

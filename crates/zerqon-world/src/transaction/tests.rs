@@ -5,6 +5,52 @@ use std::{
     sync::{Mutex, atomic::AtomicUsize},
 };
 
+#[test]
+fn receipt_decoder_accepts_512_drops_at_maximum_revision_and_rejects_larger_limits() {
+    let mut receipt = DomainReceipt {
+        operation: Uuid::from_u128(u128::MAX),
+        revision: u64::MAX,
+        chunks: Vec::new(),
+        players: Vec::new(),
+        drops: (1..=512)
+            .map(|id| CommittedDrop {
+                key: DropKey::new(Uuid::from_u128(id)),
+                revision: u64::MAX,
+                deleted: false,
+            })
+            .collect(),
+    };
+    let encode = |receipt: &DomainReceipt| {
+        serde_json::to_vec(&SavedReceipt {
+            digest: [255; 32],
+            receipt: receipt.clone(),
+        })
+        .unwrap()
+    };
+    let bytes = encode(&receipt);
+    assert!(bytes.len() > 8192 && bytes.len() <= 64 * 1024);
+    assert_eq!(decode_receipt(&bytes).unwrap().receipt, receipt);
+    let mut padded = bytes.clone();
+    padded.resize(64 * 1024, b' ');
+    assert_eq!(decode_receipt(&padded).unwrap().receipt, receipt);
+    padded.push(b' ');
+    assert!(decode_receipt(&padded).is_err());
+    receipt.drops.push(CommittedDrop {
+        key: DropKey::new(Uuid::from_u128(513)),
+        revision: u64::MAX,
+        deleted: true,
+    });
+    assert!(decode_receipt(&encode(&receipt)).is_err());
+    receipt.drops.clear();
+    receipt.chunks = (0..17)
+        .map(|x| CommittedChunk {
+            key: ChunkKey::new(x, 0),
+            revision: u64::MAX,
+        })
+        .collect();
+    assert!(decode_receipt(&encode(&receipt)).is_err());
+}
+
 thread_local! {
     static BEFORE_DOMAIN_WRITER: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
 }

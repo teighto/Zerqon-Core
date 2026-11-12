@@ -2,6 +2,8 @@ use crate::{
     crafting_data::CraftingData,
     game_mode::GameMode,
     lifecycle::{JobGuard, Lifecycle, RegistrationError},
+    player_control::SessionKey,
+    player_record::PlayerRecord,
     player_storage::{PersistedPlayer, PlayerStorage, PlayerStorageError},
     players::{InventoryRevision, PacketBatch, Players},
 };
@@ -9,7 +11,7 @@ use bytes::Bytes;
 use std::{
     collections::HashMap,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, MutexGuard,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -343,6 +345,265 @@ pub struct InventoryHandle {
     service: Arc<InventoryService>,
     session: Arc<Session>,
 }
+
+/// Reservation without a gameplay read lock; mixed jobs already own its write lock.
+/// The service binding prevents a caller from spending another inventory's quota.
+pub(crate) struct MixedIoPermit {
+    service: Arc<InventoryService>,
+    permit: OwnedSemaphorePermit,
+}
+
+/// Private session admission retained by the physical world worker, not its waiter.
+pub(crate) struct MixedInventoryLease {
+    work: InventoryWork,
+}
+
+pub(crate) struct MixedIoGuard<'a> {
+    lease: &'a MixedInventoryLease,
+    _stripe: MutexGuard<'a, ()>,
+}
+
+pub(crate) struct MixedPlayerGuard<'a> {
+    lease: &'a MixedInventoryLease,
+    current: MutexGuard<'a, Option<SessionInventory>>,
+}
+
+/// Prepared bytes and packets borrow their exact locked participant through commit.
+pub(crate) struct PreparedPlayerChange<'guard, 'lease> {
+    player: &'guard mut MixedPlayerGuard<'lease>,
+    record: PlayerRecord,
+    write: zerqon_world::PlayerWrite,
+    generation: u64,
+    batch: PacketBatch,
+    equipment: Bytes,
+}
+
+pub(crate) struct MixedPlayerPublication {
+    players: Arc<Players>,
+    key: SessionKey,
+    batch: PacketBatch,
+    equipment: Bytes,
+}
+
+impl MixedInventoryLease {
+    pub(crate) fn apply_packet(
+        &self,
+        record: &mut PlayerRecord,
+        id: i32,
+        body: &[u8],
+        can_interact: bool,
+    ) -> Result<Vec<ItemStack>, InventoryServiceError> {
+        let service = self.service();
+        let catalog = &service.catalog;
+        let crafting = &service.crafting;
+        let policy = InventoryPolicy {
+            creative: record.game_mode == GameMode::Creative,
+            can_interact,
+            allow_drops: true,
+        };
+        if body.len() > 65536 {
+            return Err(InventoryServiceError::Limit("inventory packet bytes"));
+        }
+        if id != 19 && !can_interact {
+            return Err(zerqon_inventory::InventoryError::InteractionDenied.into());
+        }
+        let result = match id {
+            18 => record.inventory.click_with_crafting(
+                catalog,
+                &decode_click(body, catalog, DecodeLimits::default())?,
+                policy,
+                &crafting.recipes,
+                &crafting.remainders,
+            )?,
+            57 => record.inventory.creative_set_with_crafting(
+                catalog,
+                &decode_creative_slot(body, catalog, DecodeLimits::default())?,
+                policy,
+                &crafting.recipes,
+            )?,
+            19 => {
+                let mut remaining = body;
+                let id = zerqon_protocol::codec::get_varint(&mut remaining)
+                    .map_err(zerqon_inventory::ItemError::from)?;
+                if id != 0 || !remaining.is_empty() {
+                    return Err(zerqon_inventory::InventoryError::WrongContainer.into());
+                }
+                record.inventory.close_crafting(catalog, policy)?
+            }
+            _ => {
+                return Err(InventoryServiceError::Unavailable(
+                    "unsupported item transaction",
+                ));
+            }
+        };
+        Ok(result.drops)
+    }
+    pub(crate) fn catalog(&self) -> &ItemCatalog {
+        &self.service().catalog
+    }
+
+    fn service(&self) -> &InventoryService {
+        self.work.service.as_ref().expect("unsettled mixed lease")
+    }
+
+    fn session(&self) -> &Session {
+        self.work.session.as_ref().expect("unsettled mixed lease")
+    }
+
+    pub(crate) fn same_world(&self, world: &Arc<zerqon_world::WorldStore>) -> bool {
+        self.service().store.same_world(world)
+    }
+
+    pub(crate) fn lock_io(&self) -> Result<MixedIoGuard<'_>, InventoryServiceError> {
+        let guard = self.service().stripes[stripe(self.session().uuid)]
+            .lock()
+            .map_err(|_| {
+                crate::managed_tasks::CleanupError("inventory I/O lock poisoned".into())
+            })?;
+        ensure_open(self.session())?;
+        Ok(MixedIoGuard {
+            lease: self,
+            _stripe: guard,
+        })
+    }
+
+    /// Latch before releasing gameplay write: close must never save a stale image.
+    pub(crate) fn poison(&self, cause: &str) {
+        let mut admission = self
+            .work
+            .activity
+            .admission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        admission.closed = true;
+        admission.failure.get_or_insert_with(|| cause.to_owned());
+    }
+
+    pub(crate) fn settle(self, cleanup: Result<(), String>) {
+        self.work.finish(cleanup);
+    }
+
+    pub(crate) fn reject_unsubmitted(self) {
+        self.settle(Ok(()));
+    }
+}
+
+impl MixedIoGuard<'_> {
+    /// Acquire after the sorted chunk locks; callers cannot outlive the UUID lock.
+    pub(crate) fn lock_player(&self) -> Result<MixedPlayerGuard<'_>, InventoryServiceError> {
+        ensure_open(self.lease.session())?;
+        let current =
+            self.lease.session().inventory.lock().map_err(|_| {
+                crate::managed_tasks::CleanupError("inventory lock poisoned".into())
+            })?;
+        if current.is_none() {
+            return Err(InventoryServiceError::Unavailable("inventory is loading"));
+        }
+        Ok(MixedPlayerGuard {
+            lease: self.lease,
+            current,
+        })
+    }
+}
+
+impl<'lease> MixedPlayerGuard<'lease> {
+    pub(crate) fn current(&self) -> &PersistedPlayer {
+        &self.current.as_ref().expect("locked loaded participant").0
+    }
+
+    /// Preview slot 0, state id and drag state are transient, not owned contents.
+    pub(crate) fn check_snapshot(
+        &self,
+        snapshot: &zerqon_world::PlayerSnapshot,
+    ) -> Result<(), InventoryServiceError> {
+        let durable = self
+            .lease
+            .service()
+            .store
+            .decode_existing_snapshot(self.lease.session().uuid, snapshot)
+            .map_err(|error| {
+                crate::managed_tasks::CleanupError(format!(
+                    "mixed player snapshot failed validation: {error}"
+                ))
+            })?;
+        let current = self.current();
+        if durable.revision != current.revision
+            || durable.record.game_mode != current.record.game_mode
+            || durable.record.previous_game_mode != current.record.previous_game_mode
+            || durable.record.inventory.slots()[1..] != current.record.inventory.slots()[1..]
+            || durable.record.inventory.cursor() != current.record.inventory.cursor()
+            || durable.record.inventory.selected() != current.record.inventory.selected()
+        {
+            return Err(crate::managed_tasks::CleanupError(
+                "mixed player snapshot diverged from the locked session".into(),
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn prepare_after<'guard>(
+        &'guard mut self,
+        record: PlayerRecord,
+    ) -> Result<PreparedPlayerChange<'guard, 'lease>, InventoryServiceError> {
+        let service = self.lease.service();
+        let session = self.lease.session();
+        let write = service.store.encode_write(session.uuid, &record)?;
+        let (batch, equipment) = packets(session.id, &record.inventory, &service.catalog)?;
+        let generation = session
+            .generation
+            .load(Ordering::Relaxed)
+            .checked_add(1)
+            .ok_or(InventoryServiceError::Limit("session generation exhausted"))?;
+        Ok(PreparedPlayerChange {
+            player: self,
+            record,
+            write,
+            generation,
+            batch,
+            equipment,
+        })
+    }
+}
+
+impl PreparedPlayerChange<'_, '_> {
+    pub(crate) fn write(&self) -> &zerqon_world::PlayerWrite {
+        &self.write
+    }
+
+    /// All fallible validation/encoding precedes commit; publication never rereads disk.
+    pub(crate) fn publish(self, revision: u64) -> MixedPlayerPublication {
+        let session = self.player.lease.session();
+        *self.player.current = Some(SessionInventory(PersistedPlayer {
+            record: self.record,
+            revision,
+        }));
+        session.generation.store(self.generation, Ordering::Release);
+        MixedPlayerPublication {
+            players: Arc::clone(&self.player.lease.service().players),
+            key: SessionKey {
+                uuid: session.uuid,
+                session_id: session.id,
+            },
+            batch: self.batch.with_inventory_revision(InventoryRevision {
+                uuid: session.uuid,
+                entity_id: session.id,
+                generation: self.generation,
+            }),
+            equipment: self.equipment,
+        }
+    }
+}
+
+impl MixedPlayerPublication {
+    pub(crate) fn enqueue(self) -> Result<(), InventoryServiceError> {
+        self.players
+            .set_equipment(self.key.uuid, self.key.session_id, self.equipment)?;
+        self.players
+            .dispatch_batches(vec![(self.key.uuid, self.key.session_id, self.batch)])?;
+        Ok(())
+    }
+}
 struct MutationRate {
     started: Instant,
     count: u32,
@@ -361,6 +622,96 @@ impl MutationRate {
     }
 }
 impl InventoryService {
+    pub(crate) async fn reserve_passive(
+        self: &Arc<Self>,
+        uuid: Uuid,
+        id: i32,
+    ) -> Result<Option<MixedInventoryLease>, InventoryServiceError> {
+        let session = self
+            .sessions
+            .lock()
+            .map_err(|_| InventoryServiceError::Unavailable("session lock poisoned"))?
+            .get(&uuid)
+            .filter(|session| session.id == id)
+            .cloned();
+        let Some(session) = session else {
+            return Ok(None);
+        };
+        let permit = Arc::clone(&self.inflight)
+            .acquire_owned()
+            .await
+            .map_err(|_| InventoryServiceError::Unavailable("inventory workers stopped"))?;
+        if session.closed.load(Ordering::Acquire)
+            || session
+                .activity
+                .admission
+                .lock()
+                .map_err(|_| InventoryServiceError::Unavailable("inventory admission unavailable"))?
+                .closed
+        {
+            return Ok(None);
+        }
+        Ok(Some(MixedInventoryLease {
+            work: InventoryWork::admit(self, &session, permit, None, false)?,
+        }))
+    }
+    pub fn food_targets(
+        &self,
+        players: &[crate::players::PlayerSnapshot],
+    ) -> Result<Vec<(zerqon_entities::MobKind, zerqon_entities::PlayerTarget)>, InventoryServiceError>
+    {
+        let sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| InventoryServiceError::Unavailable("session lock poisoned"))?;
+        let mut result = Vec::new();
+        for player in players {
+            let Some(session) = sessions
+                .get(&player.uuid)
+                .filter(|s| s.id == player.id && !s.closed.load(Ordering::Acquire))
+            else {
+                continue;
+            };
+            let current = session
+                .inventory
+                .lock()
+                .map_err(|_| InventoryServiceError::Unavailable("inventory lock poisoned"))?;
+            let Some(current) = current.as_ref() else {
+                continue;
+            };
+            let mut kinds = std::collections::BTreeSet::new();
+            for stack in [current.selected_stack(), &current.slots()[45]]
+                .into_iter()
+                .flatten()
+            {
+                let name = &self.catalog.item(stack.item())?.key;
+                if name == "minecraft:wheat" {
+                    kinds.insert(0);
+                }
+                if matches!(
+                    name.as_str(),
+                    "minecraft:carrot" | "minecraft:potato" | "minecraft:beetroot"
+                ) {
+                    kinds.insert(1);
+                }
+            }
+            for kind in kinds {
+                result.push((
+                    if kind == 0 {
+                        zerqon_entities::MobKind::Cow
+                    } else {
+                        zerqon_entities::MobKind::Pig
+                    },
+                    zerqon_entities::PlayerTarget {
+                        id: player.id,
+                        position: player.position.xyz,
+                        attackable: false,
+                    },
+                ));
+            }
+        }
+        Ok(result)
+    }
     pub fn new(
         store: Arc<PlayerStorage>,
         players: Arc<Players>,
@@ -536,6 +887,47 @@ impl InventoryService {
     }
 }
 impl InventoryHandle {
+    pub(crate) async fn reserve_mixed_io(&self) -> Result<MixedIoPermit, InventoryServiceError> {
+        let permit = Arc::clone(&self.service.inflight)
+            .acquire_owned()
+            .await
+            .map_err(|_| InventoryServiceError::Unavailable("I/O workers stopped"))?;
+        Ok(MixedIoPermit {
+            service: Arc::clone(&self.service),
+            permit,
+        })
+    }
+
+    pub(crate) fn admit_mixed(
+        &self,
+        key: SessionKey,
+        permit: MixedIoPermit,
+    ) -> Result<MixedInventoryLease, InventoryServiceError> {
+        if key.uuid != self.session.uuid
+            || key.session_id != self.session.id
+            || !Arc::ptr_eq(&permit.service, &self.service)
+        {
+            return Err(InventoryServiceError::Unavailable(
+                "mixed inventory identity differs",
+            ));
+        }
+        // Retirement takes admission before the map; never nest in the inverse order.
+        let registered = self
+            .service
+            .sessions
+            .lock()
+            .map_err(|_| InventoryServiceError::Unavailable("session lock poisoned"))?
+            .get(&key.uuid)
+            .is_some_and(|session| Arc::ptr_eq(session, &self.session));
+        if !registered {
+            return Err(InventoryServiceError::Unavailable(
+                "mixed inventory session is stale",
+            ));
+        }
+        let work = InventoryWork::admit(&self.service, &self.session, permit.permit, None, false)?;
+        Ok(MixedInventoryLease { work })
+    }
+
     #[cfg(test)]
     pub(crate) fn test_admission_closed(&self) -> bool {
         self.session.activity.admission.lock().unwrap().closed
@@ -707,9 +1099,73 @@ impl InventoryHandle {
             zerqon_inventory::Hand::Off => current.slots()[45].clone(),
         })
     }
+    pub fn item_key(
+        &self,
+        stack: &zerqon_inventory::ItemStack,
+    ) -> Result<String, InventoryServiceError> {
+        Ok(self.service.catalog.item(stack.item())?.key.clone())
+    }
+    pub fn mining_profile(
+        &self,
+        block: &str,
+        held: &zerqon_inventory::Slot,
+    ) -> crate::Result<crate::mining::Profile> {
+        crate::mining::profile(block, held, &self.service.catalog)
+    }
+    pub async fn consume_hand(
+        &self,
+        hand: zerqon_inventory::Hand,
+        expected: zerqon_inventory::ItemStack,
+    ) -> Result<(), InventoryServiceError> {
+        let batch = self
+            .service
+            .change(Arc::clone(&self.session), move |current, catalog| {
+                let index = match hand {
+                    zerqon_inventory::Hand::Main => 36 + usize::from(current.selected()),
+                    zerqon_inventory::Hand::Off => 45,
+                };
+                if current.slots()[index].as_ref() != Some(&expected) {
+                    return Err(InventoryServiceError::Unavailable("held item changed"));
+                }
+                if current.0.record.game_mode == GameMode::Creative {
+                    return Ok(());
+                }
+                let stack = if expected.count() > 1 {
+                    Some(expected.with_count(expected.count() - 1)?)
+                } else {
+                    None
+                };
+                current.creative_set(
+                    catalog,
+                    &zerqon_inventory::CreativeSlotRequest {
+                        slot: index as i16,
+                        stack,
+                    },
+                    zerqon_inventory::InventoryPolicy {
+                        creative: true,
+                        can_interact: true,
+                        allow_drops: false,
+                    },
+                )?;
+                Ok(())
+            })
+            .await?;
+        self.service
+            .players
+            .dispatch_batches(vec![(self.session.uuid, self.session.id, batch)])?;
+        Ok(())
+    }
     pub fn allow_outbound(&self, batch: &PacketBatch) -> bool {
         batch.inventory_revision().is_none_or(|revision| {
-            revision.uuid == self.session.uuid
+            let admission = self
+                .session
+                .activity
+                .admission
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            admission.failure.is_none()
+                && !self.session.closed.load(Ordering::Acquire)
+                && revision.uuid == self.session.uuid
                 && revision.entity_id == self.session.id
                 && revision.generation == self.session.generation.load(Ordering::Acquire)
         })
@@ -1198,6 +1654,304 @@ mod tests {
                 _outbound: outbound,
             }
         }
+    }
+
+    fn mixed_key(fixture: &WorkFixture) -> SessionKey {
+        SessionKey {
+            uuid: fixture.handle.session.uuid,
+            session_id: fixture.handle.session.id,
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_admission_requires_exact_session_and_its_own_service_quota() {
+        let fixture = WorkFixture::new().await;
+        let foreign = WorkFixture::new().await;
+        let key = mixed_key(&fixture);
+        for wrong in [
+            SessionKey {
+                uuid: Uuid::from_u128(999),
+                ..key
+            },
+            SessionKey {
+                session_id: key.session_id + 1,
+                ..key
+            },
+        ] {
+            let permit = fixture.handle.reserve_mixed_io().await.unwrap();
+            assert!(fixture.handle.admit_mixed(wrong, permit).is_err());
+        }
+        let permit = foreign.handle.reserve_mixed_io().await.unwrap();
+        assert!(fixture.handle.admit_mixed(key, permit).is_err());
+        assert_eq!(fixture.service.inflight.available_permits(), 2);
+        assert_eq!(foreign.service.inflight.available_permits(), 2);
+        assert_eq!(
+            fixture
+                .handle
+                .session
+                .activity
+                .admission
+                .lock()
+                .unwrap()
+                .active,
+            0
+        );
+        assert!(fixture.service.lifecycle.pending().is_empty());
+        fixture.handle.full_sync().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mixed_rejection_releases_admission_without_poisoning() {
+        let fixture = WorkFixture::new().await;
+        let permit = fixture.handle.reserve_mixed_io().await.unwrap();
+        let lease = fixture
+            .handle
+            .admit_mixed(mixed_key(&fixture), permit)
+            .unwrap();
+        assert_eq!(fixture.service.inflight.available_permits(), 1);
+        assert_eq!(
+            fixture
+                .handle
+                .session
+                .activity
+                .admission
+                .lock()
+                .unwrap()
+                .active,
+            1
+        );
+        lease.reject_unsubmitted();
+        assert_eq!(fixture.service.inflight.available_permits(), 2);
+        assert!(fixture.service.lifecycle.pending().is_empty());
+        fixture.handle.close_and_drain().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mixed_admission_rejects_stale_session_object_even_when_key_is_reused() {
+        let fixture = WorkFixture::new().await;
+        let key = mixed_key(&fixture);
+        // Exercise pointer identity independently of the usual close/drain fence.
+        fixture.service.sessions.lock().unwrap().remove(&key.uuid);
+        let replacement = fixture
+            .service
+            .open(key.uuid, key.session_id)
+            .await
+            .unwrap();
+        let permit = fixture.handle.reserve_mixed_io().await.unwrap();
+        assert!(fixture.handle.admit_mixed(key, permit).is_err());
+        assert_eq!(fixture.service.inflight.available_permits(), 2);
+        assert!(fixture.service.lifecycle.pending().is_empty());
+        drop(fixture.handle);
+        assert!(Arc::ptr_eq(
+            fixture
+                .service
+                .sessions
+                .lock()
+                .unwrap()
+                .get(&key.uuid)
+                .unwrap(),
+            &replacement.session,
+        ));
+        replacement.close_and_drain().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mixed_abandoned_admission_latches_failure_and_skips_close_save() {
+        let fixture = WorkFixture::new().await;
+        let before = fixture
+            .service
+            .store
+            .load(fixture.handle.session.uuid)
+            .unwrap()
+            .revision;
+        let permit = fixture.handle.reserve_mixed_io().await.unwrap();
+        let lease = fixture
+            .handle
+            .admit_mixed(mixed_key(&fixture), permit)
+            .unwrap();
+        drop(lease);
+        let error = fixture.handle.close_and_drain().await.unwrap_err();
+        assert!(crate::managed_tasks::is_cleanup_failure(&error));
+        assert_eq!(
+            fixture
+                .service
+                .store
+                .load(fixture.handle.session.uuid)
+                .unwrap()
+                .revision,
+            before
+        );
+        assert_eq!(fixture.service.inflight.available_permits(), 2);
+        assert!(fixture.service.lifecycle.pending().is_empty());
+        assert!(
+            fixture
+                .service
+                .lifecycle
+                .drain(tokio::time::Instant::now() + Duration::from_secs(1))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_snapshot_rejects_stale_mode_held_content_and_revision() {
+        for mismatch in 0..3 {
+            let fixture = WorkFixture::new().await;
+            {
+                let mut lock = fixture.handle.session.inventory.lock().unwrap();
+                let current = lock.as_mut().unwrap();
+                match mismatch {
+                    0 => current.0.record.game_mode = GameMode::Survival,
+                    1 => current
+                        .set_slot(
+                            &fixture.service.catalog,
+                            36,
+                            Some(ItemStack::new(ItemId(1), 1, ValidatedPatch::default()).unwrap()),
+                        )
+                        .unwrap(),
+                    _ => current.0.revision += 1,
+                }
+            }
+            let permit = fixture.handle.reserve_mixed_io().await.unwrap();
+            let lease = fixture
+                .handle
+                .admit_mixed(mixed_key(&fixture), permit)
+                .unwrap();
+            assert!(lease.same_world(&fixture.world));
+            let io = lease.lock_io().unwrap();
+            let player = io.lock_player().unwrap();
+            let snapshot = fixture
+                .world
+                .snapshot_domain(
+                    &[],
+                    &[zerqon_world::PlayerKey::new(fixture.handle.session.uuid)],
+                    &[],
+                )
+                .unwrap();
+            let error = player.check_snapshot(&snapshot.players[0]).unwrap_err();
+            assert!(crate::managed_tasks::is_cleanup_failure(&error));
+            drop(player);
+            drop(io);
+            lease.settle(Ok(()));
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_snapshot_ignores_preview_and_transient_state() {
+        let fixture = WorkFixture::new().await;
+        {
+            let mut lock = fixture.handle.session.inventory.lock().unwrap();
+            lock.as_mut()
+                .unwrap()
+                .set_slot(
+                    &fixture.service.catalog,
+                    0,
+                    Some(ItemStack::new(ItemId(1), 7, ValidatedPatch::default()).unwrap()),
+                )
+                .unwrap();
+        }
+        let permit = fixture.handle.reserve_mixed_io().await.unwrap();
+        let lease = fixture
+            .handle
+            .admit_mixed(mixed_key(&fixture), permit)
+            .unwrap();
+        let io = lease.lock_io().unwrap();
+        let player = io.lock_player().unwrap();
+        let snapshot = fixture
+            .world
+            .snapshot_domain(
+                &[],
+                &[zerqon_world::PlayerKey::new(fixture.handle.session.uuid)],
+                &[],
+            )
+            .unwrap();
+        player.check_snapshot(&snapshot.players[0]).unwrap();
+        drop(player);
+        drop(io);
+        lease.settle(Ok(()));
+    }
+
+    #[tokio::test]
+    async fn mixed_prepared_player_publishes_receipt_revision_and_preencoded_packets() {
+        let mut fixture = WorkFixture::new().await;
+        fixture._player.activate().unwrap();
+        let before = fixture.handle.full_sync().await.unwrap();
+        let gameplay = Arc::clone(&fixture.service.gameplay).write_owned().await;
+        let permit = fixture.handle.reserve_mixed_io().await.unwrap();
+        let lease = fixture
+            .handle
+            .admit_mixed(mixed_key(&fixture), permit)
+            .unwrap();
+        let io = lease.lock_io().unwrap();
+        let mut player = io.lock_player().unwrap();
+        let snapshot = fixture
+            .world
+            .snapshot_domain(
+                &[],
+                &[zerqon_world::PlayerKey::new(fixture.handle.session.uuid)],
+                &[],
+            )
+            .unwrap();
+        player.check_snapshot(&snapshot.players[0]).unwrap();
+        let mut candidate = player.current().record.clone();
+        candidate.game_mode = GameMode::Survival;
+        candidate.previous_game_mode = Some(GameMode::Creative);
+        candidate
+            .inventory
+            .set_slot(
+                &fixture.service.catalog,
+                36,
+                Some(ItemStack::new(ItemId(1), 17, ValidatedPatch::default()).unwrap()),
+            )
+            .unwrap();
+        let prepared = player.prepare_after(candidate).unwrap();
+        assert_eq!(
+            fixture
+                .service
+                .store
+                .load(fixture.handle.session.uuid)
+                .unwrap()
+                .record
+                .game_mode,
+            GameMode::Creative
+        );
+        let receipt = fixture
+            .world
+            .commit_domain(
+                Uuid::new_v4(),
+                &snapshot,
+                &[],
+                std::slice::from_ref(prepared.write()),
+                &[],
+            )
+            .unwrap();
+        let publication = prepared.publish(receipt.revision);
+        assert_eq!(player.current().revision, receipt.revision);
+        assert_eq!(player.current().record.game_mode, GameMode::Survival);
+        publication.enqueue().unwrap();
+        assert!(!fixture.handle.allow_outbound(&before));
+        let batch = fixture._outbound.try_recv().unwrap();
+        assert!(fixture.handle.allow_outbound(&batch));
+        drop(player);
+        drop(io);
+        drop(gameplay);
+        lease.settle(Ok(()));
+        let durable = fixture
+            .service
+            .store
+            .load(fixture.handle.session.uuid)
+            .unwrap();
+        assert_eq!(durable.revision, receipt.revision);
+        assert_eq!(
+            durable
+                .record
+                .inventory
+                .selected_stack()
+                .as_ref()
+                .unwrap()
+                .count(),
+            17
+        );
     }
 
     #[tokio::test]

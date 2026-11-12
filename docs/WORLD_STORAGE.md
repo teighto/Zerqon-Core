@@ -18,9 +18,9 @@ The database uses immediate durability and two-phase commit, with a 16 MiB page-
 
 `WorldStore::commit` accepts an operation UUID, all observed snapshots and up to 16 chunk replacements. It checks every read token, including unchanged neighbors, before saving. The operation returns a receipt, a conflict, a proven rejection or an indeterminate result. Imported worlds cannot create missing chunks.
 
-`snapshot_domain` reads chunks, players and drops in one database snapshot. `commit_domain` checks all of their revisions and saves their replacements with one receipt. The limits apply across the whole operation: 64 reads, 16 writes, 64 MiB of returned payload and 16 MiB of replacement payload. A player record allows 2 MiB plus 4 KiB for its envelope so every valid old inventory fits. Drop records allow 2 MiB. These are storage bounds, not a total server memory limit.
+`snapshot_domain` reads chunks, players and drops in one database snapshot. `commit_domain` checks all of their revisions and saves their replacements with one receipt. The limits apply across the whole operation: up to 512 reads and 512 writes, with at most 64 chunk reads and 16 chunk writes; 64 MiB of returned payload and 16 MiB of replacement payload. A player record allows 2 MiB plus 4 KiB for its envelope so every valid old inventory fits. Drop records allow 2 MiB. These are storage bounds, not a total server memory limit.
 
-Drop deletion keeps its revision as a tombstone. Moving or deleting a drop updates its chunk index in the same transaction. `drops_in_chunk` returns a bounded page for restoring loaded chunks; the global `scan_drops` also returns tombstones so callers can advance without an unbounded search for live records. This API is the storage layer; item spawning and pickup in the running server still need implementation.
+Drop deletion keeps its revision as a tombstone. Moving or deleting a drop updates its chunk index in the same transaction. `drops_in_chunk` returns a bounded page for restoring loaded chunks; the global `scan_drops` also returns tombstones so callers can advance without an unbounded search for live records. The server uses these records for dropped items, merging, pickup and mining loot. Inventory and item ownership changes share a transaction; motion is checkpointed separately.
 
 `receipt` looks up the last 4,096 committed operations. Retrying the same operation and payload within that history returns the original receipt. Reusing its UUID with another payload is rejected. After reopening, query the receipt instead of reusing snapshot tokens from a closed store.
 
@@ -44,7 +44,7 @@ Tests cover restart, concurrent reads and writers, conflicts, migration, importe
 
 ## По-русски
 
-Текущие чанки, инвентари и режимы игроков хранятся в `world/chunks.redb`. Транзакционный API сохраняет изменения чанков, игроков и записей выпавших предметов одной операцией. Создание и подбор самих предметов в игровом мире ещё дорабатываются.
+Текущие чанки, инвентари и режимы игроков хранятся в `world/chunks.redb`. Транзакционный API сохраняет изменения чанков, игроков и записей выпавших предметов одной операцией. Эти записи используются для выбрасывания, добычи, объединения и подбора предметов. Положение сохраняется периодически; смена количества и владельца — сразу вместе с инвентарём.
 
 При первом открытии старого мира файлы `.zqc` копируются в базу небольшими порциями. Исходные файлы остаются как резервная копия. После переноса сервер читает текущий мир из базы. Для бэкапа сохраняйте всю папку мира.
 

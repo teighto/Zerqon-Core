@@ -225,7 +225,7 @@ impl StoredInventory {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct StoredStack {
+pub(crate) struct StoredStack {
     item: String,
     count: u8,
     #[serde(deserialize_with = "components")]
@@ -297,7 +297,10 @@ impl From<StoredComponent> for ComponentValue {
     }
 }
 
-fn encode_stack(slot: &Slot, catalog: &ItemCatalog) -> Result<Option<StoredStack>, StoreError> {
+pub(crate) fn encode_stack(
+    slot: &Slot,
+    catalog: &ItemCatalog,
+) -> Result<Option<StoredStack>, StoreError> {
     let Some(stack) = slot else {
         return Ok(None);
     };
@@ -329,7 +332,10 @@ fn encode_stack(slot: &Slot, catalog: &ItemCatalog) -> Result<Option<StoredStack
     }))
 }
 
-fn decode_stack(slot: Option<StoredStack>, catalog: &ItemCatalog) -> Result<Slot, StoreError> {
+pub(crate) fn decode_stack(
+    slot: Option<StoredStack>,
+    catalog: &ItemCatalog,
+) -> Result<Slot, StoreError> {
     let Some(stack) = slot else {
         return Ok(None);
     };

@@ -253,7 +253,8 @@ impl WorldStore {
         self.metadata.as_ref()
     }
 
-    /// Read up to 64 keys and 64 MiB of payload from one transaction.
+    /// Read up to 512 keys and 64 MiB of payload from one transaction.
+    /// At most 64 keys may be chunks; drop pages retain their separate 64-row limit.
     /// Input limits do not make the store unavailable; stored corruption does.
     pub fn snapshot_domain(
         &self,
@@ -266,7 +267,8 @@ impl WorldStore {
             .ok_or_else(|| WorldError::Storage("transactions unavailable during import".into()))?
             .snapshot_domain(chunks, players, drops)
     }
-    /// Atomically CAS all read revisions and publish up to 16 writes / 16 MiB.
+    /// Atomically CAS up to 512 read revisions and publish up to 512 writes / 16 MiB.
+    /// Chunk access remains bounded to 64 reads and 16 writes per operation.
     /// A queued writer rechecks availability after acquiring redb's writer;
     /// already admitted work may finish if a separate reader fails later.
     pub fn commit_domain(

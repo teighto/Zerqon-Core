@@ -7,7 +7,8 @@ use std::{fs, sync::Arc};
 use uuid::Uuid;
 use zerqon_inventory::ItemCatalog;
 use zerqon_world::{
-    CommitError, DomainReceipt, DomainSnapshot, PlayerKey, PlayerWrite, WorldError, WorldStore,
+    CommitError, DomainReceipt, DomainSnapshot, PlayerKey, PlayerSnapshot, PlayerWrite, WorldError,
+    WorldStore,
 };
 
 #[derive(Clone)]
@@ -58,6 +59,44 @@ impl PlayerStorage {
 
     pub fn catalog(&self) -> &Arc<ItemCatalog> {
         &self.catalog
+    }
+
+    pub(crate) fn same_world(&self, world: &Arc<WorldStore>) -> bool {
+        Arc::ptr_eq(&self.world, world)
+    }
+
+    /// Decode an already-read participant without importing or creating a row.
+    /// The enclosing domain commit verifies the snapshot's opaque store token.
+    pub(crate) fn decode_existing_snapshot(
+        &self,
+        player: Uuid,
+        snapshot: &PlayerSnapshot,
+    ) -> Result<PersistedPlayer, PlayerStorageError> {
+        if player.is_nil() || snapshot.key() != PlayerKey::new(player) {
+            return Err(PlayerStorageError::Invalid(
+                "player snapshot identity differs",
+            ));
+        }
+        let bytes = snapshot.data().ok_or(PlayerStorageError::Invalid(
+            "mixed operation requires an existing player",
+        ))?;
+        let record = PlayerRecord::decode(bytes, self.world_uuid, player, &self.catalog)
+            .map_err(PlayerStorageError::CorruptRecord)?;
+        Ok(PersistedPlayer {
+            record,
+            revision: snapshot.revision(),
+        })
+    }
+
+    pub(crate) fn encode_write(
+        &self,
+        player: Uuid,
+        record: &PlayerRecord,
+    ) -> Result<PlayerWrite, PlayerStorageError> {
+        Ok(PlayerWrite {
+            key: PlayerKey::new(player),
+            replacement: Arc::from(record.encode(self.world_uuid, player, &self.catalog)?),
+        })
     }
 
     /// Inspect a terminal backend failure after an unsuccessful operation.
@@ -265,6 +304,68 @@ mod tests {
         let path = directory.join(format!("{player}.zinv"));
         let bytes = fs::read(&path).unwrap();
         (path, bytes, original)
+    }
+
+    #[test]
+    fn mixed_helpers_do_not_initialize_and_require_exact_world_and_player_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let other_directory = tempfile::tempdir().unwrap();
+        let world = Arc::new(WorldStore::open(directory.path()).unwrap());
+        let other = Arc::new(WorldStore::open(other_directory.path()).unwrap());
+        let player = Uuid::from_u128(81);
+        let store = PlayerStorage::new(Arc::clone(&world), catalog(), GameMode::Creative).unwrap();
+        assert!(store.same_world(&world));
+        assert!(!store.same_world(&other));
+        let absent = world
+            .snapshot_domain(&[], &[PlayerKey::new(player)], &[])
+            .unwrap();
+        assert!(matches!(
+            store.decode_existing_snapshot(player, &absent.players[0]),
+            Err(PlayerStorageError::Invalid(_))
+        ));
+        assert!(
+            world
+                .snapshot_domain(&[], &[PlayerKey::new(player)], &[])
+                .unwrap()
+                .players[0]
+                .data()
+                .is_none()
+        );
+        assert!(!directory.path().join("playerdata").exists());
+        let loaded = store.load(player).unwrap();
+        let reads = world
+            .snapshot_domain(&[], &[PlayerKey::new(player)], &[])
+            .unwrap();
+        assert_eq!(
+            store
+                .decode_existing_snapshot(player, &reads.players[0])
+                .unwrap()
+                .revision,
+            loaded.revision
+        );
+        assert!(matches!(
+            store.decode_existing_snapshot(Uuid::from_u128(82), &reads.players[0]),
+            Err(PlayerStorageError::Invalid(_))
+        ));
+        let record = PlayerRecord::new(GameMode::Survival);
+        let write = store.encode_write(player, &record).unwrap();
+        assert_eq!(write.key, PlayerKey::new(player));
+        assert_eq!(
+            PlayerRecord::decode(
+                &write.replacement,
+                world.uuid().unwrap(),
+                player,
+                store.catalog()
+            )
+            .unwrap()
+            .game_mode,
+            GameMode::Survival
+        );
+        assert_eq!(store.load(player).unwrap().revision, loaded.revision);
+        assert_eq!(
+            store.load(player).unwrap().record.game_mode,
+            GameMode::Creative
+        );
     }
 
     #[test]

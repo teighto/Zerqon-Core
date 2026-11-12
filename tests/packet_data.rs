@@ -2,6 +2,8 @@
 
 #[path = "../src/entity_packets.rs"]
 mod entity_packets;
+#[path = "../src/flight_speed.rs"]
+mod flight_speed;
 #[path = "../src/game_data.rs"]
 mod game_data;
 #[path = "../src/game_mode.rs"]
@@ -444,6 +446,27 @@ fn export_vanilla_decoder_fixtures() {
     .unwrap();
     let id = uuid::Uuid::nil();
     let chunk = zerqon_world::Chunk::flat(-3, 5, data.flat);
+    let items = zerqon_inventory::ItemCatalog::load(&data_path).unwrap();
+    let stone = zerqon_inventory::ItemStack::new(
+        items.item_id("minecraft:stone").unwrap(),
+        7,
+        zerqon_inventory::ValidatedPatch::default(),
+    )
+    .unwrap();
+    let named_stone = zerqon_inventory::ItemStack::new(
+        items.item_id("minecraft:stone").unwrap(),
+        3,
+        zerqon_inventory::ValidatedPatch::new(
+            std::collections::BTreeMap::from([(
+                items.component_id("minecraft:custom_name").unwrap(),
+                zerqon_inventory::ComponentValue::CustomName("teighto".into()),
+            )]),
+            std::collections::BTreeSet::new(),
+            &items,
+        )
+        .unwrap(),
+    )
+    .unwrap();
     let mut fixtures = vec![
         ("known_packs".to_owned(), packets::known_packs()),
         (
@@ -601,6 +624,47 @@ fn export_vanilla_decoder_fixtures() {
         (
             "entity_position".into(),
             entity_packets::position_sync(300, [2.0, 64.0, -3.0], 45.0, -30.0, true),
+        ),
+        (
+            "entity_item_moving".into(),
+            entity_packets::add_entity_with_motion(
+                300,
+                uuid::Uuid::from_u128(42),
+                data.entity_type("minecraft:item").unwrap(),
+                [1.0, 64.0, -2.0],
+                [0.1, 0.2, -0.05],
+                90.0,
+                -45.0,
+            )
+            .unwrap(),
+        ),
+        (
+            "entity_motion".into(),
+            entity_packets::entity_motion(300, [0.1, 0.2, -0.05]).unwrap(),
+        ),
+        (
+            "entity_motion_scaled".into(),
+            entity_packets::entity_motion(300, [512.25, -1024.5, 4.75]).unwrap(),
+        ),
+        (
+            "item_metadata_stone".into(),
+            entity_packets::item_metadata(300, &Some(stone), &items).unwrap(),
+        ),
+        (
+            "item_metadata_named".into(),
+            entity_packets::item_metadata(300, &Some(named_stone), &items).unwrap(),
+        ),
+        (
+            "item_metadata_empty".into(),
+            entity_packets::item_metadata(300, &None, &items).unwrap(),
+        ),
+        (
+            "take_item_entity".into(),
+            entity_packets::take_item_entity(300, 301, 7).unwrap(),
+        ),
+        (
+            "entity_position_checked".into(),
+            entity_packets::try_position_sync(300, [2.0, 64.0, -3.0], 45.0, -30.0, true).unwrap(),
         ),
         (
             "entity_head".into(),

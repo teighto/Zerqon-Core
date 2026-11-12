@@ -7,12 +7,12 @@ use crate::{
     game_data::GameData,
     java_plugins::{JavaPluginConfig, JavaPlugins},
     mobs::{MobConfig, Mobs},
-    player_inventory::InventoryService,
+    player_inventory::{InventoryHandle, InventoryService},
     players::{EntityIds, Players},
     server::TickStats,
 };
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::HashMap,
     path::Path,
     sync::{
         Arc, Mutex,
@@ -28,8 +28,13 @@ use zerqon_plugin_api::{Action, Event, LogLevel, SenderKind};
 use zerqon_plugins::Limits;
 #[cfg(test)]
 use zerqon_plugins::PluginManager;
-use zerqon_world::{Chunk, ChunkCache, ChunkWorkers, GenerationPolicy, SpawnPoint, WorldStore};
+use zerqon_world::{
+    Chunk, ChunkCache, ChunkWorkers, GenerationPolicy, NormalGenerator, SpawnPoint, WorldStore,
+};
 
+mod bulk;
+pub use bulk::{BulkEditConflict, MAX_EDIT_BLOCKS, MAX_EDIT_CHUNKS};
+mod mixed;
 #[cfg(test)]
 mod review_tests;
 #[cfg(test)]
@@ -96,6 +101,11 @@ pub enum CommandSource<'a> {
 pub enum BlockInteraction {
     Place(zerqon_inventory::UseOnRequest),
     Break(zerqon_inventory::PlayerActionRequest),
+    Mined {
+        request: zerqon_inventory::PlayerActionRequest,
+        expected: u32,
+        held: zerqon_inventory::Slot,
+    },
 }
 impl<'a> CommandSource<'a> {
     pub fn name(self) -> &'a str {
@@ -123,6 +133,10 @@ pub struct State {
     pub queries: Arc<crate::server_queries::ServerQueries>,
     pub native_read_budget: crate::native_query_runtime::NativeReadBudget,
     pub player_control_budget: crate::player_control::ControlBudget,
+    pub flight_speed: Arc<crate::flight_speed::FlightSpeedPlugin>,
+    pub world_edit: crate::world_edit::WorldEditPlugin,
+    pub tnt: Option<Arc<crate::tnt::TntService>>,
+    pub drops: Option<Arc<crate::item_drops::ItemDrops>>,
     pub lifecycle: crate::lifecycle::Lifecycle,
     pub sessions: crate::player_session::SessionRegistry,
     player_events: Mutex<HashMap<(Uuid, i32), PlayerEventReceipt>>,
@@ -144,6 +158,47 @@ struct PlayerEventReceipt {
 }
 
 impl State {
+    pub async fn inventory_packet(
+        &self,
+        uuid: Uuid,
+        id: i32,
+        inventory: &InventoryHandle,
+        packet_id: i32,
+        body: Vec<u8>,
+        can_interact: bool,
+    ) -> Result<()> {
+        mixed::edit_item(
+            self,
+            uuid,
+            id,
+            Some(inventory),
+            mixed::ItemAction::Packet {
+                id: packet_id,
+                body,
+                can_interact,
+            },
+        )
+        .await
+    }
+    pub async fn drop_selected(
+        &self,
+        uuid: Uuid,
+        id: i32,
+        inventory: &InventoryHandle,
+        all: bool,
+    ) -> Result<()> {
+        mixed::edit_item(
+            self,
+            uuid,
+            id,
+            Some(inventory),
+            mixed::ItemAction::Throw { all },
+        )
+        .await
+    }
+    pub async fn pickup_item(&self, uuid: Uuid, id: i32, key: zerqon_world::DropKey) -> Result<()> {
+        mixed::edit_item(self, uuid, id, None, mixed::ItemAction::Pickup(key)).await
+    }
     pub async fn edit_block(
         &self,
         uuid: Uuid,
@@ -151,282 +206,7 @@ impl State {
         inventory: &crate::player_inventory::InventoryHandle,
         action: BlockInteraction,
     ) -> Result<()> {
-        use zerqon_blocks::{
-            Aabb, Bounds, BuildError, Direction, Interaction, Placement, Position, StateId,
-        };
-        use zerqon_world::{ChunkKey, ChunkWrite, CommitError};
-        let world = self.world.as_ref().ok_or("world unavailable")?;
-        world.check_available()?;
-        let rules = Arc::clone(self.blocks.as_ref().ok_or("block rules unavailable")?);
-        let gameplay = Arc::clone(&self.gameplay).write_owned().await;
-        let observers = self.players.snapshots()?;
-        let actor = observers
-            .iter()
-            .find(|player| player.uuid == uuid && player.id == entity_id)
-            .ok_or("player session is no longer active")?;
-        let actor_position = actor.position;
-        let (clicked, hand) = match &action {
-            BlockInteraction::Place(request) => (request.block, request.hand),
-            BlockInteraction::Break(request) => (request.block, zerqon_inventory::Hand::Main),
-        };
-        let target = Position::new(clicked.x, clicked.y, clicked.z);
-        let held = inventory.held_stack(hand)?;
-        let (game_mode, _) = inventory.modes()?;
-        let near = [
-            f64::from(clicked.x),
-            f64::from(clicked.y),
-            f64::from(clicked.z),
-        ];
-        let mut blockers: Vec<Aabb> = observers
-            .iter()
-            .filter_map(|player| {
-                let xyz = player.position.xyz;
-                let bounds = Aabb {
-                    min: [xyz[0] - 0.3, xyz[1], xyz[2] - 0.3],
-                    max: [xyz[0] + 0.3, xyz[1] + 1.8, xyz[2] + 0.3],
-                };
-                (0..3)
-                    .all(|axis| {
-                        bounds.max[axis] >= near[axis] - 3.0 && bounds.min[axis] <= near[axis] + 4.0
-                    })
-                    .then_some(bounds)
-            })
-            .collect();
-        if let Some(mobs) = &self.mobs {
-            blockers.extend(mobs.blockers_near(near)?);
-        }
-        if blockers.len() > 1024 {
-            return Err("too many nearby entities for block interaction".into());
-        }
-        let store = Arc::clone(&world.store);
-        let cache = Arc::clone(&world.cache);
-        let data = Arc::clone(&world.data);
-        let stripes = Arc::clone(&world.stripes);
-        let failed = Arc::clone(&world.failed);
-        let players = Arc::clone(&self.players);
-        let shutdown = self.shutdown.clone();
-        let permit = Arc::clone(&world.inflight).acquire_owned().await?;
-        let ticket = world.workers.try_submit(move || {
-            Ok((|| -> Result<()> {
-                let _gameplay = gameplay;
-                let stopping = *shutdown.borrow();
-                store.check_available()?;
-                if failed.load(Ordering::Acquire) {
-                    return Err(zerqon_world::WorldError::StorageUnavailable.into());
-                }
-                if stopping {
-                    return Err(crate::lifecycle::Stopped.into());
-                }
-                let center = ChunkKey::new(clicked.x.div_euclid(16), clicked.z.div_euclid(16));
-                let keys: Vec<_> = (-1..=1)
-                    .flat_map(|x| (-1..=1).map(move |z| ChunkKey::new(center.x + x, center.z + z)))
-                    .collect();
-                let lock_ids: BTreeSet<_> = keys.iter().map(|key| stripe(key.x, key.z)).collect();
-                let _locks: Vec<_> = lock_ids
-                    .iter()
-                    .map(|id| stripes[*id].lock().map_err(|_| "chunk lock poisoned"))
-                    .collect::<std::result::Result<_, _>>()?;
-                let snapshots = store.snapshot(&keys)?;
-                let chunks: BTreeMap<_, _> = snapshots
-                    .iter()
-                    .filter_map(|snapshot| {
-                        let key = snapshot.key();
-                        snapshot
-                            .chunk()
-                            .cloned()
-                            .or_else(|| {
-                                (store.generation_policy() == GenerationPolicy::NativeFlat)
-                                    .then(|| Arc::new(Chunk::flat(key.x, key.z, data.flat)))
-                            })
-                            .map(|chunk| (key, chunk))
-                    })
-                    .collect();
-                for chunk in chunks.values() {
-                    if let Err(error) = validate_chunk(chunk, &data) {
-                        fail_world(&failed, &shutdown);
-                        return Err(error.into());
-                    }
-                }
-                let view = |position: Position| {
-                    chunks
-                        .get(&ChunkKey::new(
-                            position.x.div_euclid(16),
-                            position.z.div_euclid(16),
-                        ))
-                        .and_then(|chunk| {
-                            chunk.get_block(
-                                position.x.rem_euclid(16) as u8,
-                                position.y,
-                                position.z.rem_euclid(16) as u8,
-                            )
-                        })
-                        .map(StateId)
-                };
-                let interaction = Interaction {
-                    eye: [
-                        actor_position.xyz[0],
-                        actor_position.xyz[1] + 1.62,
-                        actor_position.xyz[2],
-                    ],
-                    block_range: 5.0,
-                    creative: game_mode == crate::game_mode::GameMode::Creative,
-                    bounds: Bounds::default(),
-                    blockers: &blockers,
-                };
-                let correction_face = match &action {
-                    BlockInteraction::Place(request) => Direction::from_id(request.face as u8),
-                    BlockInteraction::Break(_) => None,
-                };
-                let plan = (|| -> std::result::Result<zerqon_blocks::EditPlan, BuildError> {
-                    match action {
-                        BlockInteraction::Place(request) => {
-                            let held = held.as_ref().ok_or(BuildError::UnsupportedItem)?;
-                            let properties = held
-                                .patch()
-                                .added()
-                                .values()
-                                .find_map(|value| match value {
-                                    zerqon_inventory::ComponentValue::BlockState(value) => {
-                                        Some(value.clone())
-                                    }
-                                    _ => None,
-                                })
-                                .unwrap_or_default();
-                            let facing = match ((actor_position.yaw as f64 / 90.0 + 0.5).floor()
-                                as i64)
-                                .rem_euclid(4)
-                            {
-                                0 => Direction::South,
-                                1 => Direction::West,
-                                2 => Direction::North,
-                                _ => Direction::East,
-                            };
-                            rules.plan_placement(
-                                &view,
-                                &interaction,
-                                &Placement {
-                                    clicked: target,
-                                    face: Direction::from_id(request.face as u8)
-                                        .ok_or(BuildError::Invalid)?,
-                                    local_hit: request.hit,
-                                    facing,
-                                    item: held.item().0,
-                                    secondary_use: false,
-                                    properties: &properties,
-                                },
-                            )
-                        }
-                        BlockInteraction::Break(_) => rules.plan_break(
-                            &view,
-                            &interaction,
-                            target,
-                            held.as_ref().map(|stack| stack.item().0),
-                        ),
-                    }
-                })();
-                let plan = match plan {
-                    Ok(plan) => plan,
-                    Err(error) => {
-                        let corrections = std::iter::once(target)
-                            .chain(correction_face.and_then(|face| target.relative(face)))
-                            .filter_map(|position| {
-                                view(position).map(|state| {
-                                    bytes::Bytes::from(block_update(
-                                        position.x, position.y, position.z, state.0,
-                                    ))
-                                })
-                            })
-                            .collect::<Vec<_>>();
-                        players.dispatch_batches(vec![(uuid, entity_id, corrections)])?;
-                        return Err(error.into());
-                    }
-                };
-                if plan.changes().is_empty() {
-                    return Ok(());
-                }
-                let read_keys: BTreeSet<_> = plan
-                    .reads()
-                    .iter()
-                    .map(|(position, _)| {
-                        ChunkKey::new(position.x.div_euclid(16), position.z.div_euclid(16))
-                    })
-                    .collect();
-                let reads: Vec<_> = snapshots
-                    .into_iter()
-                    .filter(|snapshot| read_keys.contains(&snapshot.key()))
-                    .collect();
-                let mut changed = BTreeMap::new();
-                for change in plan.changes() {
-                    let key = ChunkKey::new(
-                        change.position.x.div_euclid(16),
-                        change.position.z.div_euclid(16),
-                    );
-                    let chunk = changed.entry(key).or_insert_with(|| {
-                        (**chunks
-                            .get(&key)
-                            .expect("planner read set includes every changed chunk"))
-                        .clone()
-                    });
-                    chunk.set_block(
-                        change.position.x.rem_euclid(16) as u8,
-                        change.position.y,
-                        change.position.z.rem_euclid(16) as u8,
-                        change.replacement.0,
-                    )?;
-                }
-                let writes: Vec<_> = changed
-                    .into_iter()
-                    .map(|(key, chunk)| ChunkWrite {
-                        key,
-                        replacement: Arc::new(chunk),
-                    })
-                    .collect();
-                let updates: Vec<_> = plan
-                    .changes()
-                    .iter()
-                    .map(|change| {
-                        bytes::Bytes::from(block_update(
-                            change.position.x,
-                            change.position.y,
-                            change.position.z,
-                            change.replacement.0,
-                        ))
-                    })
-                    .collect();
-                match store.commit(Uuid::new_v4(), &reads, &writes) {
-                    Ok(_) => {}
-                    Err(error @ CommitError::Indeterminate { .. }) => {
-                        fail_world(&failed, &shutdown);
-                        return Err(error.into());
-                    }
-                    Err(error) => return Err(error.into()),
-                }
-                match cache.lock() {
-                    Ok(mut cache) => {
-                        for write in writes {
-                            cache.insert(write.replacement);
-                        }
-                    }
-                    Err(_) => {
-                        fail_world(&failed, &shutdown);
-                        return Err("world edit committed but cache publication failed".into());
-                    }
-                }
-                for packet in updates {
-                    if let Err(error) = players.broadcast(packet) {
-                        fail_world(&failed, &shutdown);
-                        return Err(error.into());
-                    }
-                }
-                Ok(())
-            })())
-        })?;
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            ticket.wait()
-        })
-        .await???;
-        Ok(())
+        mixed::edit_block(self, uuid, entity_id, inventory, action).await
     }
 
     #[cfg(test)]
@@ -561,6 +341,18 @@ impl State {
         );
         let world = if let Some(data) = &data {
             let path = directory.join(&properties.level_name);
+            tracing::info!(level = %properties.level_name, generator = properties.level_type.as_str(), seed = properties.level_seed, "Opening world");
+            let normal = properties.level_type == crate::config::LevelType::Normal;
+            let seed = properties.level_seed;
+            let generator = if normal {
+                Some(NormalGenerator::new(
+                    seed,
+                    data.normal
+                        .ok_or("normal world requires the complete block and biome registries")?,
+                ))
+            } else {
+                None
+            };
             let settings = settings.clone();
             let data = Arc::clone(data);
             let gameplay = Arc::clone(&gameplay);
@@ -569,6 +361,7 @@ impl State {
             let world_lifecycle = lifecycle.clone();
             Some(Arc::new(
                 startup_work(lifecycle, stop, "open world", move || {
+                    crate::world_generation::prepare(&path, normal, seed)?;
                     World::new(
                         &path,
                         &settings,
@@ -577,6 +370,7 @@ impl State {
                         players,
                         shutdown,
                         world_lifecycle,
+                        generator,
                     )
                 })
                 .await?,
@@ -626,11 +420,56 @@ impl State {
                     Arc::clone(&players),
                     Arc::clone(data),
                     Arc::clone(blocks),
-                    entity_ids,
+                    Arc::clone(&entity_ids),
                     Arc::clone(&gameplay),
                 )
                 .await?,
             ),
+            _ => None,
+        };
+        let drops = match (&world, &data, &items, &blocks) {
+            (Some(world), Some(data), Some(items), Some(blocks))
+                if data.entity_type("minecraft:item").is_some() =>
+            {
+                Some(
+                    crate::item_drops::ItemDrops::open(
+                        Arc::clone(world),
+                        Arc::clone(&players),
+                        Arc::clone(data),
+                        Arc::clone(items),
+                        Arc::clone(blocks),
+                        Arc::clone(&entity_ids),
+                        crate::item_drops::ItemConfig {
+                            maximum: settings.max_item_entities,
+                            memory: settings.item_memory_mib * 1024 * 1024,
+                            stop: stop.clone(),
+                        },
+                    )
+                    .await?,
+                )
+            }
+            _ => None,
+        };
+        let tnt = match (&world, &data) {
+            (Some(world), Some(data)) if data.default_block_state("minecraft:tnt").is_some() => {
+                let blocks = blocks.as_ref().ok_or("block catalog unavailable")?;
+                let damage = Arc::new(crate::blast_damage::BlastDamage::new(
+                    Arc::clone(world),
+                    Arc::clone(&players),
+                    mobs.clone(),
+                    Arc::clone(blocks),
+                    Arc::clone(&gameplay),
+                ));
+                Some(Arc::new(crate::tnt::TntService::new(
+                    Arc::clone(world),
+                    Arc::clone(&players),
+                    Arc::clone(data),
+                    entity_ids,
+                    settings.tnt_explosions_per_tick,
+                    Arc::clone(blocks),
+                    damage,
+                )?))
+            }
             _ => None,
         };
         let tick = Arc::new(AtomicU64::new(0));
@@ -765,6 +604,12 @@ impl State {
             .unwrap_or_default();
         let state = Arc::new(Self {
             slots: Arc::new(Semaphore::new(properties.max_players)),
+            flight_speed: Arc::new(crate::flight_speed::FlightSpeedPlugin::new(
+                properties.max_players,
+            )),
+            world_edit: crate::world_edit::WorldEditPlugin::new(properties.max_players),
+            tnt,
+            drops,
             packet_budget,
             properties,
             settings,
@@ -830,9 +675,13 @@ impl State {
     }
 
     pub fn report(&self) -> String {
-        self.stats.lock().map_or_else(
+        let report = self.stats.lock().map_or_else(
             |_| "Tick metrics unavailable".into(),
             |stats| stats.report(),
+        );
+        format!(
+            "{report} | items {}",
+            self.drops.as_ref().map_or(0, |drops| drops.count())
         )
     }
     pub fn is_operator(&self, uuid: Uuid) -> bool {
@@ -1101,6 +950,7 @@ impl State {
     }
 
     async fn player_quit(&self, uuid: Uuid, session: i32, name: &str) -> Result<()> {
+        self.world_edit.unregister(uuid, session);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         let deadline = self
             .lifecycle
@@ -1287,13 +1137,44 @@ impl State {
         };
         let name = name.to_ascii_lowercase();
         let args: Vec<String> = words.map(str::to_owned).collect();
+        if matches!(
+            name.as_str(),
+            "pos1" | "pos2" | "size" | "set" | "replace" | "desel"
+        ) {
+            if level < 2 {
+                return Ok(vec!["Permission denied".into()]);
+            }
+            return self.world_edit.execute(self, source, &name, &args).await;
+        }
+        if matches!(name.as_str(), "ignite" | "tntstatus" | "tntcancel") {
+            if level < 2 {
+                return Ok(vec!["Permission denied".into()]);
+            }
+            if !args.is_empty() {
+                return Ok(vec![format!("Usage: //{name}")]);
+            }
+            let tnt = self.tnt.as_ref().ok_or("TNT simulation unavailable")?;
+            return match name.as_str() {
+                "ignite" => {
+                    let count = tnt
+                        .ignite(self.world_edit.selection_positions(source)?)
+                        .await?;
+                    Ok(vec![format!("Primed {count} TNT")])
+                }
+                "tntcancel" => {
+                    tnt.cancel().await?;
+                    Ok(vec!["Pending TNT cancelled".into()])
+                }
+                _ => Ok(vec![tnt.status()]),
+            };
+        }
         match name.as_str(){
             "tps"=>Ok(vec![self.report()]),
             "spark"=>Ok(self.profiler.execute(&args,level>=4).await?),
             "list"=>Ok(vec![format!("Players ({}): {}",self.online(),self.players.names().join(", "))]),
             "version"=>Ok(vec![format!("Zerqon {} | Minecraft 26.3 | teighto",env!("CARGO_PKG_VERSION"))]),
-            "help"=>Ok(vec!["Commands: /help /version /tps /tpsbar /plugins; operator: /give player item [count], /summon pig|cow|zombie [x y z], /setblock x y z state, /stop".into()]),
-            "plugins"=>{let rust=self.plugins.list().iter().map(|plugin|format!("{} ({})",plugin.name,if plugin.enabled{"enabled"}else{"disabled"})).collect::<Vec<_>>().join(", ");let java=if let Some(java)=&self.java{java.list().await?.iter().map(|plugin|format!("{} ({})",plugin.name,if plugin.enabled{"enabled"}else{"disabled"})).collect::<Vec<_>>().join(", ")}else{"disabled".into()};let callbacks=self.plugins.stats();let reads=self.native_read_budget.snapshot();let controls=self.player_control_budget.snapshot();Ok(vec![format!("Rust: {rust}; Java: {java} | Rust callbacks: {}; event bytes: {}; native read memory: {}/{} bytes; control memory: {}/{} bytes",callbacks.callbacks,callbacks.bytes,reads.reserved_bytes,reads.limit_bytes,controls.reserved_bytes,controls.limit_bytes)])},
+            "help"=>Ok(vec!["Commands: /help /version /tps /tpsbar /plugins; editor: //pos1 //pos2 //set //replace //ignite //tntstatus; operator: /give player item [count], /speed 1..10 [player], /summon pig|cow|zombie [x y z], /setblock x y z state, /stop".into()]),
+            "plugins"=>{let rust=self.plugins.list().iter().map(|plugin|format!("{} ({})",plugin.name,if plugin.enabled{"enabled"}else{"disabled"})).collect::<Vec<_>>().join(", ");let java=if let Some(java)=&self.java{java.list().await?.iter().map(|plugin|format!("{} ({})",plugin.name,if plugin.enabled{"enabled"}else{"disabled"})).collect::<Vec<_>>().join(", ")}else{"disabled".into()};let callbacks=self.plugins.stats();let reads=self.native_read_budget.snapshot();let controls=self.player_control_budget.snapshot();Ok(vec![format!("Rust: {rust}; Java: {java} | Built-in Rust: {}, {} | Rust callbacks: {}; event bytes: {}; native read memory: {}/{} bytes; control memory: {}/{} bytes",crate::flight_speed::PLUGIN_NAME,crate::world_edit::PLUGIN_NAME,callbacks.callbacks,callbacks.bytes,reads.reserved_bytes,reads.limit_bytes,controls.reserved_bytes,controls.limit_bytes)])},
             "stop"=>{if level<4{return Ok(vec!["Permission denied".into()]);}let _=self.shutdown.send(true);Ok(vec!["Stopping Zerqon".into()])},
             "setblock"=>{
                 if level<2{return Ok(vec!["Permission denied".into()]);}
@@ -1310,6 +1191,21 @@ impl State {
                 let player=self.players.snapshots()?.into_iter().find(|player|player.name.eq_ignore_ascii_case(&args[0])).ok_or("Player is not connected")?;
                 self.inventories.as_ref().ok_or("Inventory service unavailable")?.give(player.uuid,player.id,&args[1],count).await?;
                 Ok(vec![format!("Gave {count} {} to {}",args[1],player.name)])
+            },
+            "speed"=>{
+                if level<2{return Ok(vec!["Permission denied".into()]);}
+                if !(1..=2).contains(&args.len()){return Ok(vec!["Usage: /speed 1..10 [player]".into()]);}
+                let speed=crate::flight_speed::FlightSpeed::parse(&args[0])?;
+                let player=if args.len()==2 {
+                    self.players.snapshots()?.into_iter().find(|player|player.name.eq_ignore_ascii_case(&args[1])).ok_or("Player is not connected")?
+                } else {
+                    match source {
+                        CommandSource::Console=>return Ok(vec!["Usage: /speed 1..10 player".into()]),
+                        CommandSource::Player{uuid,session_id,..}=>self.players.query_snapshot(uuid)?.filter(|player|player.id==session_id).ok_or("Player is not connected")?,
+                    }
+                };
+                self.flight_speed.set(player.uuid,player.id,speed)?;
+                Ok(vec![format!("Flight speed for {}: {}",player.name,speed.level())])
             },
             "summon"=>{
                 if level<2{return Ok(vec!["Permission denied".into()]);}
@@ -1368,6 +1264,16 @@ fn is_builtin(name: &str) -> bool {
             | "spark"
             | "summon"
             | "give"
+            | "speed"
+            | "pos1"
+            | "pos2"
+            | "size"
+            | "set"
+            | "replace"
+            | "desel"
+            | "ignite"
+            | "tntstatus"
+            | "tntcancel"
             | "op"
             | "deop"
     )
@@ -1434,6 +1340,8 @@ impl Drop for PreparedChunkCompletion {
 }
 
 pub struct World {
+    generator: Option<NormalGenerator>,
+    generated_spawn: [i32; 3],
     players: Arc<Players>,
     shutdown: watch::Sender<bool>,
     failed: Arc<AtomicBool>,
@@ -1480,6 +1388,15 @@ impl World {
         }
         Ok(())
     }
+    pub async fn gameplay_read(&self) -> tokio::sync::OwnedRwLockReadGuard<()> {
+        Arc::clone(&self.gameplay).read_owned().await
+    }
+    pub(crate) fn storage(&self) -> Arc<WorldStore> {
+        Arc::clone(&self.store)
+    }
+    pub(crate) fn stop_after_storage_failure(&self) {
+        fail_world(&self.failed, &self.shutdown);
+    }
     pub fn check_health(&self) -> Result<()> {
         self.store.check_available()?;
         if self.failed.load(Ordering::Acquire) {
@@ -1491,7 +1408,7 @@ impl World {
         self.store.metadata().map_or_else(
             || SpawnPoint {
                 dimension: "minecraft:overworld".into(),
-                position: [0, 64, 0],
+                position: self.generated_spawn,
                 yaw: 0.0,
                 pitch: 0.0,
             },
@@ -1500,6 +1417,9 @@ impl World {
     }
     pub fn existing_only(&self) -> bool {
         self.store.generation_policy() == GenerationPolicy::ExistingOnly
+    }
+    fn generate(&self, x: i32, z: i32) -> Chunk {
+        generate_chunk(x, z, &self.data, self.generator)
     }
     pub fn missing_imported_chunk(error: &(dyn std::error::Error + 'static)) -> bool {
         matches!(
@@ -1532,6 +1452,7 @@ impl World {
         let store = Arc::clone(&self.store);
         let cache = Arc::clone(&self.cache);
         let data = Arc::clone(&self.data);
+        let generator = self.generator;
         let stripes = Arc::clone(&self.stripes);
         self.execute(move || {
             let _guard = stripes[stripe(x, z)]
@@ -1542,11 +1463,7 @@ impl World {
             if let Some(chunk) = cached {
                 return Ok(chunk);
             }
-            let chunk = Arc::new(
-                store
-                    .load(x, z)?
-                    .unwrap_or_else(|| Chunk::flat(x, z, data.flat)),
-            );
+            let chunk = Arc::new(load_or_generate(&store, x, z, &data, generator)?);
             validate_chunk(&chunk, &data)?;
             cache
                 .lock()
@@ -1556,6 +1473,7 @@ impl World {
         })
         .await
     }
+    #[expect(clippy::too_many_arguments)]
     fn new(
         path: &Path,
         settings: &Settings,
@@ -1564,6 +1482,7 @@ impl World {
         players: Arc<Players>,
         shutdown: watch::Sender<bool>,
         lifecycle: crate::lifecycle::Lifecycle,
+        generator: Option<NormalGenerator>,
     ) -> Result<Self> {
         let store = WorldStore::open(path)?;
         if let Some(metadata) = store.metadata() {
@@ -1574,6 +1493,9 @@ impl World {
             validate_chunk(&spawn, &data)?;
         }
         Ok(Self {
+            generator,
+            generated_spawn: generator
+                .map_or([0, 64, 0], |generator| normal_spawn(generator, &data)),
             players,
             shutdown,
             failed: Arc::new(AtomicBool::new(false)),
@@ -1667,6 +1589,7 @@ impl World {
                     let data = Arc::clone(&world.data);
                     let stripes = Arc::clone(&world.stripes);
                     let failed = Arc::clone(&world.failed);
+                    let generator = world.generator;
                     let ticket = world.workers.try_submit(move || {
                         snapshot.mark();
                         let _guard = stripes[stripe(x, z)].lock().map_err(|_| {
@@ -1683,11 +1606,7 @@ impl World {
                         let chunk = if let Some(chunk) = cached {
                             chunk
                         } else {
-                            let chunk = Arc::new(
-                                store
-                                    .load(x, z)?
-                                    .unwrap_or_else(|| Chunk::flat(x, z, data.flat)),
-                            );
+                            let chunk = Arc::new(load_or_generate(&store, x, z, &data, generator)?);
                             validate_chunk(&chunk, &data)?;
                             cache
                                 .lock()
@@ -1697,8 +1616,12 @@ impl World {
                                 .insert(Arc::clone(&chunk));
                             chunk
                         };
-                        crate::packets::chunk(&chunk, &data)
-                            .map_err(|_| zerqon_world::WorldError::Corrupt("unknown block state"))
+                        let packet = if generator.is_some() {
+                            crate::packets::chunk_with_generator(&chunk, &data, generator)
+                        } else {
+                            crate::packets::chunk(&chunk, &data)
+                        };
+                        packet.map_err(|_| zerqon_world::WorldError::Corrupt("unknown block state"))
                     })?;
                     let result = ticket.wait();
                     drop(work_permit);
@@ -1751,6 +1674,7 @@ impl World {
         let store = Arc::clone(&self.store);
         let cache = Arc::clone(&self.cache);
         let data = Arc::clone(&self.data);
+        let generator = self.generator;
         let stripes = Arc::clone(&self.stripes);
         let ticket = self.workers.try_submit(move || {
             let _gameplay = gameplay;
@@ -1776,7 +1700,7 @@ impl World {
             } else {
                 store
                     .load(cx, cz)?
-                    .unwrap_or_else(|| Chunk::flat(cx, cz, data.flat))
+                    .unwrap_or_else(|| generate_chunk(cx, cz, &data, generator))
             };
             validate_chunk(&chunk, &data)?;
             chunk.set_block(x.rem_euclid(16) as u8, y, z.rem_euclid(16) as u8, block)?;
@@ -1815,6 +1739,64 @@ impl World {
             Err(error) => Err(error.into()),
         }
     }
+}
+
+fn generate_chunk(x: i32, z: i32, data: &GameData, generator: Option<NormalGenerator>) -> Chunk {
+    generator.map_or_else(
+        || Chunk::flat(x, z, data.flat),
+        |generator| generator.generate(x, z),
+    )
+}
+
+fn load_or_generate(
+    store: &WorldStore,
+    x: i32,
+    z: i32,
+    data: &GameData,
+    generator: Option<NormalGenerator>,
+) -> std::result::Result<Chunk, zerqon_world::WorldError> {
+    if let Some(chunk) = store.load(x, z)? {
+        return Ok(chunk);
+    }
+    let chunk = generate_chunk(x, z, data, generator);
+    validate_chunk(&chunk, data)?;
+    if generator.is_some() {
+        store.save(&chunk)?;
+    }
+    Ok(chunk)
+}
+
+fn normal_spawn(generator: NormalGenerator, data: &GameData) -> [i32; 3] {
+    for radius in 0i32..=32 {
+        for dx in -radius..=radius {
+            for dz in -radius..=radius {
+                if dx.abs().max(dz.abs()) != radius {
+                    continue;
+                }
+                let (x, z) = (dx * 16 + 8, dz * 16 + 8);
+                let y = generator.surface_height(i64::from(x), i64::from(z));
+                if !(zerqon_world::NORMAL_SEA_LEVEL + 1..=140).contains(&y) {
+                    continue;
+                }
+                let chunk = generator.generate(dx, dz);
+                if (1..=2).all(|dy| {
+                    chunk
+                        .get_block(8, y + dy, 8)
+                        .is_some_and(|state| data.is_air(state))
+                }) {
+                    return [x, y + 1, z];
+                }
+            }
+        }
+    }
+    [
+        0,
+        generator
+            .surface_height(0, 0)
+            .max(zerqon_world::NORMAL_SEA_LEVEL)
+            + 12,
+        0,
+    ]
 }
 
 fn fail_world(failed: &AtomicBool, shutdown: &watch::Sender<bool>) {

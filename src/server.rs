@@ -290,7 +290,15 @@ async fn run_tick(state: Arc<State>, tick: u64) -> Result<()> {
     }
     if !*state.shutdown.borrow()
         && let Some(mobs) = &state.mobs
-        && let Err(error) = mobs.tick(tick).await
+        && let Err(error) = async {
+            let food = if let Some(inventories) = &state.inventories {
+                inventories.food_targets(&state.players.snapshots()?)?
+            } else {
+                Vec::new()
+            };
+            mobs.tick_with_food(tick, food).await
+        }
+        .await
     {
         if *state.shutdown.borrow() && crate::managed_tasks::is_cancelled(error.as_ref()) {
             cancellation = Some(error);
@@ -301,6 +309,33 @@ async fn run_tick(state: Arc<State>, tick: u64) -> Result<()> {
             tracing::error!(%error,"Mob tick failed");
         } else {
             failures.push(format!("mob tick: {error}"));
+        }
+    }
+    if !*state.shutdown.borrow()
+        && let Some(tnt) = &state.tnt
+        && let Err(error) = tnt.tick(tick).await
+    {
+        if *state.shutdown.borrow() && crate::managed_tasks::is_cancelled(error.as_ref()) {
+            cancellation = Some(error);
+        } else {
+            failures.push(format!("TNT tick: {error}"));
+        }
+    }
+    if !*state.shutdown.borrow()
+        && let Some(drops) = &state.drops
+        && let Err(error) = async {
+            let candidates = drops.tick(tick).await?;
+            for (uuid, id, key) in candidates {
+                state.pickup_item(uuid, id, key).await?;
+            }
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+        }
+        .await
+    {
+        if *state.shutdown.borrow() && crate::managed_tasks::is_cancelled(error.as_ref()) {
+            cancellation = Some(error);
+        } else {
+            failures.push(format!("item tick: {error}"));
         }
     }
     if !*state.shutdown.borrow()
@@ -496,6 +531,11 @@ async fn shutdown_components(state: &State) -> Result<()> {
     {
         tracing::error!(%error,"Mob snapshot shutdown save failed");
         failures.push(format!("mob snapshot: {error}"));
+    }
+    if let Some(drops) = &state.drops
+        && let Err(error) = drops.flush().await
+    {
+        failures.push(format!("item snapshot: {error}"));
     }
     match state.profiler.shutdown().await {
         Ok(messages) => {
@@ -842,7 +882,14 @@ mod tests {
         );
         assert!(disabled, "world failure skipped plugin Disable");
         assert!(matches!(profiler, Err(ProfilerServiceError::ShuttingDown)));
-        assert!(drain.is_ok(), "lifecycle cleanup failed: {drain:?}");
+        assert!(
+            matches!(
+                &drain,
+                Err(crate::lifecycle::DrainError::Cleanup { failures, omitted: 0 })
+                    if failures.len() == 1 && failures[0].contains("unknown block state")
+            ),
+            "accepted world failure was lost or cleanup did not finish: {drain:?}"
+        );
         assert!(state.lifecycle.pending().is_empty());
     }
 }

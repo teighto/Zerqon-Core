@@ -101,6 +101,7 @@ impl Fixture {
 
 fn play_state(epoch: u64) -> PlayState {
     PlayState {
+        mining: None,
         radius: 0,
         loaded: HashSet::new(),
         center: (0, 0),

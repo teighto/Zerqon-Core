@@ -388,20 +388,15 @@ fn slab_collision_allows_touching_but_rejects_intersection_with_the_placed_half(
 }
 
 #[test]
-fn unsupported_items_fluids_entities_and_neighbor_effects_fail_explicitly() {
+fn unsupported_items_and_interactive_targets_preserve_ordinary_neighbor_building() {
     let properties = BTreeMap::new();
-    for key in [
-        "minecraft:oak_door",
-        "minecraft:oak_sign",
-        "minecraft:water_bucket",
-        "minecraft:sand",
-    ] {
+    for key in ["minecraft:oak_sign", "minecraft:water_bucket"] {
         let mut request = stone_request(&properties);
         request.item = catalog().item_id(key).unwrap();
         assert!(
             matches!(
                 catalog().plan_placement(&floor, &context(), &request),
-                Err(BuildError::UnsupportedItem)
+                Err(BuildError::UnsupportedItem | BuildError::UnsupportedBlock(_))
             ),
             "{key}"
         );
@@ -421,12 +416,14 @@ fn unsupported_items_fluids_entities_and_neighbor_effects_fail_explicitly() {
                 floor(position)
             }
         };
+        let plan = catalog()
+            .plan_placement(&view, &context(), &request)
+            .unwrap();
         assert!(
-            matches!(
-                catalog().plan_placement(&view, &context(), &request),
-                Err(BuildError::Fluid(_) | BuildError::UnsupportedBlock(_))
-            ),
-            "{key}"
+            plan.changes()
+                .iter()
+                .all(|change| change.position != Position::new(1, 1, 0)),
+            "unchanged neighbor was overwritten: {key}"
         );
     }
     let chest = state("minecraft:chest", &[]);
@@ -444,7 +441,7 @@ fn unsupported_items_fluids_entities_and_neighbor_effects_fail_explicitly() {
 }
 
 #[test]
-fn creative_tool_restrictions_and_survival_are_not_silently_ignored() {
+fn creative_tool_restrictions_preserve_survival_planning() {
     let sword = catalog().item_id("minecraft:diamond_sword").unwrap();
     assert!(matches!(
         catalog().plan_break(&floor, &context(), Position::new(0, 0, 0), Some(sword)),
@@ -452,10 +449,13 @@ fn creative_tool_restrictions_and_survival_are_not_silently_ignored() {
     ));
     let mut interaction = context();
     interaction.creative = false;
-    assert!(matches!(
-        catalog().plan_break(&floor, &interaction, Position::new(0, 0, 0), None),
-        Err(BuildError::Survival)
-    ));
+    assert!(
+        !catalog()
+            .plan_break(&floor, &interaction, Position::new(0, 0, 0), None)
+            .unwrap()
+            .changes()
+            .is_empty()
+    );
     assert!(
         catalog()
             .plan_break(&floor, &context(), Position::new(0, 0, 0), Some(u32::MAX))

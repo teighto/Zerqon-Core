@@ -208,7 +208,7 @@ class Client:
             self.handle(kind,body)
             if token and kind == 4 and wire.Cursor(body).varint() == token:
                 if request_full and self.full <= before:
-                    raise AssertionError('Abort-action acknowledgement arrived without full snapshot')
+                    raise AssertionError('Block-action acknowledgement arrived without full snapshot')
                 break
             if token is None and self.full > before:
                 break

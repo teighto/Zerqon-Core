@@ -3,6 +3,7 @@ mod cache;
 mod chunk;
 mod file_lock;
 pub mod metadata;
+mod normal;
 mod section;
 mod source_data;
 mod storage;
@@ -13,12 +14,14 @@ pub use cache::ChunkCache;
 pub use chunk::{Chunk, FlatPalette, MIN_Y, SECTION_COUNT, WORLD_HEIGHT};
 pub use file_lock::ExclusiveFileLock;
 pub use metadata::{GenerationPolicy, SpawnPoint, WorldMetadata};
+pub use normal::{NORMAL_SEA_LEVEL, NormalGenerator, NormalPalette};
 pub use section::{SECTION_VOLUME, Section};
 pub use storage::WorldStore;
 pub use transaction::{
     ChunkKey, ChunkSnapshot, ChunkWrite, CommitError, CommitReceipt, CommittedChunk, CommittedDrop,
     CommittedPlayer, DomainReceipt, DomainSnapshot, DropData, DropKey, DropSnapshot, DropWrite,
-    MAX_PLAYER_RECORD_BYTES, PlayerKey, PlayerSnapshot, PlayerWrite,
+    MAX_DOMAIN_READS, MAX_DOMAIN_WRITES, MAX_PLAYER_RECORD_BYTES, NORMAL_GENERATION_GUARD,
+    PlayerKey, PlayerSnapshot, PlayerWrite,
 };
 pub use workers::{ChunkTicket, ChunkWorkers};
 

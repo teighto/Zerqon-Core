@@ -7,7 +7,7 @@ use std::{
 use serde::Deserialize;
 use zerqon_protocol::codec::{put_string, put_varint};
 
-use zerqon_world::FlatPalette;
+use zerqon_world::{FlatPalette, NormalPalette};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DataError {
@@ -78,6 +78,7 @@ impl BlockResolver {
 
 pub struct GameData {
     pub flat: FlatPalette,
+    pub normal: Option<NormalPalette>,
     pub plains_biome: i32,
     pub overworld_dimension: i32,
     pub block_bits: u8,
@@ -85,11 +86,16 @@ pub struct GameData {
     configuration: Vec<Vec<u8>>,
     block_flags: Vec<u8>,
     entity_types: BTreeMap<String, i32>,
+    block_defaults: BTreeMap<String, u32>,
 }
 
 impl GameData {
     pub fn entity_type(&self, name: &str) -> Option<i32> {
         self.entity_types.get(name).copied()
+    }
+
+    pub fn default_block_state(&self, name: &str) -> Option<u32> {
+        self.block_defaults.get(name).copied()
     }
 
     pub fn load(path: &Path) -> Result<Self, DataError> {
@@ -191,8 +197,14 @@ impl GameData {
             "minecraft:overworld",
         )?;
         let configuration = configuration_packets(&registry_data.registries, &tags.registries)?;
+        let normal = normal_palette(&blocks, &registry_data.registries, flat)?;
+        let block_defaults = blocks
+            .keys()
+            .map(|name| Ok((name.clone(), default(name)?)))
+            .collect::<Result<_, DataError>>()?;
         Ok(Self {
             flat,
+            normal,
             plains_biome,
             overworld_dimension,
             block_bits: (u32::BITS - max_block_state.leading_zeros()).max(1) as u8,
@@ -200,6 +212,7 @@ impl GameData {
             configuration,
             block_flags,
             entity_types,
+            block_defaults,
         })
     }
 
@@ -226,6 +239,122 @@ impl GameData {
             .get(state as usize)
             .is_some_and(|flags| flags & 4 != 0)
     }
+}
+
+fn normal_palette(
+    blocks: &BTreeMap<String, Block>,
+    registries: &[Registry],
+    flat: FlatPalette,
+) -> Result<Option<NormalPalette>, DataError> {
+    const BLOCKS: &[&str] = &[
+        "minecraft:deepslate",
+        "minecraft:sand",
+        "minecraft:sandstone",
+        "minecraft:gravel",
+        "minecraft:water",
+        "minecraft:lava",
+        "minecraft:snow_block",
+        "minecraft:oak_log",
+        "minecraft:oak_leaves",
+        "minecraft:spruce_log",
+        "minecraft:spruce_leaves",
+        "minecraft:coal_ore",
+        "minecraft:iron_ore",
+        "minecraft:copper_ore",
+        "minecraft:gold_ore",
+        "minecraft:redstone_ore",
+        "minecraft:diamond_ore",
+    ];
+    const BIOMES: &[&str] = &[
+        "minecraft:plains",
+        "minecraft:forest",
+        "minecraft:desert",
+        "minecraft:snowy_plains",
+        "minecraft:ocean",
+        "minecraft:river",
+        "minecraft:jagged_peaks",
+    ];
+    let biome_registry = registries
+        .iter()
+        .find(|registry| registry.name == "minecraft:worldgen/biome");
+    // Small flat-only test/embedded catalogs remain valid. Normal startup explicitly
+    // requires this optional palette instead of inventing IDs for absent entries.
+    if BLOCKS.iter().any(|name| !blocks.contains_key(*name))
+        || BIOMES.iter().any(|name| {
+            !biome_registry
+                .is_some_and(|registry| registry.entries.iter().any(|entry| entry.id == *name))
+        })
+    {
+        return Ok(None);
+    }
+    let state = |name: &str, leaves: bool| -> Result<u32, DataError> {
+        let block = &blocks[name];
+        let defaults: Vec<_> = block.states.iter().filter(|state| state.default).collect();
+        let [default] = defaults.as_slice() else {
+            return Err(invalid(format!(
+                "{name} requires exactly one default state"
+            )));
+        };
+        if !leaves {
+            return Ok(default.id);
+        }
+        // Persist native crowns even before random leaf-decay ticks are implemented.
+        let matching: Vec<_> = block
+            .states
+            .iter()
+            .filter(|candidate| {
+                default.properties.iter().all(|(key, value)| {
+                    let expected = match key.as_str() {
+                        "persistent" => "true",
+                        "distance" => "1",
+                        _ => value.as_str(),
+                    };
+                    candidate
+                        .properties
+                        .get(key)
+                        .is_some_and(|value| value == expected)
+                })
+            })
+            .collect();
+        let [leaf] = matching.as_slice() else {
+            return Err(invalid(format!(
+                "missing unique persistent leaf state for {name}"
+            )));
+        };
+        Ok(leaf.id)
+    };
+    let biome = |name| registry_id(registries, "minecraft:worldgen/biome", name);
+    Ok(Some(NormalPalette {
+        air: flat.air,
+        bedrock: flat.bedrock,
+        stone: flat.stone,
+        dirt: flat.dirt,
+        grass: flat.grass,
+        deepslate: state("minecraft:deepslate", false)?,
+        sand: state("minecraft:sand", false)?,
+        sandstone: state("minecraft:sandstone", false)?,
+        gravel: state("minecraft:gravel", false)?,
+        water: state("minecraft:water", false)?,
+        lava: state("minecraft:lava", false)?,
+        snow: state("minecraft:snow_block", false)?,
+        oak_log: state("minecraft:oak_log", false)?,
+        oak_leaves: state("minecraft:oak_leaves", true)?,
+        spruce_log: state("minecraft:spruce_log", false)?,
+        spruce_leaves: state("minecraft:spruce_leaves", true)?,
+        coal_ore: state("minecraft:coal_ore", false)?,
+        iron_ore: state("minecraft:iron_ore", false)?,
+        copper_ore: state("minecraft:copper_ore", false)?,
+        gold_ore: state("minecraft:gold_ore", false)?,
+        redstone_ore: state("minecraft:redstone_ore", false)?,
+        diamond_ore: state("minecraft:diamond_ore", false)?,
+        plains: biome("minecraft:plains")?,
+        forest: biome("minecraft:forest")?,
+        desert: biome("minecraft:desert")?,
+        snowy_plains: biome("minecraft:snowy_plains")?,
+        ocean: biome("minecraft:ocean")?,
+        river: biome("minecraft:river")?,
+        mountains: biome("minecraft:jagged_peaks")?,
+    }))
 }
 
 #[derive(Deserialize)]

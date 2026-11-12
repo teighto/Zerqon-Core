@@ -20,6 +20,8 @@ pub(crate) const GUARD_V2: &[u8] =
     b"ZERQON_STORAGE_V2\nThis world uses chunks.redb. Older Zerqon versions must not open it.\n";
 pub(crate) const GUARD: &[u8] =
     b"ZERQON_STORAGE_V3\nThis world uses one chunks.redb domain for chunks, players and item drops. Older Zerqon versions must not open it.\n";
+pub const NORMAL_GENERATION_GUARD: &[u8] =
+    b"ZERQON_STORAGE_V3_NORMAL_1\nThis world requires native normal generation version 1. Older Zerqon versions must not open it.\n";
 const CHUNKS: TableDefinition<u64, &[u8]> = TableDefinition::new("chunks");
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const RECEIPTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("receipts");
@@ -29,8 +31,14 @@ const PLAYER_CREATED: TableDefinition<&[u8], u8> = TableDefinition::new("player_
 const DROPS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("drops");
 const DROP_CHUNKS: TableDefinition<&[u8], u8> = TableDefinition::new("drop_chunks");
 const MAX_CHUNK: usize = 1024 * 1024;
-const MAX_READS: usize = 64;
-const MAX_WRITES: usize = 16;
+const MAX_CHUNK_READS: usize = 64;
+const MAX_CHUNK_WRITES: usize = 16;
+const MAX_DROP_PAGE_KEYS: usize = 64;
+/// Maximum total chunk, player and drop keys read by one domain operation.
+pub const MAX_DOMAIN_READS: usize = 512;
+/// Maximum total chunk, player and drop after-images committed atomically.
+pub const MAX_DOMAIN_WRITES: usize = 512;
+const MAX_RECEIPT_BYTES: usize = 64 * 1024;
 const RECEIPT_LIMIT: u64 = 4096;
 const MAX_RECORD: usize = 2 * 1024 * 1024;
 /// Includes bounded world/mode envelope headroom for a maximum-size legacy ZINV file.
@@ -39,7 +47,7 @@ const MAX_WRITE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_READ_BYTES: usize = 64 * 1024 * 1024;
 
 pub(crate) fn is_storage_guard(bytes: &[u8]) -> bool {
-    bytes == GUARD || bytes == GUARD_V2
+    bytes == GUARD || bytes == GUARD_V2 || bytes == NORMAL_GENERATION_GUARD
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -283,8 +291,12 @@ impl Transactions {
             metadata.generation_policy
         });
         if !path.try_exists()? {
-            let guarded_v3 = root.join("IMPORT_INCOMPLETE").try_exists()?
-                && crate::metadata::read_regular(&root.join("IMPORT_INCOMPLETE"), 4096)? == GUARD;
+            let guarded_v3 = if root.join("IMPORT_INCOMPLETE").try_exists()? {
+                let bytes = crate::metadata::read_regular(&root.join("IMPORT_INCOMPLETE"), 4096)?;
+                bytes == GUARD || bytes == NORMAL_GENERATION_GUARD
+            } else {
+                false
+            };
             if marker.try_exists()? || guarded_v3 {
                 return Err(error(
                     "transaction database is missing; preserved chunk files are not a fallback",
@@ -353,10 +365,16 @@ impl Transactions {
         } else {
             None
         };
-        if identity.schema == 3 && guard_bytes.as_deref() != Some(GUARD) {
+        if identity.schema == 3
+            && guard_bytes.as_deref() != Some(GUARD)
+            && guard_bytes.as_deref() != Some(NORMAL_GENERATION_GUARD)
+        {
             return Err(error("V3 database requires its downgrade guard"));
         }
         if identity.schema == 2 {
+            if guard_bytes.as_deref() == Some(NORMAL_GENERATION_GUARD) {
+                return Err(error("normal generation requires a V3 database"));
+            }
             if marked.as_ref().is_some_and(|marker| marker.schema != 2) {
                 return Err(error("V3 marker cannot identify a V2 database"));
             }
@@ -505,7 +523,7 @@ impl Transactions {
     pub(crate) fn snapshot(&self, keys: &[ChunkKey]) -> Result<Vec<ChunkSnapshot>, WorldError> {
         self.healthy()?;
         if keys.is_empty()
-            || keys.len() > MAX_READS
+            || keys.len() > MAX_CHUNK_READS
             || keys.iter().collect::<BTreeSet<_>>().len() != keys.len()
         {
             return Err(error("snapshot requires unique bounded chunk keys"));
@@ -552,7 +570,7 @@ impl Transactions {
             .len()
             .saturating_add(players.len())
             .saturating_add(drops.len());
-        if count == 0 || count > MAX_READS {
+        if count == 0 || count > MAX_DOMAIN_READS || chunks.len() > MAX_CHUNK_READS {
             return Err(WorldError::TransactionLimit("snapshot key count"));
         }
         if chunks.iter().collect::<BTreeSet<_>>().len() != chunks.len()
@@ -651,7 +669,7 @@ impl Transactions {
         limit: usize,
     ) -> Result<Vec<DropSnapshot>, WorldError> {
         self.healthy()?;
-        if limit == 0 || limit > MAX_READS {
+        if limit == 0 || limit > MAX_DROP_PAGE_KEYS {
             return Err(WorldError::TransactionLimit("drop page count"));
         }
         if after.is_some_and(|key| key.uuid.is_nil()) {
@@ -821,7 +839,11 @@ impl Transactions {
         if operation.is_nil() || read_count == 0 || write_count == 0 {
             return Err(error("transaction requires a nonnil operation and reads/writes").into());
         }
-        if read_count > MAX_READS || write_count > MAX_WRITES {
+        if read_count > MAX_DOMAIN_READS
+            || write_count > MAX_DOMAIN_WRITES
+            || reads.chunks.len() > MAX_CHUNK_READS
+            || chunk_writes.len() > MAX_CHUNK_WRITES
+        {
             return Err(WorldError::TransactionLimit("read/write count").into());
         }
         let mut expected_chunks = BTreeMap::new();
@@ -1145,7 +1167,7 @@ impl Transactions {
             receipt: receipt.clone(),
         })
         .map_err(|cause| self.backend_error(cause))?;
-        if saved.len() > 8192 {
+        if saved.len() > MAX_RECEIPT_BYTES {
             return Err(WorldError::TransactionLimit("receipt bytes").into());
         }
         receipts
@@ -1446,7 +1468,7 @@ fn decode_chunk(key: ChunkKey, value: &[u8]) -> Result<(u64, Chunk), WorldError>
     Ok((revision, chunk))
 }
 fn decode_receipt(value: &[u8]) -> Result<SavedReceipt, WorldError> {
-    if value.len() > 8192 {
+    if value.len() > MAX_RECEIPT_BYTES {
         return Err(error("oversized operation receipt"));
     }
     let saved: SavedReceipt = serde_json::from_slice(value).map_err(error)?;
@@ -1459,7 +1481,8 @@ fn decode_receipt(value: &[u8]) -> Result<SavedReceipt, WorldError> {
     if receipt.operation.is_nil()
         || receipt.revision == 0
         || count == 0
-        || count > MAX_WRITES
+        || count > MAX_DOMAIN_WRITES
+        || receipt.chunks.len() > MAX_CHUNK_WRITES
         || receipt
             .chunks
             .iter()

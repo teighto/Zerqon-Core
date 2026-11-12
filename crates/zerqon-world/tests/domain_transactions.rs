@@ -539,77 +539,47 @@ fn invalid_ids_duplicates_missing_reads_and_foreign_tokens_never_write() {
 }
 
 #[test]
-fn read_and_write_count_limits_apply_to_the_sum_of_all_domains() {
+fn mixed_snapshots_and_writes_are_not_limited_by_chunk_only_totals() {
     let root = tempfile::tempdir().unwrap();
     let store = WorldStore::open(root.path()).unwrap();
     let chunks: Vec<_> = (0..22).map(|x| ChunkKey::new(x, -x)).collect();
     let players: Vec<_> = (1..=22).map(player).collect();
     let drops: Vec<_> = (1..=22).map(drop_key).collect();
-    assert!(
-        store
-            .snapshot_domain(&chunks[..21], &players, &drops[..21])
-            .is_ok()
-    );
-    assert!(
-        store
-            .snapshot_domain(&chunks, &players, &drops[..21])
-            .is_err()
+    let snapshot = store
+        .snapshot_domain(&chunks, &players, &drops[..21])
+        .unwrap();
+    assert_eq!(
+        snapshot.chunks.len() + snapshot.players.len() + snapshot.drops.len(),
+        65
     );
     let reads = store
         .snapshot_domain(&chunks[..6], &players[..6], &drops[..5])
         .unwrap();
-    let chunk_writes: Vec<_> = chunks[..6].iter().map(|key| chunk_write(*key, 1)).collect();
+    let chunks: Vec<_> = chunks[..6].iter().map(|key| chunk_write(*key, 1)).collect();
     let player_writes: Vec<_> = players[..6]
         .iter()
         .map(|key| player_write(*key, 2))
         .collect();
-    let drop_writes: Vec<_> = drops[..5]
+    let drops: Vec<_> = drops[..5]
         .iter()
-        .map(|key| drop_write(*key, chunks[0], 3))
+        .map(|key| drop_write(*key, chunks[0].key, 3))
         .collect();
-    let rejected = Uuid::new_v4();
-    assert!(
-        store
-            .commit_domain(
-                rejected,
-                &reads,
-                &chunk_writes,
-                &player_writes,
-                &drop_writes
-            )
-            .is_err()
-    );
-    assert!(store.domain_receipt(rejected).unwrap().is_none());
-    let unchanged = store
-        .snapshot_domain(&chunks[..6], &players[..6], &drops[..5])
-        .unwrap();
-    assert!(unchanged.chunks.iter().all(|entry| entry.chunk().is_none()));
-    assert!(unchanged.players.iter().all(|entry| entry.data().is_none()));
-    assert!(unchanged.drops.iter().all(|entry| entry.data().is_none()));
-
-    let accepted = store
-        .commit_domain(
-            Uuid::new_v4(),
-            &reads,
-            &chunk_writes,
-            &player_writes[..5],
-            &drop_writes,
-        )
+    let receipt = store
+        .commit_domain(Uuid::new_v4(), &reads, &chunks, &player_writes, &drops)
         .unwrap();
     assert_eq!(
-        accepted.chunks.len() + accepted.players.len() + accepted.drops.len(),
-        16
+        receipt.chunks.len() + receipt.players.len() + receipt.drops.len(),
+        17
     );
     assert!(
         store
-            .snapshot_domain(&[], &players[5..6], &[])
+            .snapshot_domain(&[], &players[6..7], &[])
             .unwrap()
             .players[0]
             .data()
             .is_none()
     );
 }
-
 #[test]
 fn empty_and_oversized_opaque_values_reject_the_entire_mixed_commit() {
     let root = tempfile::tempdir().unwrap();

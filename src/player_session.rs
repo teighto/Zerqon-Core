@@ -584,11 +584,33 @@ impl SessionInner {
                 .unwrap_or_else(|error| error.into_inner())
                 .clone();
             let inventory_cleanup = match resources {
-                Some(resources) => resources
-                    .inventory
-                    .close_and_drain()
-                    .await
-                    .map_err(|error| error.to_string()),
+                Some(resources) => {
+                    let returned = if inner.state.drops.is_some() {
+                        inner
+                            .state
+                            .inventory_packet(
+                                inner.uuid,
+                                inner.id,
+                                &resources.inventory,
+                                19,
+                                vec![0],
+                                true,
+                            )
+                            .await
+                            .map_err(|error| error.to_string())
+                    } else {
+                        Ok(())
+                    };
+                    let drained = resources
+                        .inventory
+                        .close_and_drain()
+                        .await
+                        .map_err(|error| error.to_string());
+                    match (returned, drained) {
+                        (Ok(()), result) | (result, Ok(())) => result,
+                        (Err(first), Err(second)) => Err(format!("{first}; {second}")),
+                    }
+                }
                 None => Ok(()),
             };
             let mut cleanup = if joining {
